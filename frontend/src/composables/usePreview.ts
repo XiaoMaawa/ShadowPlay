@@ -379,9 +379,8 @@ export function usePreview() {
 
     const info = (status.ringInfo ?? ringInfo.value) as RingInfo | null
     if (!info) {
-      // preload 还在轮询等采集服务
-      serviceHint.value =
-        '还没有检测到采集服务。请在项目根目录另开一个终端执行：npm run service'
+      // preload 还在轮询等采集服务（界面会自动拉服务，不需要人去敲命令）
+      serviceHint.value = '采集服务还没就绪，正在等待…'
       waitingService.value = true
       return false
     }

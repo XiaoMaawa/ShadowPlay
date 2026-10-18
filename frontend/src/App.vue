@@ -353,7 +353,7 @@
           </div>
         </div>
 
-        <!-- 服务没在跑时给一键启动（以前只能去终端敲 npm run service） -->
+        <!-- 服务没在跑时给一键启动 -->
         <div v-if="waitingService && !fatal" class="overlay-actions">
           <button class="primary" @click="launchService">启动采集服务</button>
         </div>
@@ -621,7 +621,7 @@ const serviceStatusTitle = computed(() => {
         `  界面：${l.wantedProfilesPath ?? '（未知）'}\n` +
         `  服务：${l.runningProfilesPath ?? '（未知）'}\n` +
         '下面的分片数 / 录制目录都属于那个服务，导出会去它的 recordRoot 找分片。\n' +
-        '要让界面自己起服务，先停掉命令行里的那个再点"启动采集服务"。'
+        '要让界面自己起服务，先停掉命令行里的那个。'
       )
     }
     if (l.source === 'file') {
@@ -631,7 +631,7 @@ const serviceStatusTitle = computed(() => {
     if (!l.owned) return `服务在运行（外部启动，状态来自它的输出）\n${file}`
     return '服务在运行（本界面启动，状态来自它的输出）'
   }
-  return `没有读到服务状态。\n状态文件：${file}\n可以从这里启动服务，或在命令行执行 npm run service。`
+  return `没有读到服务状态。\n状态文件：${file}`
 })
 
 // ---- 预览帧率通知 ---------------------------------------------------------

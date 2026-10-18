@@ -428,7 +428,13 @@ function launchService() {
     cwd: PROJECT_ROOT,
     // stdin 留着给导出命令用，stdout 读状态，stderr 只记日志。
     stdio: ['pipe', 'pipe', 'pipe'],
-    detached: false,
+    // detached：服务必须在界面退出后继续常驻（用户要求：Electron 退出，
+    // 服务不能退）。Windows 上 libuv 会在 detached 时带上
+    // CREATE_BREAKAWAY_FROM_JOB —— 没有它，Electron（Chromium）把自己的
+    // 子进程都塞进 kill-on-close 的作业对象里，界面一关作业对象一关，
+    // 服务就被连带杀掉，录到一半的 ffmpeg 也跟着死。Breakaway 让服务
+    // 脱离那个作业对象，界面生死与它无关。
+    detached: true,
     windowsHide: true,
   })
 
@@ -450,7 +456,9 @@ function launchService() {
       }
     }
   })
-  // 不让它拖住 Electron 退出：我们自己会在 quit 时收掉它。
+  // 让界面进程退出时不被这个子进程拖住。注意**不是**杀掉它——分离的
+  // 意义就是让它在界面退出后继续录、继续常驻（见上面 detached 的注释）。
+  // 停止服务的唯一途径：界面里的「停止采集服务」按钮或 npm run service:stop。
   serviceChild.unref?.()
 
   log('已启动采集服务，pid =', serviceChild.pid, '配置 =', file)
@@ -1965,6 +1973,26 @@ if (!app.requestSingleInstanceLock()) {
       return
     }
 
+    // -------------------------------------------------------------------
+    // 自动拉起采集服务（用户要求：界面启动时如果服务没跑，直接把它起好，
+    // 不要再让人"另开一个终端 npm run service"）。
+    //
+    // launchService() 自己就会判断"已经在跑就复用"，所以这里无条件调是安全的：
+    //   * 服务没在跑  -> 它 spawn（detached，界面退出也常驻，见那边的注释）；
+    //   * 服务已在跑  -> 它走 alreadyRunning 分支，只把设置下发一遍，什么也不动。
+    //
+    // 只在**正常界面模式**做。--selftest / --gui-export 那些验收模式自己管
+    // 服务生死（finish() 里会 stopService），插一脚反而会把它们的干净环境搅乱。
+    // -------------------------------------------------------------------
+    if (!IS_SELFTEST && !IS_GUI_EXPORT && !IS_EXTERNAL_PROBE) {
+      const started = launchService()
+      if (!started.ok) {
+        // exe 没编译出来之类：日志里说清楚，界面那边还会显示原有的错误遮罩，
+        // 不弹窗也不退界面 —— 设置页/停止按钮仍然可用。
+        log('自动启动采集服务失败：', started.error ?? '(无错误信息)')
+      }
+    }
+
     createWindow()
 
     // 界面一开就把设置推给在跑的服务，**不管服务是谁起的**。
@@ -1982,7 +2010,8 @@ if (!app.requestSingleInstanceLock()) {
   })
 
   app.on('window-all-closed', () => {
-    // 采集服务是独立进程，界面退出时不去动它
+    // 采集服务是 detached 的常驻进程：界面退出**不**停服、不杀它。
+    // 停服走界面里的「停止采集服务」或 npm run service:stop。
     app.quit()
   })
 }

@@ -303,12 +303,9 @@ async function scanSessions() {
   try {
     const profiles = await fetchProfiles()
     if (!profiles.length) {
-      emit({
-        type: 'waiting-service',
-        message:
-          '还没有检测到采集服务。\n请另开一个终端执行：npm run service\n' +
-          '（或直接运行 native\\build\\shadow-capture.exe）',
-      })
+      // 服务还没起来：界面只显示"等待采集服务"的遮罩（界面会自动拉服务），
+      // 不再让人去终端敲 npm run service —— 现在不需要了。
+      emit({ type: 'waiting-service', message: '采集服务还没就绪，正在等待…' })
       return
     }
 

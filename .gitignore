@@ -5,6 +5,9 @@ dist/
 export/
 _svc.out.txt
 _svc.err.txt
+_e.out.txt
+_e.err.txt
+.acl-reports/
 native/build/
 *.obj
 *.pdb
