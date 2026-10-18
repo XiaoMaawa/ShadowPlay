@@ -1,0 +1,30 @@
+{
+  "name": "shadow-play-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ShadowPlay 预览：C++ 采集服务 + Electron 渲染（共享内存零拷贝）",
+  "main": "app/main.cjs",
+  "scripts": {
+    "service": "node scripts/service.mjs start",
+    "service:status": "node scripts/service.mjs status",
+    "service:stop": "node scripts/service.mjs stop",
+    "build:native": "node scripts/build-native.mjs --node",
+    "build:web": "node scripts/build-web.mjs",
+    "build": "node scripts/build-native.mjs --node && node scripts/build-web.mjs",
+    "dev:web": "node scripts/dev-server.mjs",
+    "dev": "node scripts/dev.mjs",
+    "start": "node scripts/launch.mjs",
+    "start:bg": "node scripts/launch.mjs --bg",
+    "probe": "node scripts/launch.mjs --probe",
+    "selftest": "node scripts/launch.mjs --selftest 6",
+    "selftest:fresh": "node scripts/launch.mjs --selftest 8 --fresh",
+    "test:recording": "node scripts/test-recording.mjs 20",
+    "test:export": "node scripts/test-export.mjs 18",
+    "offsets": "node scripts/offsets.mjs",
+    "test:selfheal": "node scripts/test-selfheal.mjs",
+    "test:pipe": "node scripts/test-pipe.mjs"
+  },
+  "devDependencies": {
+    "electron": "^42.2.0"
+  }
+}

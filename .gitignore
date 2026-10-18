@@ -1,0 +1,10 @@
+node_modules/
+frontend/node_modules/
+.electron/
+dist/
+export/
+_svc.out.txt
+_svc.err.txt
+native/build/
+*.obj
+*.pdb

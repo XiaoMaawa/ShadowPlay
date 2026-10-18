@@ -1,0 +1,23 @@
+/* 全局基础样式：去掉默认边距，铺满窗口 */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #07090f;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 桌面应用里不需要文本选择/拖拽选中 */
+body {
+  user-select: none;
+}
