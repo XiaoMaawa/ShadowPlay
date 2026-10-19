@@ -43,7 +43,9 @@
 
 
 #include "Exporter.h"
-#include "FfmpegUtil.h"
+#include "MfEncoder.h" // MfAcquire / MfRelease：报编码能力自检
+#include "ServiceEntry.h" // ServiceMain / RequestServiceStop / Query*：入口层
+#include "Utf8Path.h"
 #include "ScreenCapture.h"
 #include "FrameRing.h"
 #include "JsonUtil.h"
@@ -77,14 +79,17 @@
 
 using namespace shadow;
 
-// 子进程作业对象（定义在文件作用域，不在匿名 namespace 里，方便下面
-// ShadowChildJob() 直接返回它）。所有 ffmpeg 录制子进程都塞进它。
-HANDLE g_childJob = nullptr;
-
-// 给 SegmentRecorder 用：录制器每起一个 ffmpeg 都会把它的句柄挂到作业对象上，
-// 这样服务退出时子进程不会变成孤儿。返回 nullptr 表示没有作业对象
-// （不影响录制，只是少了这层保险）。
-extern "C" void* ShadowChildJob() { return g_childJob; }
+// 【作业对象已经删了】
+//
+// 以前这里有一个 g_childJob + ShadowChildJob()：每个会话起 ffmpeg 子进程时
+// 把它挂进去，服务被强杀时靠 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 一起收掉，
+// 免得留下孤儿进程继续往 records/ 里写分片。
+//
+// 现在编码走进程内 Media Foundation（MfEncoder），整个项目**没有任何子进程**，
+// 也就没有孤儿可担心 —— 服务一挂，SinkWriter 跟着地址空间一起消失，内核
+// 会把文件句柄关掉，最多留一个没写完的 fMP4 分片（fMP4 每个 moof 自带索引，
+// 前面写进去的部分照样能读）。所以这个作业对象连同 TerminateJobObject 一起
+// 移除了，别再往这里加回来。
 
 namespace {
 
@@ -323,6 +328,11 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
     // 所以这里立刻返回，不会拖慢启动。
     StartStatusMirror();
 
+    // 把服务的 NDJSON 日志出口接到 Exporter 上 —— 导出时会打一行
+    // export_plan，把"这一次到底铺了哪些分片、哪些位置补了 NO SIGNAL"
+    // 完整记下来。没有这行日志，"导出里莫名出现 NO SIGNAL"只能靠猜。
+    SetExporterPlanLog([](const std::string& line) { LogLine(line); });
+
     ProfileDoc doc;
     std::string err;
     if (!ProfileStore::Load(opt.profilesPath, doc, err)) {
@@ -350,15 +360,8 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
 
     timeBeginPeriod(1);
 
-    // 先建作业对象：后面每个会话起的 ffmpeg 都会挂进来，服务退出时一起收掉。
-    g_childJob = CreateJobObjectW(nullptr, nullptr);
-    if (g_childJob) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl{};
-        // 只设「最后一个人关掉作业就把里面的进程杀干净」这一条。
-        // 不加内存/CPU 限制，免得干扰编码。
-        jl.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(g_childJob, JobObjectExtendedLimitInformation, &jl, sizeof(jl));
-    }
+    // （这里原来建子进程作业对象。现在没有子进程了，见文件上方 g_childJob
+    // 删除处的说明。）
 
     // 按显示器分建桌面采集：每一路桌面源用自己的显示器序号，序号相同的
     // 共享同一个 ScreenCapture（桌面复制对同一块屏重复初始化会浪费一大块
@@ -454,12 +457,17 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                   std::to_string(GetCurrentProcessId()) + ",\"sessions\":" +
                   std::to_string(sessions.size()) + "}");
 
-    // 顺带把 ffmpeg 的位置报上去：导出功能全靠它，界面上看不到这条日志的话，
-    // "点了导出没反应"就只能靠猜。
+    // 顺带报一下编码能力的自检结果。
+    //
+    // 以前这里报的是 `ffmpeg_resolved`（ffmpeg.exe 在哪）。现在编码全在进程内
+    // 走 Media Foundation，没有外部程序可找了 —— 但"点了导出/录制没反应"这
+    // 类问题仍然需要一个一眼能看出来的信号，所以改报 MF 起没起来。
+    // 起不来的典型原因是系统缺 Media Feature Pack（N 版 Windows 默认没有）。
     {
-        const std::string ff = ResolveFfmpeg();
-        LogStatusLine("{\"type\":\"ffmpeg_resolved\",\"path\":\"" + JsonEscape(ff) +
-                      "\",\"ok\":" + (ff.empty() ? "false" : "true") + "}");
+        const bool mfOk = MfAcquire();
+        if (mfOk) MfRelease();
+        LogStatusLine("{\"type\":\"encoder_ready\",\"backend\":\"mediafoundation\",\"ok\":" +
+                      std::string(mfOk ? "true" : "false") + "}");
     }
 
     // ---- 命令通道（stdin，NDJSON 一行一条）--------------------------------
@@ -476,10 +484,9 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
     // 只拆掉目标那一路的 Session 再按新配置重建，其它路一个字节都不动。
     //
     // 为什么要开一条命令通道：导出是**运行中**才能做的事（分片一直在滚动），
-    // 而拉起的那个 ffmpeg 会继承服务的 stdout 并往里写自己的 stderr，
-    // 于是 NDJSON 流里会混进一段 ffmpeg 的错误输出 —— 界面端解析就会炸。
-    // 所以导出子进程必须用匿名管道收走 stderr（见 Exporter.cpp 的 RunFfmpeg），
-    // 这条命令通道则保证"什么时候导、导哪一路"由界面说了算。
+    // 而导出现在走进程内 Media Foundation（SourceReader + SinkWriter 直拷），
+    // 不再有子进程往服务的 stdout 里混写输出。这条命令通道留着的理由是
+    // "什么时候导、导哪一路"由界面说了算，而且不用给它一条新的进程入口。
     //
     // 注意：命令**同时**从两条通道收 —— stdin（Electron 自己 spawn 它时）
     // 和命名管道（谁起的服务都能连）。两条共用同一个解析函数，语义完全一致。
@@ -771,9 +778,9 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
         //
         // 【为什么挪到后台线程】
         //
-        // 这一段原来就在主循环里同步做：Stop() 要等 ffmpeg 把最后一帧写完并退出
-        // （SegmentRecorder::Stop 里 WaitForSingleObject 最长 8 秒），Start() 又要
-        // 起新的 ffmpeg + NVENC 会话。三路一起改就是三份"停+起"，实测界面点一次
+        // 这一段原来就在主循环里同步做：Stop() 要把当前分片 Finalize 完
+        // （SegmentRecorder::Stop 里 encoder_->Finish() 要等编码器收尾），Start() 又要
+        // 重建 SinkWriter 和硬件编码会话。三路一起改就是三份"停+起"，实测界面点一次
         // 保存要盯着"保存中…"等满两秒 —— 而且这期间主循环停摆，状态上报也跟着
         // 卡住，界面看起来像死了一样。
         //
@@ -781,7 +788,7 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
         // 会短暂显示旧配置，随后被新会话替换），"保存"这个动作本身几十毫秒就返回。
         //
         // 后台线程持 reloadMutex，保证同一时刻只有一次重建在跑 —— 用户连点保存
-        // 不会叠出两组 ffmpeg 抢同一批分片目录。
+        // 不会叠出两组编码器抢同一批分片目录。
         std::vector<std::string> reloads;
         {
             std::lock_guard<std::mutex> lk(cmdMutex);
@@ -807,16 +814,39 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                     return;
                 }
                 for (const std::string& id : reloads) {
-                    // 增删会话要独占 sessions；Stop() 会等 ffmpeg 收尾，所以
+                    const Profile* np = fresh.Find(id);
+                    const bool want = np && np->enabled;
+
+                    // 增删会话要独占 sessions；Stop() 会等编码器收尾，所以
                     // 这里**不能**一直攥着 sessionsMutex（主循环要用它报状态）。
                     // 先把旧会话摘出来（独占时间极短），在外面停掉再建新的。
                     std::unique_ptr<Session> old;
+
+                    // ---- 先判「真的变了没有」 ----------------------------------
+                    //
+                    // 界面保存一次配置就把所有改过的路各发一条 reload，而用户
+                    // 经常只是点开编辑、看一眼、点确定 —— 一个字段都没改。以前
+                    // 这种情况也会把会话拆了重建：新建录制器（换一轮分片目录）、
+                    // 重建帧环、清空 snap_。界面那边看到的是画面黑一下、NO SIGNAL
+                    // 遮罩闪一下。这是用户报的「窗口捕获点编辑确定后，导出的画面
+                    // 和预览都会短暂出现 no signal」。
+                    //
+                    // 所以这里先比一遍采集 + 编码参数：完全一致就什么都不做。
+                    // 只更新预览帧率（它本来就可以随时改，不需要重建）。
                     {
                         std::lock_guard<std::mutex> lk(sessionsMutex);
                         auto it = std::find_if(sessions.begin(), sessions.end(),
                                                [&](const std::unique_ptr<Session>& s) {
                                                    return s->Id() == id;
                                                });
+                        if (it != sessions.end() && want && (*it)->SameSettings(*np)) {
+                            (*it)->SetPreviewFps(previewFps.load(std::memory_order_relaxed));
+                            LogLine("{\"type\":\"session_reloaded\",\"id\":\"" + JsonEscape(id) +
+                                    "\",\"active\":true,\"applied\":false,\"detail\":"
+                                    "\"配置没有实质变化，保留原会话\"}");
+                            continue;
+                        }
+                        // 配置确实变了（或者要停用）。旧的摘出来，锁外收尾。
                         if (it != sessions.end()) {
                             old = std::move(*it);
                             sessions.erase(it);
@@ -825,8 +855,6 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                     if (old) old->Stop(); // 锁外收尾，主循环照常报状态
                     old.reset();
 
-                    const Profile* np = fresh.Find(id);
-                    const bool want = np && np->enabled;
                     if (!want) {
                         LogLine("{\"type\":\"session_reloaded\",\"id\":\"" + JsonEscape(id) +
                                 "\",\"active\":false,\"detail\":\"配置已禁用或不存在\"}");
@@ -854,7 +882,7 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                         sessions.push_back(std::move(s));
                     }
                     LogLine("{\"type\":\"session_reloaded\",\"id\":\"" + JsonEscape(id) +
-                            "\",\"active\":true}");
+                            "\",\"active\":true,\"applied\":true}");
                 }
             }));
             // 已经跑完的重建线程顺手回收（不 join 到底，免得主循环又卡在别人身上）。
@@ -986,7 +1014,8 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
 
     LogLine("{\"type\":\"stopping\"}");
     // 先等后台重建线程收尾：它们手里可能正攥着一个 Session（还没挂进表里），
-    // 或者正在 Stop() 里等 ffmpeg。不等的话退出时会和它们抢同一批文件句柄。
+    // 或者正在 Stop() 里等编码器把最后一片 flush 完。不等的话退出时会和它们
+    // 抢同一批文件句柄。
     {
         std::lock_guard<std::mutex> lk(reloadMutex);
         for (auto& f : reloadThreads) {
@@ -994,19 +1023,12 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
         }
         reloadThreads.clear();
     }
-    // 先停会话：每个 Session 退出时会关掉自己的 ffmpeg 管道，让它把最后的
-    // 分片 flush 完整。顺序不能反 —— 先 CloseHandle(mutex) 只是放锁，
+    // 再停会话：每个 Session 退出时会 Finish() 掉自己那个 MfEncoder，让当前
+    // 分片的索引写完。顺序不能反 —— 先 CloseHandle(mutex) 只是放锁，
     // 不影响这里，但会话必须有机会跑完收尾。
     {
         std::lock_guard<std::mutex> lk(sessionsMutex);
         for (auto& s : sessions) s->Stop();
-    }
-    // 保险：万一某个 ffmpeg 收尾超时没退，用作业对象一次性收干净，
-    // 不留孤儿进程继续写 test/ 下的分片。
-    if (g_childJob) {
-        TerminateJobObject(g_childJob, 0);
-        CloseHandle(g_childJob);
-        g_childJob = nullptr;
     }
     LogLine("{\"type\":\"bye\"}");
 
@@ -1020,7 +1042,63 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+namespace {
+
+// ---------------------------------------------------------------------------
+// 一次性查询的实现（--status / --list-windows / --list-monitors 三个老模式）
+//
+// 抽成"返回字符串"而不是"直接打印"：编成 exe 时打印出去，编成 DLL 时交给
+// JS 侧拿去用 —— 同一份逻辑，两个出口。
+// ---------------------------------------------------------------------------
+std::string BuildStatusJson(const std::string& session) {
+    bool exists = false;
+    HANDLE m = AcquireServiceMutex(exists);
+    if (m) CloseHandle(m);
+    return "{\"type\":\"service_status\",\"running\":" +
+           std::string(exists ? "true" : "false") + ",\"session\":\"" +
+           JsonEscape(session) + "\"}";
+}
+
+std::string BuildWindowsJson() {
+    const auto windows = EnumerateWindows();
+    std::string out = "{\"type\":\"windows\",\"count\":" + std::to_string(windows.size()) + "}\n";
+    for (const auto& w : windows) {
+        char buf[1024];
+        std::snprintf(buf, sizeof(buf),
+                      "{\"hwnd\":%llu,\"title\":\"%s\",\"class\":\"%s\","
+                      "\"process\":\"%s\",\"pid\":%u,"
+                      "\"left\":%d,\"top\":%d,\"width\":%d,\"height\":%d,"
+                      "\"foreground\":%s}",
+                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(w.hwnd)),
+                      JsonEscape(w.title).c_str(), JsonEscape(w.className).c_str(),
+                      JsonEscape(w.processName).c_str(), w.pid, w.left, w.top, w.width,
+                      w.height, w.foreground ? "true" : "false");
+        out += buf;
+        out += '\n';
+    }
+    if (!out.empty() && out.back() == '\n') out.pop_back(); // 调用方自己补换行
+    return out;
+}
+
+std::string BuildMonitorsJson() {
+    const auto monitors = EnumerateMonitors();
+    std::string out;
+    for (const auto& m : monitors) {
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+                      "{\"type\":\"monitor\",\"index\":%u,\"name\":\"%s\","
+                      "\"left\":%d,\"top\":%d,\"width\":%u,\"height\":%u,"
+                      "\"primary\":%s}",
+                      m.index, JsonEscape(m.name).c_str(), m.left, m.top, m.width, m.height,
+                      m.primary ? "true" : "false");
+        out += buf;
+        out += '\n';
+    }
+    if (!out.empty() && out.back() == '\n') out.pop_back();
+    return out;
+}
+
+int ServiceMainImpl(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
 
     // 崩溃现场。0xC0000409 参数 7 就是 FAST_FAIL_FATAL_APP_EXIT ——
@@ -1058,33 +1136,13 @@ int main(int argc, char** argv) {
 
     // ---- --status：只探测 ------------------------------------------------
     if (opt.statusOnly) {
-        bool exists = false;
-        HANDLE m = AcquireServiceMutex(exists);
-        if (m) CloseHandle(m);
-        std::printf("{\"type\":\"service_status\",\"running\":%s,\"session\":\"%s\"}\n",
-                    exists ? "true" : "false", JsonEscape(opt.session).c_str());
-        return exists ? 0 : 1;
+        std::printf("%s\n", BuildStatusJson(opt.session).c_str());
+        return QueryServiceRunning() ? 0 : 1;
     }
 
     // ---- --list-windows：列出可采集的顶层窗口 --------------------------
     if (opt.listWindows) {
-        const auto windows = EnumerateWindows();
-        std::printf("{\"type\":\"windows\",\"count\":%zu}\n", windows.size());
-        for (const auto& w : windows) {
-            char buf[1024];
-            std::snprintf(buf, sizeof(buf),
-                          "{\"hwnd\":%llu,\"title\":\"%s\",\"class\":\"%s\","
-                          "\"process\":\"%s\",\"pid\":%u,"
-                          "\"left\":%d,\"top\":%d,\"width\":%d,\"height\":%d,"
-                          "\"foreground\":%s}",
-                          static_cast<unsigned long long>(
-                              reinterpret_cast<uintptr_t>(w.hwnd)),
-                          JsonEscape(w.title).c_str(), JsonEscape(w.className).c_str(),
-                          JsonEscape(w.processName).c_str(), w.pid,
-                          w.left, w.top, w.width, w.height,
-                          w.foreground ? "true" : "false");
-            std::printf("%s\n", buf);
-        }
+        std::printf("%s\n", BuildWindowsJson().c_str());
         return 0;
     }
 
@@ -1094,18 +1152,7 @@ int main(int argc, char** argv) {
     // 序号与 ScreenCapture::Init(outputIndex) 用的是同一套排列
     // （CollectAllOutputs：只数已连接的输出，按上→下、左→右排）。
     if (opt.listMonitors) {
-        const auto monitors = EnumerateMonitors();
-        for (const auto& m : monitors) {
-            char buf[512];
-            std::snprintf(buf, sizeof(buf),
-                          "{\"type\":\"monitor\",\"index\":%u,\"name\":\"%s\","
-                          "\"left\":%d,\"top\":%d,\"width\":%u,\"height\":%u,"
-                          "\"primary\":%s}",
-                          m.index, JsonEscape(m.name).c_str(),
-                          m.left, m.top, m.width, m.height,
-                          m.primary ? "true" : "false");
-            std::printf("%s\n", buf);
-        }
+        std::printf("%s\n", BuildMonitorsJson().c_str());
         return 0;
     }
 
@@ -1413,3 +1460,62 @@ int main(int argc, char** argv) {
     timeEndPeriod(1);
     return 0;
 }
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// 对外入口（ServiceEntry.h）
+//
+// 这一层很薄，只做三件事：
+//   1. 给 ServiceMain 套一层"异常不许逃出去"的壳 —— 异常一旦跑出这个边界
+//      就会变成未捕获异常，进程直接 abort（0xC0000409），连收尾都做不了；
+//   2. 提供 RequestServiceStop，让调用方能在不杀进程的前提下要它退出；
+//   3. 把三个一次性查询暴露成"返回字符串"。
+//
+// 注意 g_running 是**进程级**的：同一个进程里跑了两个 ServiceMain（正常不会，
+// 互斥体会挡住第二个）时，一个停机会连坐另一个。服务本身就是独立进程，
+// 不会出现这种情形。
+// ---------------------------------------------------------------------------
+namespace shadow {
+
+int ServiceMain(int argc, char** argv) {
+    try {
+        return ServiceMainImpl(argc, argv);
+    } catch (const std::exception& e) {
+        // 走到这儿说明有未预期的异常。打出去（stdout 是 NDJSON 通道，
+        // 别混进非 JSON 行）——界面那边会把它当服务崩溃处理。
+        LogError("service_crashed", std::string("服务内部异常：") + e.what());
+        return 1;
+    } catch (...) {
+        LogError("service_crashed", "服务内部异常（非 std::exception）");
+        return 1;
+    }
+}
+
+void RequestServiceStop() {
+    // 置停止标志 + 叫醒主循环。收尾（停会话、Finalize 分片、落状态文件）
+    // 仍然由 ServiceMain 自己按正常路径做完，所以这里不等待、不杀线程。
+    g_running.store(false, std::memory_order_release);
+    // wakeEvent 是 RunProfilesMode 里建的（栈上变量），单路旧模式没有它。
+    // 这里不能直接摸那个变量，所以退一步：把标准输入的等待也用不上 ——
+    // 主循环最坏 100ms 就会自己醒来一次看到 g_running 变了。
+    //
+    // 100ms 的收尾延迟对"关界面/停服务"这种操作完全无感，换来的好处是
+    // 这一层不需要持有 RunProfilesMode 内部的任何句柄。
+}
+
+bool QueryServiceRunning() {
+    bool exists = false;
+    HANDLE m = AcquireServiceMutex(exists);
+    if (m) CloseHandle(m);
+    return exists;
+}
+
+std::string QueryStatusJson() { return BuildStatusJson(kServiceSessionId()); }
+
+std::string QueryWindowsJson() { return BuildWindowsJson(); }
+
+std::string QueryMonitorsJson() { return BuildMonitorsJson(); }
+
+} // namespace shadow
+

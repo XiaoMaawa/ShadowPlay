@@ -5,32 +5,40 @@
 // 这里直接起 shadow-capture.exe，喂一份「回放 10 秒 / 分片 2 秒」的配置，
 // 默认连录两轮（同一份配置、同一个目录），验四件事：
 //
-//   1. temp/proofs/recording/<子目录>/segments/<轮次> 下真的出现了 .ts 分片，
+//   1. temp/proofs/recording/<子目录>/segments/<轮次> 下真的出现了 .mp4 分片，
 //      而且能被 ffprobe 解出来（不是 0 字节空壳）；
-//   2. 分片数被**回放时长**限住，不会一直涨（滚动删除生效）；
-//   3. 时间轴确实在往前走 —— 本轮 index.csv 里的区间起点/终点一直推进，
+//   2. 磁盘上的内容被**回放时长**限住，不会一直涨（滚动删除生效）；
+//   3. 时间轴确实在往前走 —— 本轮 index.csv 里各槽位的区间终点一直推进，
 //      而磁盘上始终只有回放窗口那么长的内容。
 //   4. 第二轮**不**继承第一轮的分片字节数（复写槽位时文件必须先截断）。
 //
+// ⚠️ 分片**数量**不再是判据。录制端从「保留最后 N 片」改成了「保留最近 N 秒」
+// （见 DESIGN.md 9.5 与 MfEncoder::PurgeExpired）：尺寸一变就切片，一次拖窗口
+// 能切出七八片零点几秒的过渡片；若仍按片数保留，20 秒窗口会被这些碎片吃光，
+// 导出几乎全程 NO SIGNAL（用户实际报过）。现在槽位给的是标称片数的 8 倍余量，
+// 正常等长录制时磁盘上约 1.5 倍标称片数（每片在开下一片时才被判定过期），
+// 拖窗口时片数会更多而**总时长**不变 —— 所以断言看「清单跨度 + 磁盘字节」，不看行数。
+//
 // 第 3 条是必须的，别只盯着文件名。踩过的坑：最早那版断言写的是
-// 「第一个分片不应该是 000000.ts」，跑 26 秒后判定失败。其实滚动**是**生效的，
-// 是断言错了 —— HLS 的分片名是**循环复用的槽位**，不是单调递增的序号。
+// 「第一个分片不应该是 000000.mp4」，跑 26 秒后判定失败。其实滚动**是**生效的，
+// 是断言错了 —— 分片名是**循环复用的槽位**，不是单调递增的序号。
 // 回放 10 秒 / 分片 2 秒 ⇒ 保留 5 个槽位，写满 5 个之后文件名就在
-// 000000.ts..000004.ts 之间打转，任何时刻第一个文件都叫 000000.ts。
+// 000000.mp4..000004.mp4 之间打转，任何时刻第一个文件都叫 000000.mp4。
 // 要看"有没有删"，只能看 ①分片数有没有被限住 ②时间轴有没有推进。
 //
-// 第二个坑（也踩了）：index.csv 是**追加日志**，不是"当前窗口清单"。
-// 它把历史上每个分片区间都记下来（跑 26 秒就有 12 行，覆盖 0~24s），
-// 所以不能拿"首行起点 → 末行终点"当窗口跨度，那必然等于总录制时长。
-// 真正代表"此刻磁盘上留着哪一段"的是**磁盘上那几个 .ts 文件**：
+// 第二个变化（MF 改造后）：index.csv 从**追加日志**变成了**当前窗口清单**。
+// ffmpeg 的 `-segment_list` 只会往后追加，跑 26 秒就有 12 行覆盖 0~24s，
+// 所以那时不能拿"首行起点 → 末行终点"当窗口跨度。现在 `MfEncoder` 每次
+// 开关分片都整份重写清单，行数恒等于槽位数，末行终点就是时间轴末端。
+// 真正代表"此刻磁盘上留着哪一段"的还是**磁盘上那几个分片**：
 // 5 个文件、每个 2 秒 ⇒ 窗口 ≈ 10 秒。下面用「分片数 × 分片时长」来
 // 卡窗口大小，用"末行终点一直在涨"来证明它在往前滚。
 //
-// 第三个坑（这轮才修）：`-segment_wrap` 复写 000000.ts 时**不会先截断**。
+// 第三个坑（这轮才修）：环形复写槽位时**不会先截断**。
 // 上一轮这个槽位有 6.4 MB、这轮只写 2 MB，文件就还是 6.4 MB —— 于是
 // 界面上的"占多少磁盘 / 录了多少字节"跟着虚高（实测回放 120s 的配置显示
 // 356 MB，而按窗口时长 × 码率算只有 120 MB 上下）。修法是起录前清掉
-// 旧的 .ts（`SegmentRecorder::ClearStaleSlots`），第 4 条就是它的回归闸门。
+// 旧的分片（`MfEncoder::Start` 里清目录），第 4 条就是它的回归闸门。
 //
 // 第四个变化（分代改造）：分片现在按**轮次**分子目录存
 // （`segments/0001-fps30/`），每改一次帧率就换一个轮次，旧轮次留着，
@@ -105,7 +113,7 @@ writeFileSync(PROFILE_FILE, JSON.stringify(doc, null, 2), 'utf8')
  * 数字最大的那一代，否则会把上一代留下的分片算进这一轮。
  *
  * 兼容两种命名：老目录曾叫 `0001-fps30`（序号-fps），现在只叫 `1`（纯代次）。
- * 平铺在 `segments/` 根下的 .ts 是分代改造之前的老数据，不算本轮。
+ * 平铺在 `segments/` 根下的分片是分代改造之前的老数据，不算本轮。
  */
 function currentRunDir(segRoot) {
   if (!existsSync(segRoot)) return null
@@ -123,7 +131,7 @@ function currentRunDir(segRoot) {
 function segmentsOf(dir) {
   if (!dir || !existsSync(dir)) return []
   return readdirSync(dir)
-    .filter((f) => f.endsWith('.ts'))
+    .filter((f) => f.endsWith('.mp4'))
     .sort()
     .map((f) => {
       const st = statSync(path.join(dir, f))
@@ -135,8 +143,8 @@ function segmentsOf(dir) {
  * 去掉"正在写"的那一片。
  *
  * 分段器是边写边切：任何时刻总有**一片还在写**，它的体积和时长都只有完整片的
- * 一小截（实测 0.2s / 262144 字节，完整片 2.0s / 1.5MB）。而且 `segment_wrap`
- * 会让文件名循环覆写 —— 最新的一片未必叫 000004.ts，可能是 000002.ts。
+ * 一小截（实测 0.2s / 262144 字节，完整片 2.0s / 1.5MB）。而且槽位循环复写
+ * 会让文件名循环覆写 —— 最新的一片未必叫 000004.mp4，可能是 000002.mp4。
  *
  * 所以不能按文件名猜，只能按 mtime：mtime 最新的那一片就是正在写的，排除掉。
  * 只留 mtime 明显更早的完整片。
@@ -164,8 +172,18 @@ function readTimeline(runDir) {
   if (!existsSync(p)) return null
   const rows = []
   for (const line of readFileSync(p, 'utf8').split(/\r?\n/)) {
-    const m = line.match(/^([0-9]+\.ts),([0-9.]+),([0-9.]+)$/)
-    if (m) rows.push({ name: m[1], start: Number(m[2]), end: Number(m[3]) })
+    // 第四列是每片的墙钟 Unix **毫秒**（本项目加在 ffmpeg 的 csv 格式之后，用来
+    // 判断"这片属不属于回放窗口"）；第五、六列是这片编码时的画布宽高（过渡期
+    // 画布可能比真实内容大，导出端据此裁黑边）。老数据只有三列，所以后面都可选。
+    const m = line.match(/^([0-9]+\.mp4),([0-9.]+),([0-9.]+)(?:,([0-9]+))?(?:,([0-9]+),([0-9]+))?$/)
+    if (m) {
+      rows.push({
+        name: m[1],
+        start: Number(m[2]),
+        end: Number(m[3]),
+        startUnix: m[4] ? Number(m[4]) : 0,
+      })
+    }
   }
   if (!rows.length) return null
   return { rows, first: rows[0].start, last: rows[rows.length - 1].end }
@@ -210,7 +228,7 @@ async function recordOnce(round) {
     const tl = readTimeline(run?.dir)
     samples.push({
       count: segs.length,
-      // 时间轴终点：证明"内容在往前走"。这是**追加日志**的末行，单调递增。
+      // 时间轴终点：证明"内容在往前走"。末行终点就是当前时间轴末端。
       timelineEnd: tl ? tl.last : 0,
       bytes: segs.reduce((a, s) => a + s.bytes, 0),
       names: segs.map((s) => s.name).join(','),
@@ -220,7 +238,7 @@ async function recordOnce(round) {
   await new Promise((r) => setTimeout(r, WATCH_MS))
   clearInterval(sampler)
 
-  // 先让服务有机会自己收尾（它会先关 ffmpeg 管道再等它退出）。强杀只作兜底：
+  // 先让服务有机会自己收尾（它会 Finalize 当前分片再退出）。强杀只作兜底：
   // 分片是收尾时写完的，太早杀会让最后一个分片停在中途。
   child.kill('SIGINT')
   await new Promise((r) => setTimeout(r, DRAIN_MS))
@@ -262,10 +280,14 @@ for (let r = 0; r < ROUNDS; r++) runs.push(await recordOnce(r))
 
 // ---- 判定 --------------------------------------------------------------
 const problems = []
-const windowBudget = (REPLAY_S * 6e6 / 8) * 1.6
-// 6 Mbps、10 秒窗口 ⇒ 约 7.5 MB；要是老分片没删，26 秒会堆到 20 MB 上下。
-// 这个预算是每一轮都要过的 —— 尤其第二轮：它验证上一轮留下的字节被清干净了。
-const expectedRows = Math.floor(WATCH_MS / 1000 / SEGMENT_S)
+// 窗口预算：配置请求 6 Mbps，但 MF 的 CBR 输出会**超额**。
+//
+// 实测 2560x1440@30 / 6Mbps 配置下，每轮 18 秒录到 8.4 MB ⇒ 实际码率约
+// 3.9 Mbps（低于请求，正常）；但**瞬时**峰值会冲到 12.3 MB。原因是
+// SinkWriter 每个分片都有独立的 VBV 缓冲，切片的头一帧是关键帧（大），
+// 5 个槽位里新写的那个还没被后面的平缓帧摊薄。所以预算给 2.5 倍余量，
+// 只用来抓"老分片在堆积"这种量级错误（那样会到 20MB 以上）。
+const windowBudget = (REPLAY_S * 6e6 / 8) * 2.5
 const probeTargets = []
 
 for (let i = 0; i < runs.length; i++) {
@@ -292,11 +314,15 @@ for (let i = 0; i < runs.length; i++) {
   if (r.totalBytes === 0) problems.push(`${tag}：分片都是空的`)
 
   if (WATCH_MS / 1000 > REPLAY_S + SEGMENT_S * 2) {
-    if (r.segs.length !== EXPECT_SEGMENTS) {
-      problems.push(`${tag}：分片数 ${r.segs.length} != 保留上限 ${EXPECT_SEGMENTS} —— 滚动删除没把数量限住`)
+    // 分片数上限：正常等长录制时槽位不会被占满，PurgeExpired 在开新片时清，
+    // 所以稳态约 1.5 倍标称片数（实测 10s 窗口 / 2s 片 → 7~8 片）。
+    // 这里只拦"完全不删"的病态情况（涨到标称片数好几倍）。
+    const segCap = Math.ceil((REPLAY_S * 2) / SEGMENT_S) + 2
+    if (r.segs.length > segCap) {
+      problems.push(`${tag}：分片数 ${r.segs.length} 超过上限 ${segCap} —— 滚动删除没把长度限住`)
     }
-    if (r.peak > EXPECT_SEGMENTS + 1) {
-      problems.push(`${tag}：分片数涨到 ${r.peak} 超过保留上限 ${EXPECT_SEGMENTS} —— 滚动删除没生效`)
+    if (r.peak > segCap + 2) {
+      problems.push(`${tag}：分片数涨到 ${r.peak} 超过上限 ${segCap + 2} —— 滚动删除没生效`)
     }
     // 磁盘占用必须跟"窗口时长 × 码率"同量级，而不是跟总录制时长同量级。
     if (r.peakBytes > windowBudget) {
@@ -310,8 +336,10 @@ for (let i = 0; i < runs.length; i++) {
   if (!r.timeline) {
     problems.push(`${tag}：本轮没有 index.csv —— 看不出时间轴，无法证明录制在推进`)
   } else {
-    if (r.timeline.rows.length < expectedRows - 3) {
-      problems.push(`${tag}：时间轴只记了 ${r.timeline.rows.length} 个区间，明显少于 ${expectedRows} —— 录制有中断`)
+    // index.csv 是**当前窗口清单**（每次开/关分片整份重写），不是追加日志。
+    // 行数 = 此刻盘上的活分片数，不做等值断言（见文件头：保留策略已改成按秒）。
+    if (r.timeline.rows.length === 0) {
+      problems.push(`${tag}：index.csv 是空的 —— 分片没被登记进清单`)
     }
     if (r.timeline.last < REPLAY_S) {
       problems.push(`${tag}：时间轴末端只有 ${r.timeline.last.toFixed(1)}s，没超过回放窗口 ${REPLAY_S}s`)
@@ -319,12 +347,26 @@ for (let i = 0; i < runs.length; i++) {
     if (r.timeline.last <= r.segs.length * SEGMENT_S) {
       problems.push(`${tag}：时间轴末端 ${r.timeline.last.toFixed(1)}s 还没超出磁盘容量 ${r.segs.length * SEGMENT_S}s —— 没滚过`)
     }
-    // 第二轮的时间轴必须从 0 附近重新开始 —— index.csv 没清掉的话它会接着上一轮涨。
-    if (i > 0 && r.timeline.rows.length > expectedRows + 4) {
-      problems.push(
-        `${tag}：时间轴有 ${r.timeline.rows.length} 个区间，比单轮的 ${expectedRows} 多太多 —— ` +
-          `index.csv 跨轮次累积了（起录前没删）`,
-      )
+    // 环形窗口的正确形态：清单里各槽位按起点排好后应当**首尾相接、无缝**，
+    // 且总跨度等于回放窗口（不留过期余量时最多 window + 一片，因为过期判定
+    // 发生在开新片的那一刻）。起点不是 0 是正常的 —— 录到 18 秒时，
+    // 留在盘上的是最后 10 秒（8s..18s），最早那几片已经被清掉了。
+    // 曾经在这里断言"第二轮必须从 0 开始"，那是对环形缓冲的误解。
+    const sorted = [...r.timeline.rows].sort((a, b) => a.start - b.start)
+    let gaps = 0
+    for (let k = 1; k < sorted.length; k++) {
+      if (Math.abs(sorted[k].start - sorted[k - 1].end) > 0.05) gaps++
+    }
+    if (gaps > 0) {
+      problems.push(`${tag}：清单里有 ${gaps} 处时间断档 —— 槽位复写后时间轴串不起来`)
+    }
+    const span = sorted[sorted.length - 1].end - sorted[0].start
+    const spanCap = REPLAY_S + SEGMENT_S * 2
+    if (span > spanCap) {
+      problems.push(`${tag}：清单跨度 ${span.toFixed(1)}s，超过窗口上限 ${spanCap}s —— 老分片没被清掉`)
+    }
+    if (span < REPLAY_S - SEGMENT_S) {
+      problems.push(`${tag}：清单跨度只有 ${span.toFixed(1)}s，短于回放窗口 ${REPLAY_S}s —— 内容被切丢太多`)
     }
   }
 
@@ -332,7 +374,7 @@ for (let i = 0; i < runs.length; i++) {
   const done = completeSegments(r.segs)
   const probeTarget = done[Math.floor(done.length / 2)]
   if (probeTarget) probeTargets.push({ round: i + 1, dir: r.runDir, name: probeTarget.name })
-  else problems.push(`${tag}：只有 ${r.segs.length} 个 .ts，挑不出已经写完的分片来做解码验证`)
+  else problems.push(`${tag}：只有 ${r.segs.length} 个 .mp4，挑不出已经写完的分片来做解码验证`)
 }
 
 // ---- 抽一片真解码，确认不是空壳 -----------------------------------------

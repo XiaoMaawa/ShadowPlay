@@ -143,13 +143,38 @@ public:
     // 采集端错误的累计数量（用于上报给前端）
     uint32_t ErrorCount() const { return errorCount_; }
 
+    // ---- 鼠标指针开关 ------------------------------------------------------
+    //
+    // 只影响桌面源：窗口源用 WGC，那边由系统自己决定画不画（本项目对窗口源
+    // 一律关掉光标，见 WindowCapture 的 put_IsCursorCaptureEnabled(FALSE)）。
+    //
+    // 默认开着 —— 录桌面时用户几乎总是希望画面里能看到鼠标。
+    void SetDrawCursor(bool on) {
+        drawCursor_ = on;
+        if (!on) {
+            cursorVisible_ = false;
+            cursorBlends_ = 0;
+        }
+    }
+    bool DrawCursor() const { return drawCursor_; }
+
+    /** 累计把光标叠进画面的次数（诊断用：为 0 说明一次都没叠上） */
+    uint64_t CursorBlends() const { return cursorBlends_; }
+
+    /** 当前光标形状的尺寸（诊断用，未拿到形状时为 0x0） */
+    void CursorShapeSize(uint32_t& w, uint32_t& h, uint32_t& type) const {
+        w = cursorValid_ ? shape_.width : 0;
+        h = cursorValid_ ? shape_.height : 0;
+        type = cursorValid_ ? shape_.type : 0;
+    }
+
     // **每一个**使用这个采集器的会话线程都必须先持有它。
     //
     // 踩过的坑：加锁之前，N 路配置共享同一个 ScreenCapture（main.cpp 起会话时
     // 传的是 desktop.get()），于是多线程同时对同一个 duplication_ 调
     // AcquireNextFrame、同时往同一块 staging_ 纹理 CopyResource、
     // frameAcquired_/lastPixels_ 互相覆盖。表现出来就是帧率忽高忽低（掉到 28）、
-    // 画面花屏、喂给 ffmpeg 的像素本身是另一路正在写的。
+    // 画面花屏、喂给编码器的像素本身是另一路正在写的。
     std::mutex& Mutex() { return mu_; }
 
 private:
@@ -169,11 +194,53 @@ private:
     ID3D11DeviceContext*     context_ = nullptr;
     IDXGIOutputDuplication*  duplication_ = nullptr;
     ID3D11Texture2D*         staging_ = nullptr;
-
     uint32_t outputIndex_ = 0;
     uint32_t timeoutMs_ = 200;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+
+    // ---- 鼠标指针（只给桌面源用）-----------------------------------------
+    //
+    // DXGI 桌面复制**不会**把光标画进帧里 —— 屏幕上那个光标是 DWM 单独合成
+    // 的一层。要录进去就得自己叠。Desktop Duplication 每帧会告诉我们光标在
+    // 哪、显示还是隐藏（PointerPosition）、形状要不要换（PointerShapeBufferSize）。
+    //
+    // 实测定下来的三条语义（native/probe_cursor.cpp 跑出来的，别凭文档猜）：
+    //   * PointerPosition.Position 是光标位图**左上角的桌面绝对坐标**，热区已经
+    //     扣掉了：SetCursorPos(100,100) + HotSpot(10,0) 时报的是 (90,100)。
+    //     所以不需要自己累加位移。
+    //   * 这一帧没有光标更新时，LastMouseUpdateTime 为 0，同时 PointerPosition
+    //     是 (0,0)/Visible=FALSE。**必须靠 LastMouseUpdateTime 判**，否则每帧都
+    //     按"不可见"处理，录出来的光标会疯狂闪。
+    //   * 形状只在变的时候才带（PointerShapeBufferSize > 0），平时是 0，得把上
+    //     一次的形状留着继续用。
+    struct CursorShape {
+        std::vector<uint8_t> pixels;
+        uint32_t type = 0;           // DXGI_OUTDUPL_POINTER_SHAPE_TYPE_*
+        uint32_t width = 0;
+        uint32_t height = 0;         // 单色时是**双倍**高度（AND + XOR 两段）
+        uint32_t pitch = 0;          // 源行宽；COLOR 时恰好 = width*4
+        int32_t  hotX = 0;           // 仅记录，位置不需要它
+        int32_t  hotY = 0;
+    };
+    CursorShape shape_;
+    bool        cursorValid_ = false;   // shape_ 里有没有可用形状
+    bool        cursorVisible_ = false; // 最近一次光标更新说它可见
+    int64_t     cursorX_ = 0;           // 光标位图左上角（桌面绝对坐标）
+    int64_t     cursorY_ = 0;
+    bool        drawCursor_ = true;     // false = 不叠光标
+    uint64_t    cursorBlends_ = 0;      // 叠了多少次（诊断用）
+
+    // 这块输出的桌面原点。光标位置是全局桌面坐标，要减掉它才是输出内坐标。
+    int64_t originX_ = 0;
+    int64_t originY_ = 0;
+
+    // 从帧信息里更新光标状态（位置 / 可见性 / 形状）。
+    void UpdateCursorState(const DXGI_OUTDUPL_FRAME_INFO& info);
+
+    // 把光标按当前状态叠进 dst（紧密排布 BGRA，stride = dstW*4）。
+    void BlendCursorInto(uint8_t* dst, uint32_t dstW, uint32_t dstH) const;
+
     uint32_t stagingW_ = 0;   // staging 纹理当前尺寸（用于判断是否需要重建）
     uint32_t stagingH_ = 0;
     uint32_t stagingFmt_ = 0;

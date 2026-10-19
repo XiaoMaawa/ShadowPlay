@@ -2,7 +2,7 @@
 
 #include "StatusFile.h"
 
-#include "FfmpegUtil.h" // ToUtf8
+#include "Utf8Path.h" // ToUtf8
 
 #include <windows.h>
 #include <shlobj.h>
@@ -86,7 +86,7 @@ std::string StatusFilePath() {
             }
         }
         // 注意用 PathToUtf8 而不是 p.string()：路径里可能有中文用户名，
-        // 走 ANSI 会变成乱码（这个坑在导出那边踩过一次，见 FfmpegUtil.h）。
+        // 走 ANSI 会变成乱码（这个坑在导出那边踩过一次，见 Utf8Path.h）。
         return PathToUtf8(StatusFileDefaultPath());
     }();
     return cached;

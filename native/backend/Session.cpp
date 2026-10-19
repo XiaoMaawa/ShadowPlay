@@ -23,10 +23,6 @@
 #include "RingNames.h"
 #include "WindowEnum.h"
 
-// 由 main.cpp 提供：录制器把每个 ffmpeg 子进程挂到这个作业对象上，
-// 服务退出时子进程会被内核一并收掉（没有作业对象时返回 nullptr）。
-extern "C" void* ShadowChildJob();
-
 namespace shadow {
 
 namespace {
@@ -104,9 +100,9 @@ Session::~Session() {
     // 各成员显式按「依赖越深越先拆」的顺序释放，别交给编译器生成的逆序析构。
     //
     // 顺序有讲究：窗口采集（WGC）背后挂着一个专职泵消息的线程，它要跟着
-    // 会话一起停；录制器背后挂着 ffmpeg 管道，要赶在帧环之前收尾。手工写死
-    // 顺序比依赖成员声明位置可靠 —— 以后有人在 Session.h 里挪一行，析构
-    // 顺序就不会跟着悄悄变。
+    // 会话一起停；录制器背后攥着 SinkWriter（还没 Finalize 的分片），要赶在
+    // 帧环之前收尾。手工写死顺序比依赖成员声明位置可靠 —— 以后有人在
+    // Session.h 里挪一行，析构顺序就不会跟着悄悄变。
     Stop();
     windowCapture_.reset();
     recorder_.reset();
@@ -203,12 +199,56 @@ std::string Session::StatusJson() const {
     return std::string(buf) + cap + record + expo + "}";
 }
 
+// 帧环的预留容量。
+//
+// 共享内存的槽容量是建映射那一刻定死的（FrameRing.h 里写得很清楚），而窗口
+// 尺寸可以随时被用户拖大。两种做法：
+//   a) 每次尺寸变化都重建环 —— 消费者必掉线，界面要等 2 秒重新握手；
+//   b) 按"足够大"一次预留，只有真的超了才重建。
+//
+// 选 b)：桌面源的尺寸是固定的，窗口源同一次拖拽里也常常跨不过一个台阶。
+// 余量给到 1.5 倍再向上取整到 64 像素 —— 1440p 一槽是 14.7MB，1.5 倍就是
+// 22MB，四槽 88MB，对一个常驻录制服务是可以接受的；换来的是拖窗口时
+// 绝大多数情况一次都不用重建。
+//
+// 上限只在这里设一次下限：太小的画面（比如 300x200 的小工具窗口）也按
+// 720p 预留，免得用户随便拉一下就超。
+uint32_t Session::RingCapWidth(uint32_t w) {
+    const uint32_t grown = static_cast<uint32_t>(static_cast<uint64_t>(w) * 3u / 2u);
+    const uint32_t base = grown < 1280u ? 1280u : grown;
+    return (base + 63u) & ~63u;
+}
+
+uint32_t Session::RingCapHeight(uint32_t h) {
+    const uint32_t grown = static_cast<uint32_t>(static_cast<uint64_t>(h) * 3u / 2u);
+    const uint32_t base = grown < 720u ? 720u : grown;
+    // 槽容量按 width*4*height 算，高度不用对齐到 64，但留个偶数省得
+    // 和 H.264 的宏块对齐逻辑拌在一起。
+    return (base + 1u) & ~1u;
+}
+
 void Session::EnsureRecorder(uint32_t w, uint32_t h) {
     if (recordRoot_.empty() || w == 0 || h == 0) return;
-    if (recorder_ && recorderW_ == w && recorderH_ == h && recorder_->Running()) return;
 
-    // 尺寸变了（窗口被缩放）必须先收掉旧的：分片尺寸在进程启动时就固定了，
-    // 中途换分辨率只能重起一个 ffmpeg，否则喂进去的字节数对不上。
+    // H.264 的宏块是 16x16，宽高必须取偶。录制器内部会自己向下取偶，但喂帧
+    // 那一步要拿尺寸做校验 —— 如果这里存的还是原始奇数高（窗口高度经常是
+    // 889 这种），Feed() 就会认为尺寸不符，安安静静把每一帧都当"坏帧"丢掉，
+    // 表现为状态里 recording=true 而 recordFrames 永远是 0。
+    w &= ~1u;
+    h &= ~1u;
+    if (w == 0 || h == 0) return;
+
+    // 【尺寸变了不再重建录制器】见 DESIGN.md 9.5。
+    //
+    // 以前这里是 `recorderW_ == w && recorderH_ == h` 才算复用，尺寸一变就
+    // Stop + 新建：新轮次目录、切片从 000000 重来、采集端要重开编码器。后果
+    // 是「拖动改变窗口大小之后，回放里只剩调整之后的画面」，而且服务里其他
+    // 路也跟着抖一下。现在录制器跨尺寸存活，编码器自己切分片。
+    //
+    // 代价：recorderW_/recorderH_ 只表示"建录制器时的尺寸"，之后可能和实际
+    // 帧尺寸不同 —— 这正是 Feed() 不再拿尺寸做校验的原因。
+    if (recorder_ && recorder_->Running()) return;
+
     if (recorder_) {
         recorder_->Stop();
         recorder_.reset();
@@ -246,6 +286,21 @@ bool Session::ExportNow(const std::string& exportDir, double maxSeconds) {
     if (!recorder_) return false;
     const std::string segDir = recorder_->SegmentsDir();
     if (segDir.empty()) return false;
+
+    // 导出前把**正在写的那一片**收尾落盘。
+    //
+    // 【为什么这一步不能省】回放窗口的右端应该是用户按下导出按钮的那一刻。但切片
+    // 是按固定片长的：点导出时总有一片正在写，它没 Finalize、index.csv 里也没有
+    // 它，导出端只能读到最后一片**已完成**的分片 → "点导出之前那半秒到一秒"永远
+    // 导不出来。用户报的就是这个（m09776：「我点击导出视频的时候，前一秒，或者说
+    // 前半秒，画面都丢失了，应该一直录到我点击按钮才停止才对啊」）。
+    //
+    // 切完不中断录制：紧接着开新片继续录、切片序号继续递增、不换轮次目录。
+    // 代价只是那一片比标称短，导出端本来就按每片真实时长铺时间轴。
+    //
+    // 失败不影响导出：FlushSegment 返回 false 只说明"没切"（没在录 / 当前片
+    // 一帧都没有 / 等超时），导出端照旧拿已完成的分片，最多还是丢那一小段。
+    recorder_->FlushSegment();
 
     // 文件名前缀用配置名，避免多路配置同一秒导出时互相覆盖。
     // 配置名里可能有目录分隔符/通配符，先洗一遍 —— 服务端不该把用户输入
@@ -463,7 +518,7 @@ void Session::ThreadMain() {
         const uint32_t w = wgcActive ? windowCapture_->Width() : capture_->Width();
         const uint32_t h = wgcActive ? windowCapture_->Height() : capture_->Height();
 
-        if (!ring_.Open(profile_.id, w, h)) {
+        if (!ring_.Open(profile_.id, RingCapWidth(w), RingCapHeight(h))) {
             // 帧环建不起来多半是名字被占着（上一个自己还没完全退出）。这也不是
             // "这一路彻底完了"，回到外层重试一遍更合理。
             {
@@ -475,6 +530,8 @@ void Session::ThreadMain() {
             continue;
         }
         ring_.SetMode(w, h, 0);
+        ringW_ = w;
+        ringH_ = h;
         {
             std::lock_guard<std::mutex> lk(mu_);
             status_.attached = true;
@@ -508,13 +565,23 @@ void Session::ThreadMain() {
         uint64_t framesInWindow = 0;
         uint64_t captureNsInWindow = 0;
         // 分项计时：captureMs 只量了"采集"那一段，而一拍里还有 Publish（往共享环
-        // memcpy 一整屏）和 Feed（同步写 ffmpeg 管道）两笔大头。只报 captureMs
+        // memcpy 一整屏）和 Feed（拷进待编码槽）两笔大头。只报 captureMs
         // 的时候看不出 fps 卡在 80 到底卡在哪 —— 实测 1440p 每帧 14.7MB，这三笔
         // 加起来是 44MB/拍，120fps 就是 5.3GB/s，正是内存带宽的天花板。
         uint64_t publishNsInWindow = 0;
         uint64_t feedNsInWindow = 0;
         uint64_t loopsInWindow = 0;
         bool connected = false;
+        // 上一拍采集到底有没有真的拿到画面。
+        //
+        // 用来判断"现在能不能说自己是 Live"。放在循环外是为了让 !connected
+        // 那一支（在循环顶部）能看到上一拍的结果 —— frameAction 在循环中部
+        // 才算得出来。
+        //
+        // 判据必须是"采集健康"而不是"消费者在不在"：消费者在不在只决定
+        // 要不要往环里 Publish，采集断没断才是画面有没有的前提。两者混用
+        // 就是那个"NO SIGNAL 撤不掉"的 bug。
+        bool lastFrameOk = false;
         // 本轮的"没人在看"状态。等待消费者那一段里已经 declare 过它了。
         bool waitingSkip = false;
 
@@ -524,13 +591,19 @@ void Session::ThreadMain() {
 
             // ---- 等消费者接入 -------------------------------------------------
             if (!connected) {
-                {
-                    std::lock_guard<std::mutex> lk(mu_);
-                    if (status_.state == SessionState::Waiting ||
-                        status_.state == SessionState::Starting) {
-                        status_.state = SessionState::Waiting;
-                    }
-                }
+                // 注意这里**不**动 status_.state。
+                //
+                // 踩过的坑：这里原本在 !connected 时把状态写成 Waiting，
+                // 而 Waiting 在界面侧是"正常、别盖遮罩"。可 !connected 有两种
+                // 成因：(a) 界面还没连进来，(b) 界面掉线了正在等它回来。
+                // 这两种都写 Waiting 的话，界面刷新（渲染进程换了个 pid）那一
+                // 瞬间状态会从 Reconnecting 跳回 Waiting，画面在"NO SIGNAL"和
+                // "上一帧定格"之间闪一下 —— 用户看到的就是"启动时有画面，
+                // 然后闪一下没信号"。
+                //
+                // 状态该由"采集链路到底通不通"决定，见下面 WaitForConsumer
+                // 成功和采集失败两个分支。
+                //
                 // 超时必须给 0（=只查一次立刻返回）。
                 //
                 // 踩过的坑：这里原本写的是 WaitForConsumer(100)，它内部每 20ms 轮询
@@ -545,18 +618,22 @@ void Session::ThreadMain() {
                     connected = true;
                     {
                         std::lock_guard<std::mutex> lk(mu_);
-                        // 只有"正在 Starting/Waiting"时才能推进到 Live。
+                        // 消费者接上了 —— 只要采集链路是好的，就该是 Live。
                         //
-                        // 【踩过的坑】这里原来无条件写 Live。外层的 AccessLost
-                        // 分支会把状态置成 Reconnecting 去重建采集，一旦重建成功，
-                        // 内层循环重跑回到这里 —— 消费者还连着，于是状态立刻又被
-                        // 改回 Live，那个 Reconnecting 等于白设。
-                        // 更糟的是重建失败时也会走这条路：目标窗口早就没了，
-                        // 界面却一直显示"有画面"，NO SIGNAL 永远盖不上来。
-                        if (status_.state == SessionState::Starting ||
-                            status_.state == SessionState::Waiting) {
-                            status_.state = SessionState::Live;
-                        }
+                        // 【踩过的坑】这里原来只允许 Starting/Waiting 推进到 Live，
+                        // 理由是"别把 AccessLost 分支刚设的 Reconnecting 冲掉"。
+                        // 但那个顾虑的正确解法是"采集没恢复时别写 Live"，
+                        // 而不是"永远不给 Reconnecting 翻身的机会" —— 后者会让
+                        // 状态**永久**卡在 Reconnecting：界面刷新、渲染进程换了
+                        // 一个 pid，服务端判一次心跳过期置 Reconnecting，此后
+                        // 消费者再连回来也没人把状态改回去，NO SIGNAL 就再也
+                        // 撤不掉了（实测就是这个表现：画面明明在动，遮罩一直在）。
+                        //
+                        // 现在改成看"本次采集是否健康"：采集循环正在正常出帧
+                        // （lastFrameOk 表示上一拍拿到了帧）才允许回到 Live。
+                        // AccessLost 那一支重建失败时 lastFrameOk 是 false，
+                        // 状态留在 Reconnecting，遮罩照样盖得上。
+                        if (lastFrameOk) status_.state = SessionState::Live;
                         status_.consumerPid = ring_.ConsumerPid();
                     }
                 } else {
@@ -594,7 +671,7 @@ void Session::ThreadMain() {
             //
             // 1) 这里原本是 `lastPublish + (frameInterval - workEstimate_)`，把
             //    lastPublish 当成基准。但 lastPublish 是在 Feed 录制器**之后**才采的
-            //    （见下面 publishedAt 的位置），而 Feed 是一帧几 MB 的同步管道写。
+            //    （见下面 publishedAt 的位置），而 Feed 是一帧几 MB 的整屏拷贝。
             //    那段耗时被算了两次，实测间隔 11.8ms、帧率钉在 43。
             //    改成从 nextPublish_ 累加后时间轴才自洽。
             //
@@ -629,7 +706,7 @@ void Session::ThreadMain() {
             //
             // 走自己的快照缓冲而不是采集器内部指针：多路配置共用一个 ScreenCapture，
             // 直接拿采集器内部的指针回去用会被别的会话线程覆盖 ——
-            // 那正是帧率忽高忽低（掉到 28）、画面花屏、ffmpeg 收到脏像素的真因。
+            // 那正是帧率忽高忽低（掉到 28）、画面花屏、编码器收到脏像素的真因。
             //
             // 两条源必须分派：WGC 模式下 capture_ 是 **nullptr**（见上面
             // 「优先走 WGC」那段），无脑解引用必崩。
@@ -640,10 +717,23 @@ void Session::ThreadMain() {
                 snap_.resize(static_cast<size_t>(expectW) * 4u * expectH);
             }
 
+            // ---- 窗口尺寸变了：换帧环、换录制器 --------------------------------
+            //
+            // WGC 的帧池会跟着窗口重建（见 WindowCapture::Capture），所以同一路
+            // 会话在不同时刻拿到的帧尺寸可以完全不同。这里处理随之而来的两件事：
             uint32_t gotW = 0;
             uint32_t gotH = 0;
             int64_t  gotQpc = 0;
             bool     isNew = false;
+            // snap_ 里这一刻装的是不是 gotW×gotH 的**真实像素**（而不是"沿用旧尺寸"）。
+            //
+            // 这个标记是必需的：窗口换尺寸后，采集会话会重建，而新尺寸的第一帧
+            // 可能晚几拍才到。这期间 windowCapture_->Width() 已经是新尺寸，但
+            // snap_ 里还是旧尺寸的图。以前这里没有这个标记，直接把 gotW 当成
+            // 沿用的旧值继续往下走，于是「gotW 是旧的、ringW_ 是新的」持续不等，
+            // 每拍都触发一次"尺寸变了"—— 实测表现为录制器反复重建、
+            // recordFrames 归零后再也涨不起来，画面看着就是卡死。
+            bool     frameValid = false;
             CaptureStatus cs = CaptureStatus::Error;
             {
                 if (useWgc) {
@@ -655,6 +745,7 @@ void Session::ThreadMain() {
                         gotH = fvRaw_.height;
                         gotQpc = fvRaw_.presentQpc;
                         isNew = true;
+                        frameValid = true;
                     } else if (cs == CaptureStatus::NoChange) {
                         // 窗口这一拍没重绘（WGC 只在窗口重绘时投帧）。
                         //
@@ -664,10 +755,16 @@ void Session::ThreadMain() {
                         // 录进去的是零宽帧，实测帧率从 60 掉到 52。
                         //
                         // snap_ 里本来就还留着上一拍拷进来的像素（这一路自己的缓冲），
-                        // 直接沿用它的尺寸即可。
+                        // 直接沿用它的尺寸即可 —— 但**只有尺寸对得上**才能沿用。
+                        // 窗口刚换过尺寸时 snap_ 里是旧尺寸的图，这时候报 Ok 会让
+                        // 上层以为"有新的一帧"，实际上像素是错的尺寸、录制器也会
+                        // 被反复重建。所以这种情形老实认 NoChange，让上层等下一帧。
                         gotW = snapW_;
                         gotH = snapH_;
-                        if (gotW > 0 && gotH > 0) cs = CaptureStatus::Ok;
+                        if (gotW > 0 && gotH > 0) {
+                            cs = CaptureStatus::Ok;
+                            frameValid = true;
+                        }
                     }
                 } else {
                     // 采集器是共享的，取快照期间必须独占它。
@@ -685,6 +782,10 @@ void Session::ThreadMain() {
                         // isNew 现在只能说明"本路这一拍拿到了内容"，不能说明"桌面变了"，
                         // 但这正是下游要的口径：喂录制器的是连续帧流，不是变化事件。
                         isNew = true;
+                        // 桌面源也一样要置 frameValid：snapW_/snapH_ 是喂录制器和
+                        // 发布预览用的尺寸来源，不置它就一直停在 0，录制器一帧都
+                        // 收不到（症状：recording=true、recordFrames 永远 0）。
+                        frameValid = gotW > 0 && gotH > 0;
                     } else if (cs == CaptureStatus::NoChange) {
                         // 这一拍桌面没动。把采集器攥着的上一张重放到**本路自己的**缓冲里，
                         // 然后当成一帧正常的帧继续走 —— 录像要的是连续帧流，
@@ -702,17 +803,71 @@ void Session::ThreadMain() {
                             gotH = snapH_;
                             cs = CaptureStatus::Ok;
                             isNew = false;
+                            frameValid = true;
                         } else if (capture_->AcquireReplayLocked(snap_.data(), snap_.size(), gotW,
                                                                  gotH, gotQpc)) {
                             cs = CaptureStatus::Ok;
                             isNew = false;
+                            frameValid = gotW > 0 && gotH > 0;
                         }
                     }
                 }
             }
-            snapW_ = gotW;
-            snapH_ = gotH;
-            const uint32_t snapStride = gotW * 4u;
+            // ---- 只有真的拿到像素时才更新"上一帧尺寸" ---------------------
+            //
+            // 踩过的坑（非常隐蔽，症状是"改一次窗口大小之后录制就再也不出帧"）：
+            // 这里原来是无条件 `snapW_ = gotW; snapH_ = gotH;`。而 AccessLost /
+            // Error 那一拍 gotW/gotH 都是 0，于是 snapW_ 被改成 0；下一拍 WGC
+            // 报 NoChange，代码走"沿用上一帧"分支，看到 snapW_ == 0 就只能放弃
+            // —— 此后每一拍都放弃，frameAction 永远 false，录制器再也收不到帧，
+            // 而状态里 actualFps 正常（节拍在跑）、recordBytes 还在（旧的），
+            // 只有 recordFrames 归零不动。查了很久。
+            if (frameValid) {
+                snapW_ = gotW;
+                snapH_ = gotH;
+            }
+            const uint32_t snapStride = snapW_ * 4u;
+
+            // ---- 画面尺寸变了：预览和录制都得跟着改 ----------------------
+            //
+            // 【为什么这件事必须在这里做】窗口被用户拖大/拖小时，WGC 的帧
+            // 尺寸会跟着变（WindowCapture 内部会重建帧池），而下游有两处
+            // 尺寸是**建的时候定死的**：
+            //
+            //   1) 帧环的槽容量（共享内存一旦创建容量就固定，见 FrameRing.h）。
+            //      窗口超出预留容量后 Publish 会直接返回 false，界面就永远停在
+            //      旧尺寸上 —— 用户看到的就是"窗口放大了，预览还是小小一块"。
+            //   2) 录制器的编码器（分片宽高定了就不能改，H.264 流中间不能换尺寸）。
+            //
+            // 所以尺寸一变就得：超容量就换环、然后确保录制器也换了。
+            //
+            // 【为什么只对 WGC 触发】桌面源的尺寸是显示器分辨率，会话期间不会变；
+            // 而且多路同源共享一个采集器，跟着一路去重建环会把别路一起打断。
+            //
+            // 【为什么比较 ringW_ 而不是直接比 snapW_】静止的窗口每一拍都走
+            // NoChange，snapW_ 是沿用值，不会误触发。真正要防的是"已经 SetMode
+            // 过了还反复 SetMode" —— 那会每拍都复位一次轮转状态，消费者读到的
+            // 帧序号乱跳，界面表现为闪。
+            if (useWgc && gotW > 0 && gotH > 0 && (gotW != ringW_ || gotH != ringH_)) {
+                if (ring_.NeedsGrow(gotW, gotH)) {
+                    // 容量不够了：整个环重建（消费者会掉线一次，界面端 2 秒
+                    // 扫描兜住重连，见 preload.cjs 的 attachSession）。
+                    if (!ring_.Open(profile_.id, RingCapWidth(gotW), RingCapHeight(gotH))) {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        status_.detail = "帧环重建失败：" + ring_.LastError();
+                    } else {
+                        ring_.SetMode(gotW, gotH, 0);
+                    }
+                } else {
+                    // 容量够，只需要把头部几何信息改掉。
+                    ring_.SetMode(gotW, gotH, 0);
+                }
+                ringW_ = gotW;
+                ringH_ = gotH;
+                // 录制器按新尺寸重开一轮分片（内部会 Stop 旧的再起新的，
+                // 旧的那一轮留在磁盘上照常可导出）。
+                EnsureRecorder(gotW, gotH);
+            }
 
             const auto actEnd = std::chrono::steady_clock::now();
             captureNsInWindow += static_cast<uint64_t>(
@@ -720,7 +875,7 @@ void Session::ThreadMain() {
 
             bool published = false;
             // 这一拍做 Publish 判定的时刻。放在这里而不是用后面的 publishedAt：
-            // 预览限流要的是"现在能不能发"，晚一拍量出来的时间点会被录制写管道
+            // 预览限流要的是"现在能不能发"，晚一拍量出来的时间点会被录制拷贝
             // 的耗时污染。
             const auto publishedNow = std::chrono::steady_clock::now();
             // 这一轮是否"有帧可录"。和 published **不是**一回事：published 只在
@@ -738,7 +893,7 @@ void Session::ThreadMain() {
                     // ---- 预览限流 ------------------------------------------
                     //
                     // 录制帧率（fps）和预览帧率是**两件不同的事**，不能绑在一起：
-                    //   * 录制要按配置帧率喂 ffmpeg，少一帧时间轴就歪；
+                    //   * 录制要按配置帧率喂编码器，少一帧时间轴就歪；
                     //   * 预览只要够顺眼就行，1440p 每帧 14.7MB 的 memcpy 在
                     //     120fps 下是 1.77GB/s，实测把循环从 120 拖到 91fps。
                     //
@@ -785,12 +940,21 @@ void Session::ThreadMain() {
                 frameAction = true;
                 (void)isNew;
             } else if (cs == CaptureStatus::AccessLost) {
-                // 锁屏 / UAC / 分辨率切换 / 窗口关闭：重建采集。
+                // 锁屏 / UAC / 分辨率切换 / 窗口关闭 / 窗口改尺寸：重建采集。
                 //
                 // 这里必须**一直重试**，不能试一次就判死。WGC 这一路最典型：
                 // 用户关掉了被录的窗口，过几秒又开了一个同样的窗口（记事本、VSCode
                 // 这种应用常见），此时按匹配规则重新解一次就该能接上。以前这里是
                 // "重建一次失败 → status 置 Failed → 后面再也不会试"，于是只能重启服务。
+                //
+                // 【窗口改尺寸也走这条路】
+                // WGC 的帧池是 Init 时按当时窗口尺寸建的，不会自己跟随；而重建
+                // 帧池（IDirect3D11CaptureFramePool::Recreate）实测会把投帧渠道
+                // 弄断 —— 之后再也不来 FrameArrived，画面永远停在旧内容上。
+                // 唯一可靠的办法是重建整个采集会话，正好就是这条路径。
+                // 用 resizeNotice 区分：尺寸变了的话窗口还在、句柄还是那个，
+                // 应该原地重开，不能重新按规则匹配（那可能抓到另一个同类窗口）。
+                const bool byResize = useWgc && windowCapture_->TakeResizeNotice();
                 {
                     std::lock_guard<std::mutex> lk(mu_);
                     // 状态必须一起改成 Reconnecting，不能只改 detail。
@@ -801,7 +965,7 @@ void Session::ThreadMain() {
                     // 永远盖不上来 —— 用户看到的就是"最后一帧卡死在那儿"。
                     // 重建那 6 次一共要等五六秒，这段时间足够长，状态必须诚实。
                     status_.state = SessionState::Reconnecting;
-                    status_.detail = "采集被中断，正在重建";
+                    status_.detail = byResize ? "窗口尺寸变了，正在重建采集" : "采集被中断，正在重建";
                     status_.recording = false;
                 }
                 // 先停掉录制器：画面已经断了，继续往里喂旧帧会把时间轴拉长。
@@ -811,12 +975,31 @@ void Session::ThreadMain() {
                 uint32_t newH = 0;
                 for (int attempt = 0; attempt < kRebuildAttempts; ++attempt) {
                     if (stopRequested_.load(std::memory_order_acquire)) break;
-                    Sleep(attempt == 0 ? 200 : 1000);
+                    // 改尺寸引起的重建：窗口还在，没必要等，第一轮立刻干。
+                    // 窗口关了引起的重建：等 200ms 给用户/系统一点时间。
+                    if (attempt > 0 || !byResize) Sleep(attempt == 0 ? 200 : 1000);
                     if (stopRequested_.load(std::memory_order_acquire)) break;
                     if (useWgc) {
+                        // 重新 Init 之前必须 Cleanup：泵线程、帧池、会话都得收干净，
+                        // 否则老会话的 FrameArrived 还会往老的 frameArrived 上写。
+                        // 句柄要**先**取下来 —— Cleanup 会把 hwnd_ 清空。
+                        const HWND keep = static_cast<HWND>(windowCapture_->Hwnd());
+                        windowCapture_->Cleanup();
+                        if (byResize && keep) {
+                            // 尺寸变化：句柄还是那个窗口，原地重开就行。
+                            // 窗口在重建期间又关了的话 Init 会失败，下一轮
+                            // 退化成"重新匹配"。
+                            std::string werr;
+                            if (windowCapture_->Init(keep, werr)) {
+                                rebuilt = true;
+                                newW = windowCapture_->Width();
+                                newH = windowCapture_->Height();
+                                break;
+                            }
+                            // 句柄失效了：落到下面的重新匹配逻辑。
+                        }
                         // WGC 这一路：窗口关了就得**重新按匹配规则解一个**再 Init。
                         // （WindowCapture 会置 closed；沿用旧句柄是死路。）
-                        windowCapture_->Cleanup();
                         WindowInfo again;
                         if (!profile_.match.Valid()) break;  // 没规则，再试也没用
                         if (!ResolveWindow(profile_.match, again) || !again.hwnd) continue;
@@ -847,11 +1030,36 @@ void Session::ThreadMain() {
                     }
                 }
                 if (rebuilt) {
-                    ring_.SetMode(newW, newH, 0);
+                    // 窗口被拉大之后可能超出帧环的预留容量（建映射时按 1.5 倍
+                    // 预留，见 RingCapWidth）。超了 Publish 会静默失败 —— 预览
+                    // 变成"有状态没画面"，特别难查。所以这里显式判一次。
+                    if (ring_.NeedsGrow(newW, newH)) {
+                        if (!ring_.Open(profile_.id, RingCapWidth(newW), RingCapHeight(newH))) {
+                            std::lock_guard<std::mutex> lk(mu_);
+                            status_.detail = "帧环重建失败：" + ring_.LastError();
+                        } else {
+                            ring_.SetMode(newW, newH, 0);
+                        }
+                    } else {
+                        ring_.SetMode(newW, newH, 0);
+                    }
+                    ringW_ = newW;
+                    ringH_ = newH;
                     // 分辨率可能变了：录制器尺寸固定，得重建一份才能继续录。
                     EnsureRecorder(newW, newH);
                     std::lock_guard<std::mutex> lk(mu_);
                     status_.state = SessionState::Live;
+                    // detail 必须在这里重写回正常描述。
+                    //
+                    // 踩过的坑：只恢复 state 不恢复 detail，界面上的提示就永远
+                    // 停在"窗口尺寸变了，正在重建采集"—— 画面明明已经在正常
+                    // 刷新了，用户却以为一直在重建。
+                    if (useWgc && newW > 0) {
+                        status_.detail = "窗口（WGC）：" + status_.matchedTitle;
+                    } else if (!useWgc && capture_) {
+                        status_.detail = "整屏（显示器 " +
+                                         std::to_string(profile_.source.monitorIndex) + "）";
+                    }
                 } else {
                     // 重试用完还是重建不起来：别在这里"判死"。
                     //
@@ -926,7 +1134,10 @@ void Session::ThreadMain() {
             if (recorder_ && frameAction && snapW_ > 0 && !snap_.empty()) {
                 const uint32_t snapStride = snapW_ * 4u;
                 const auto feedT0 = std::chrono::steady_clock::now();
-                recorder_->Feed(snap_.data(), snapStride, recorderW_, recorderH_);
+                // 传的必须是**这一帧的真实尺寸**（snapW_/snapH_），不是建录制器
+                // 时的 recorderW_/recorderH_：窗口拖大拖小之后两者不同，而
+                // 编码器靠这个尺寸决定要不要切一片新的（见 DESIGN.md 9.5）。
+                recorder_->Feed(snap_.data(), snapStride, snapW_, snapH_);
                 feedNsInWindow += static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - feedT0).count());
@@ -948,6 +1159,8 @@ void Session::ThreadMain() {
             // frameAction 的含义才是"这一拍确实产生了一帧"（新帧或静止重发），
             // 录制器也是按它喂的，两者口径一致。
             if (frameAction) framesInWindow++;
+            // 把这一拍的结果留给下一轮的"能不能回到 Live"判断。
+            lastFrameOk = frameAction;
             // "干活"估计值，用来把下一轮的 deadline 往前挪（见 nextDue 的注释）。
             //
             // 用**积分修正**而不是纯 EMA：EMA 有稳态偏差 —— 它只会从下面慢慢逼近，
@@ -1090,10 +1303,10 @@ void Session::ThreadMain() {
         break;  // 真的是 Stop
     }  // 外层循环
 
-    // 收录制器：关掉管道让 ffmpeg 把最后一个不完整分片 flush 完再退出。
+    // 收录制器：让 MfEncoder 把当前分片 Finalize 掉（写完索引再关文件）。
     // 放在这里（线程末尾）而不是析构里，是为了让"停止"这件事有个确定的
-    // 收尾点：析构可能发生在服务被强杀之后，那时 ffmpeg 会变成孤儿进程
-    // 继续占着分片目录。
+    // 收尾点：析构可能发生在服务被强杀之后，那时没 Finalize 的分片就留在
+    // 磁盘上（fMP4 自带 moof，前面的部分仍可读）。
     if (recorder_) {
         recorder_->Stop();
         RefreshRecordStatus();

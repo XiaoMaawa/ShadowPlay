@@ -131,6 +131,11 @@ public:
 
     const std::string& Id() const { return profile_.id; }
 
+    // 这份新配置和本会话正在用的那份，采集 + 编码参数是否完全一致。
+    // reload 用它决定「其实什么都没改、不必重建」（见 Profiles.h 的说明）。
+    bool SameSettings(const Profile& other) const { return profile_.SameSettings(other); }
+    const Profile& Config() const { return profile_; }
+
     // 配置显示名（导出文件名前缀、事件里给界面显示用）。
     const std::string& Name() const { return profile_.name; }
 
@@ -168,8 +173,13 @@ private:
     void ThreadMain();
     // 解析采集源，成功则填好 capture_ / windowCapture_，返回是否可用。
     bool ResolveSource();
-    // 按当前画面尺寸建/重建录制器（尺寸变了就得重起 ffmpeg）。
+    // 按当前画面尺寸建/重建录制器（尺寸变了就得重建编码器）。
     void EnsureRecorder(uint32_t w, uint32_t h);
+    // 帧环的预留容量。窗口可以随用户拖大，而共享内存的槽容量建好就定死，
+    // 所以不能只按当前尺寸预留 —— 这里按"当前尺寸 + 余量"给一份上限，
+    // 到上限还可以再重建一次（见 Session.cpp 里的换环逻辑）。
+    static uint32_t RingCapWidth(uint32_t w);
+    static uint32_t RingCapHeight(uint32_t h);
     // 把状态里的录制信息刷新一遍（每秒调一次，扫目录有开销）。
     void RefreshRecordStatus();
 
@@ -178,7 +188,7 @@ private:
     std::string recordRoot_;
 
     // 分片录制（需求 5）。窗口源一开始匹配不到时它是空的，
-    // 等窗口出现、尺寸定下来再建 —— 分辨率必须先知道才好起 ffmpeg。
+    // 等窗口出现、尺寸定下来再建 —— 分辨率必须先知道才好起编码器。
     std::unique_ptr<SegmentRecorder> recorder_;
     uint32_t recorderW_ = 0;
     uint32_t recorderH_ = 0;
@@ -234,6 +244,13 @@ private:
     std::vector<uint8_t> snap_;
     uint32_t snapW_ = 0;
     uint32_t snapH_ = 0;
+    // 帧环当前**生效**的尺寸（= 最近一次 SetMode 给它的那对值）。
+    //
+    // 和 snapW_/snapH_ 分开记：snap 是"这一拍采到多大"，环是"对外宣称多大"。
+    // 窗口缩放后两者会短暂不一致（池刚重建、新尺寸那张还没到），需要一个
+    // 地方记住环的真实状态，才不会被反复 SetMode。
+    uint32_t ringW_ = 0;
+    uint32_t ringH_ = 0;
     // Capture() 的元数据出口（尺寸/QPC）。像素不用它——像素走 snap_。
     FrameView fvRaw_;
     // 本路已经吃过的「最近一张」版本号。多路同源时靠它决定要不要真的去

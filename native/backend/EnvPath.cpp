@@ -5,7 +5,7 @@
 
 #include <string>
 
-#include "FfmpegUtil.h" // FromUtf8 / ToUtf8
+#include "Utf8Path.h" // FromUtf8 / ToUtf8
 
 namespace shadow {
 

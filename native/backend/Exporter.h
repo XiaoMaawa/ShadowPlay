@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -40,6 +41,14 @@ struct ExportStatus {
     double      elapsedMs = 0.0;
     uint64_t    jobId = 0;          // 递增；界面靠它区分"这是不是新的一次"
 };
+
+/**
+ * 把诊断日志的出口接进来（服务启动时传 main.cpp 的 LogLine）。
+ *
+ * 不接就静默 —— Exporter 不直接依赖服务进程的 stdout，探针和单测才能复用。
+ * 现在只用来打 export_plan：计划里到底铺了哪些片、哪些位置补了 NO SIGNAL。
+ */
+void SetExporterPlanLog(std::function<void(const std::string&)> sink);
 
 class Exporter {
 public:

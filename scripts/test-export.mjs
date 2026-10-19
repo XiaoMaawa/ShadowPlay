@@ -27,8 +27,14 @@ import { projectRoot, tempRoot, electronDistPath, assertElectronDist } from './e
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-const waitSeconds = Number(process.argv[2]) > 0 ? Number(process.argv[2]) : 14
 const replaySeconds = Number(process.env.SHADOW_TEST_REPLAY_SECONDS ?? 20)
+// 【等待时长必须大于回放窗口】以前这里直接拿命令行那个数当等待上限，于是
+// `test-export.mjs 18` 在 20 秒的回放窗口下**永远录不满**：导出时回放窗口里
+// 有 16 秒"还没录到"，被按设计补成 NO SIGNAL，成片是黑的却一路判"通过"。
+// 现在至少等到回放窗口 + 6 秒（留出切片/落盘的余量），调用方给的数只能把它
+// 调得更长，不能调短。
+const requested = Number(process.argv[2]) > 0 ? Number(process.argv[2]) : 0
+const waitSeconds = Math.max(requested, replaySeconds + 6)
 
 const PROOF_DIR = path.join(tempRoot, 'proofs', 'export')
 const EXPORT_DIR = path.join(PROOF_DIR, 'exports')
@@ -42,6 +48,16 @@ const backend = path.join(projectRoot, 'native', 'build', 'shadow-capture.exe')
 
 if (!existsSync(backend)) {
   console.error(`[test-export] 找不到采集服务：${backend}\n请先执行 npm run build:native`)
+  process.exit(1)
+}
+
+// 界面产物缺了的话，Electron 打开的是一个白窗口，脚本只会"等报告超时"，
+// 完全看不出是 dist 没构建。这里提前拦住并说清补什么命令。
+if (!existsSync(path.join(tempRoot, 'dist', 'index.html'))) {
+  console.error(
+    `[test-export] 找不到界面产物：${path.join(tempRoot, 'dist', 'index.html')}\n` +
+      '请先执行 npm run build:web',
+  )
   process.exit(1)
 }
 
@@ -78,7 +94,7 @@ function killStrayServices() {
 }
 
 killStrayServices()
-// 进程退干净、句柄释放需要一点时间（服务还要收尾 ffmpeg 子进程）。
+// 进程退干净、句柄释放需要一点时间（服务还要 Finalize 当前分片）。
 await new Promise((r) => setTimeout(r, 1500))
 console.log('[test-export] 已清掉残留的采集服务')
 

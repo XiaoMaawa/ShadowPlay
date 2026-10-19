@@ -139,6 +139,9 @@ private:
 
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+    // 最近一次 SetMode 的像素格式，用来判断"模式真的变了"没有 ——
+    // 只是宽度高度抖一下不该让消费者重建纹理（见 SetMode 的注释）。
+    uint32_t modeFormat_ = 0;
     uint32_t consumerPid_ = 0;
     int      nextSlot_ = 0;
     int      lastPublishedSlot_ = -1;   // 最近一次发布的槽，用于"重复发布最后一帧"

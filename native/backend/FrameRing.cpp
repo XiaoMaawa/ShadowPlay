@@ -215,11 +215,34 @@ void FrameRing::SetMode(uint32_t width, uint32_t height, uint32_t format) {
     StoreU32(&header_->height, height);
     StoreU32(&header_->stride, width * 4u);
     StoreU32(&header_->format, format);
-    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&header_->modeChangeCount));
+
+    // modeChangeCount 只在**尺寸真的变了**的时候才加。
+    //
+    // 这个函数原来每拍都无条件 +1。而拖动窗口时 WGC 每帧报一个不同的
+    // ContentSize，Session 就会每拍调一次 SetMode（哪怕只是 1 像素的抖动），
+    // 于是这个计数器在拖拽期间疯涨。消费者拿它当"布局变了、要重建纹理"
+    // 的信号，就变成了每帧重建一次 GL 纹理 —— 这正是"窗口大小改变的时候
+    // 过渡不够丝滑"的一个来源。
+    //
+    // 现在只有 width/height/format 任一真的变化才计数。
+    const bool changed = (width_ != width || height_ != height || modeFormat_ != format);
+    if (changed) {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&header_->modeChangeCount));
+    }
 
     width_ = width;
     height_ = height;
-    nextSlot_ = 0;
+    modeFormat_ = format;
+
+    // **不要在这里重置 nextSlot_**。
+    //
+    // 原来这里有一句 `nextSlot_ = 0;`，含义大概是"换尺寸了从头开始轮转"。
+    // 但它和生产者轮转是同一个变量：拖拽期间每拍都调 SetMode，于是每一帧
+    // 都被写进 0 号槽。消费者用 sequence lock 校验（上传前后 header.version
+    // 必须一致），写同一个槽时消费者正好在读那个槽 —— 校验必然失败、这一帧
+    // 被丢掉，表现就是拖拽期间预览一顿一顿（掉帧率能到一半以上）。
+    //
+    // 槽位轮转必须只由 Publish 推进。
 }
 
 bool FrameRing::WaitForConsumer(uint32_t timeoutMs) {
@@ -228,6 +251,30 @@ bool FrameRing::WaitForConsumer(uint32_t timeoutMs) {
         if (!header_) return false;
         const uint32_t pid = LoadU32(&header_->consumerPid);
         if (pid != 0 && pid != GetCurrentProcessId()) {
+            // 这个 pid 真的还活着吗？
+            //
+            // 踩过的坑：这里原来只看 `pid != 0` 就返回 true。消费者被杀掉
+            // 之后没人会把 header.consumerPid 清零（进程是被强杀的，析构函数
+            // 没机会跑），于是这个陈旧 pid 永远留着，服务端一直以为"有人在
+            // 看"：会话状态卡在 Live、不转 Reconnecting/NO SIGNAL，重启界面
+            // 之后旧 pid 也要等到新消费者覆盖它才会变。
+            //
+            // 判活必须用和 ConsumerAlive() 同一套标准（心跳优先、pid 兜底），
+            // 否则两处会给出互相矛盾的答案：ConsumerAlive() 说死了要置
+            // Reconnecting，WaitForConsumer() 下一秒又说活着把状态推回 Live，
+            // 界面就在 NO SIGNAL 和最后一帧之间来回闪。
+            if (!ConsumerAlive()) {
+                // 死了：把陈旧的 pid 清掉，让下一次判断落到"没接入"分支。
+                //
+                // 只在真的确认它死了之后才清 —— ConsumerAlive() 对新接入的
+                // 消费者（心跳还没写第一次）返回 true，不会误伤。
+                InterlockedCompareExchange(
+                    reinterpret_cast<volatile LONG*>(&header_->consumerPid), 0,
+                    static_cast<LONG>(pid));
+                if (GetTickCount() - start >= timeoutMs) return false;
+                Sleep(20);
+                continue;
+            }
             const bool isNewConsumer = (pid != consumerPid_);
             consumerPid_ = pid;
             if (isNewConsumer) {
@@ -277,7 +324,22 @@ bool FrameRing::ConsumerAlive(uint32_t staleMs) const {
     const int64_t beat = InterlockedCompareExchange64(
         reinterpret_cast<volatile LONG64*>(&header_->consumerHeartbeatQpc), 0, 0);
 
-    if (beat != 0) {
+    if (beat == 0) {
+        // 从没写过心跳 —— 几乎只可能是"刚握手、第一次心跳还没来得及写"。
+        //
+        // 消费者 Bind() 里的顺序是「先写 consumerPid，再 TouchHeartbeat()」，
+        // 中间有几微秒的窗口。生产者是每 500ms 查一次，撞上这个窗口的概率
+        // 不算低，而撞上的后果很重：判一次"消费者已死"就要走
+        // connected=false → state=Reconnecting，界面那边立刻铺 NO SIGNAL，
+        // 一秒钟后又自己好了 —— 用户看到的就是"启动时有画面，然后闪一下
+        // 没信号"。
+        //
+        // 所以这里按"信它"处理。真正的死消费者一定写过心跳（Bind 成功就会
+        // 写一次），beat==0 而 consumerPid!=0 的组合只出现在刚接入那一瞬。
+        return true;
+    }
+
+    {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         const int64_t ageMs = (now.QuadPart - beat) * 1000 / qpcFrequency_;

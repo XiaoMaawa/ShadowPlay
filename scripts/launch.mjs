@@ -263,6 +263,19 @@ if (backendMissing) {
   )
 }
 
+// 界面产物也必须先构建。以前漏了这条检查：dist/ 缺了的时候界面窗口会打开
+// 但白屏，主进程只打一句"加载开发服务器失败"（因为非开发模式也去连
+// 127.0.0.1:5173 了），看上去像网络问题。现在启动前就说清楚。
+const webEntry = path.join(TEMP_ROOT, 'dist', 'index.html')
+if (!existsSync(webEntry) && !process.env.DEV_SERVER_URL) {
+  console.warn(
+    '[launch] 警告：界面产物还没构建（' +
+      webEntry +
+      '）。\n' +
+      '         先执行 npm run build:web，或者 npm run build 一次编完原生 + 界面。',
+  )
+}
+
 if (!isProbe && !backendMissing && !serviceStatus().running) {
   console.log('[launch] 采集服务没在运行，先拉起它…')
   // 有 profiles.json 就让服务跑多会话模式；否则退回单路模式。

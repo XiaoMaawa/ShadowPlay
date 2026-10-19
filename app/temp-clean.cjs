@@ -21,8 +21,8 @@
 //
 // 采集服务现在是**独立进程**，关掉界面它也不停（用户明确要求）。
 // 于是"启动界面"和"服务正在录制"完全可能同时成立 —— 这时把 records/ 整棵
-// 删掉，ffmpeg 手里那个句柄指向的文件就没了：它要么写失败、要么 muxer 找
-// 不回分片，最后在界面上表现为「ffmpeg 提前退出（分片写入中断）」。查了很
+// 删掉，编码器手里那个句柄指向的文件就没了：它要么写失败、要么解不出分片
+// 索引，最后在界面上表现为「编码器提前退出（分片写入中断）」。查了很
 // 久才发现根因是清理逻辑自己把正在录的东西删了。
 //
 // 所以 records/ 改成**看服务活没活着**再决定：服务在跑就一个字节都不动。
@@ -42,9 +42,23 @@ const EPHEMERAL_IN_PROOFS = ['recording', 'export', 'selfheal', 'reload', 'hang'
 const KEEP_IN_ROOT = ['dist']
 
 /**
+ * 临时根下这些是**用户设置**，启动清理时必须原样留着。
+ *
+ * 【为什么要单列一条】settings.json（预览帧率上限等）就放在临时根下，而清理
+ * 逻辑是"根目录下不是白名单的一律删"。漏掉这一条的表现是：用户把预览帧率从
+ * 60 调到 30、点确认、当时生效，**下次打开又变回 60** —— 因为每次启动都先把
+ * 设置文件删了，loadSettings() 读不到就退回默认值。用户报的就是这个
+ * （m11513：「右上角齿轮设置，调节了预览帧率，怎么不见你给他保存起来，不然
+ * 下次打开又是60fps」）。
+ *
+ * 和 dist/ 一样，它不属于"这一次运行留下的产物"，而是跨运行要留住的状态。
+ */
+const KEEP_ROOT_FILES = ['settings.json']
+
+/**
  * 这些目录里有**活着的进程正在写**，启动清理默认不动。
  *
- * records/ 由采集服务的 ffmpeg 写；服务独立运行，界面重启时它常常还在录。
+ * records/ 由采集服务的进程内编码器写；服务独立运行，界面重启时它常常还在录。
  * 调用方可以通过 opts.keepLive 显式覆盖（服务确实没跑时才清）。
  */
 const LIVE_WRITTEN = ['records']
@@ -67,7 +81,7 @@ function rmQuiet(target) {
     rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 })
     return true
   } catch {
-    // 文件被占着（服务还在跑、ffmpeg 还没退）就跳过，下次再说。
+    // 文件被占着（服务还在跑、编码器还没收尾）就跳过，下次再说。
     return false
   }
 }
@@ -98,8 +112,13 @@ function purgeRunArtifacts(tempRoot, opts = {}) {
       kept.push(name)
       continue
     }
+    if (KEEP_ROOT_FILES.includes(name)) {
+      // 用户设置（预览帧率等）：跨运行要留住，删了下次启动就退回默认值
+      kept.push(name)
+      continue
+    }
     if (liveDirs.includes(name)) {
-      // 有活着的进程在写（采集服务的 ffmpeg），删了就是「分片写入中断」
+      // 有活着的进程在写（采集服务的编码器），删了就是「分片写入中断」
       kept.push(name)
       continue
     }
@@ -177,7 +196,11 @@ function cleanOnStartup(tempRoot, opts = {}) {
   const { removed, kept } = purgeRunArtifacts(tempRoot, { keepLive: opts.keepLive })
   ensureLayout(tempRoot)
   if (removed.length) log(`已清理上次运行的临时产物：${removed.length} 项`)
-  const noteable = kept.filter((k) => !k.startsWith('dist'))
+  // dist/ 和 settings.json 是"本来就该留着"的，不该出现在"保留"提示里 ——
+  // 那行提示是给用户看"这次为什么没清干净"的，混进常驻项只会造成噪音。
+  const noteable = kept.filter(
+    (k) => !k.startsWith('dist') && !KEEP_ROOT_FILES.includes(k),
+  )
   if (noteable.length) log(`保留：${noteable.join(', ')}`)
   return { removed, kept }
 }

@@ -82,7 +82,7 @@ sweepStaleRoots({ log: (m) => console.log('[main]', m) })
 // 不清理的话这些误判比垃圾本身难查得多。
 //
 // 例外是 records/：采集服务是独立进程，关掉界面它照样在录。这时删掉它就是
-// 把 ffmpeg 正在写的分片抽走，界面上会报「ffmpeg 提前退出（分片写入中断）」。
+// 把编码器正在写的分片抽走，界面上会报「编码器提前退出（分片写入中断）」。
 // 所以先看一眼状态文件：够新就说明服务活着，records/ 一个字节都不动。
 //
 // 这里不能调 serviceRunningFast()：它要判断 SERVICE_EXE 存不存在，而那个
@@ -221,7 +221,7 @@ const DEFAULT_SETTINGS = {
   // 共享环 memcpy 一次全屏（1440p 是 14.7MB）。限到 60 直接把这份带宽砍半，
   // 省下的时间归采集循环自己用 —— 录制帧率反而更容易达标。
   //
-  // **只管预览**：录制照旧按每路配置的帧率喂 ffmpeg，导出也照旧按配置帧率，
+  // **只管预览**：录制照旧按每路配置的帧率喂编码器，导出也照旧按配置帧率，
   // 这个值对成片没有任何影响。
   previewMaxFps: 60,
 }
@@ -312,6 +312,7 @@ const live = {
   sessions: [], // 每个配置的最新一条 session 状态
   profilesLoaded: null, // 服务的 profiles_loaded 消息
   exportEvents: [], // 最近的导出事件（界面用来弹提示）
+  lastExportPlan: '', // 最近一次导出的计划诊断行（export_plan 事件）
   updatedAt: 0,
   sawServiceOutput: false,
   mirrored: null, // 最近一次读到的状态文件（{file, ageMs, doc}），没有就是 null
@@ -363,6 +364,20 @@ function ingestServiceLine(line) {
     if (msg.type === 'export_result') live.lastExportResult = msg
   } else if (msg.type === 'desktop_ready' || msg.type === 'no_sessions') {
     live.lastNotice = msg
+  } else if (msg.type === 'export_plan') {
+    // 导出计划的诊断行（哪个片、哪一段补了 NO SIGNAL）。
+    //
+    // 为什么要存下来：NO SIGNAL 的三种成因（分片真有空洞 / 计划器算漏 /
+    // 某片 probe 失败被跳过）只看摘要分不清，而这行日志只在 --gui-export
+    // 里靠 stdout 能看见 —— 服务是常驻进程、被别的界面复用时就看不到了。
+    // 存进 report 之后，验收报告自己就带着"为什么补了遮罩"。
+    live.lastExportPlan = msg.detail
+    if (IS_GUI_EXPORT) log('[export_plan]', msg.detail)
+  } else if (msg.type === 'export_status' && msg.plan) {
+    // 界面点导出走的是插件（Electron 主进程内），服务不知道有这回事 ——
+    // 那条 export_plan 只能由 exportStatus() 捎过来。两条路都收，谁先到用谁。
+    live.lastExportPlan = msg.plan
+    if (IS_GUI_EXPORT) log('[export_plan]', msg.plan)
   }
   // 事件转发给所有窗口（界面靠它知道导出结束，不用轮询）
   for (const w of BrowserWindow.getAllWindows()) {
@@ -432,7 +447,7 @@ function launchService() {
     // 服务不能退）。Windows 上 libuv 会在 detached 时带上
     // CREATE_BREAKAWAY_FROM_JOB —— 没有它，Electron（Chromium）把自己的
     // 子进程都塞进 kill-on-close 的作业对象里，界面一关作业对象一关，
-    // 服务就被连带杀掉，录到一半的 ffmpeg 也跟着死。Breakaway 让服务
+    // 服务就被连带杀掉，录到一半的会话也跟着死。Breakaway 让服务
     // 脱离那个作业对象，界面生死与它无关。
     detached: true,
     windowsHide: true,
@@ -486,12 +501,16 @@ function launchService() {
  */
 async function pushSettingsToService() {
   const { previewMaxFps } = loadSettings()
+  // 先把值推给页面，再去等管道。
+  //
+  // 踩过的坑：原来只有 `r.ok`（服务真的收到了）之后才调 applyPreviewFpsToPage，
+  // 而服务没起 / 管道还没建好时这个函数会静默失败 —— 页面于是永远收不到
+  // 存下来的值，界面停在默认的 60fps，用户看到的就是"设置没保存"。
+  // 页面侧的值和"服务有没有收到"本来就是两件事：值先落地，服务随后补发。
+  applyPreviewFpsToPage(previewMaxFps)
   for (let attempt = 0; attempt < 25; attempt++) {
     const r = await sendServiceCommand({ cmd: 'set-preview-fps', fps: previewMaxFps })
-    if (r.ok) {
-      applyPreviewFpsToPage(previewMaxFps)
-      return true
-    }
+    if (r.ok) return true
     // 管道还没建好：等一下再来。100ms × 25 ≈ 2.5 秒的等待预算。
     await new Promise((res) => setTimeout(res, 100))
   }
@@ -936,6 +955,50 @@ function listMonitors() {
 // ---------------------------------------------------------------------------
 let mainWindow = null
 
+/**
+ * 界面产物缺失时自己补一次构建。
+ *
+ * 为什么要有这一步：dist/ 是**构建产物**，被清掉的理由多得是 —— 临时目录被
+ * 清理软件扫了、换了 SHADOW_TEMP_ROOT、上次只跑了 build:native、git clean 顺手
+ * 清了机器上的东西。以前这种情况界面直接弹一个「请先执行 npm run build:web」
+ * 的框就退场了，用户看到的是"界面找不到"，明明心里想的是"我双击一下就能用"。
+ *
+ * 这里用 Electron 自己当 Node 跑构建脚本（ELECTRON_RUN_AS_NODE=1），不依赖
+ * 系统 PATH 里有没有 node —— 打包成绿色版之后 PATH 里通常没有。
+ *
+ * 失败**不抛**：构建不成功就把原因返回给调用方，让它照旧弹出原来的提示，
+ * 至少用户能看到真正发生了什么。
+ *
+ * @returns {{ok: boolean, error?: string, log?: string}}
+ */
+function buildWebNow() {
+  const script = path.join(PROJECT_ROOT, 'scripts', 'build-web.mjs')
+  if (!existsSync(script)) return { ok: false, error: `找不到构建脚本：${script}` }
+  log('界面产物缺失，先自动构建一次…')
+  try {
+    const r = spawnSync(process.execPath, [script], {
+      cwd: PROJECT_ROOT,
+      // 让 electron.exe 退化成纯 Node 跑脚本（见 scripts/launch.mjs 顶部说明）
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 180000,
+    })
+    if (r.error) return { ok: false, error: r.error.message }
+    const out = `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()
+    if (r.status !== 0) {
+      return { ok: false, error: `构建脚本退出码 ${r.status}`, log: out }
+    }
+    if (!existsSync(path.join(TEMP_ROOT, 'dist', 'index.html'))) {
+      return { ok: false, error: '构建脚本成功了，但产物还是不存在', log: out }
+    }
+    log('界面产物构建完成。')
+    return { ok: true, log: out }
+  } catch (err) {
+    return { ok: false, error: err.message }
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1360,
@@ -975,6 +1038,7 @@ function createWindow() {
 
   const indexPath = path.join(TEMP_ROOT, 'dist', 'index.html')
   if (IS_DEV) {
+    // 只有显式开发模式（npm run dev）才连 dev server。
     mainWindow.loadURL(DEV_URL).catch((err) => {
       logErr('加载开发服务器失败：', err.message)
       if (existsSync(indexPath)) mainWindow.loadFile(indexPath)
@@ -982,12 +1046,27 @@ function createWindow() {
   } else if (existsSync(indexPath)) {
     mainWindow.loadFile(indexPath)
   } else {
-    mainWindow.loadURL(DEV_URL).catch(() => {
+    // 生产模式**不**去连 127.0.0.1:5173。
+    //
+    // 以前这里会先 loadURL(DEV_URL)，连不上才弹框。问题是一旦 dist 缺了，
+    // 用户看到的是一句 ERR_CONNECTION_REFUSED（看着像网络问题），真正的
+    // 原因藏在后面 —— 而且非开发模式本来就不该去找一个没在跑的 dev server。
+    logErr('找不到界面产物：' + indexPath)
+
+    // 别急着弹「你自己去 npm run build:web」：dist 就是构建产物，删掉能重建，
+    // 这里自己补一次。网络无关、不需要终端，双击就能回到可用状态。
+    const built = buildWebNow()
+    if (built.ok && existsSync(indexPath)) {
+      mainWindow.loadFile(indexPath)
+    } else {
       dialog.showErrorBox(
-        '找不到前端',
-        `既没有 ${indexPath}，也连不上 ${DEV_URL}。\n请先执行  npm run build:web`,
+        '找不到界面',
+        `缺少构建产物：\n${indexPath}\n\n自动构建也没成功：\n` +
+          `${built.error ?? '(无错误信息)'}\n` +
+          `${built.log ? `\n构建输出（末尾）：\n${built.log.slice(-1500)}\n` : ''}` +
+          `\n请手动执行：\n  npm run build:web`,
       )
-    })
+    }
   }
 
   return mainWindow
@@ -1063,6 +1142,9 @@ function startExportStatusPoll() {
       bytes: st.bytes ?? 0,
       elapsedMs: st.elapsedMs ?? 0,
       jobId: st.jobId ?? 0,
+      // 导出计划诊断行（哪个片、哪一段补了 NO SIGNAL）。
+      // 插件 exportStatus() 带着它；没有就是空串。
+      plan: st.plan ?? '',
       updatedAt: Date.now(),
     }
     for (const w of BrowserWindow.getAllWindows()) {
@@ -1792,19 +1874,45 @@ async function runGuiExport(waitSeconds) {
 
   // 等录制真的开始：界面上的"第几段"必须涨起来，光 connected 不够。
   //
-  // 为什么要求 ≥3 段：服务每写满一片就报一次状态，第 1 段常常是"正在写的
-  // 那一片"，内容只有不到一秒 —— 导它没什么意义，也测不出拼接。
-  const deadline = Date.now() + Math.max(4, waitSeconds) * 1000
-  const wantSegments = 3
+  // 【判据必须是"选中的那一路录满了整个回放窗口"】以前是"任意路加起来 ≥3 段"：
+  // 三路配置里 p-win 出两段就能把总数顶到 3，主路只录了 2 秒就点导出，20 秒
+  // 回放窗口里 18 秒"还没录到"被按设计补成 NO SIGNAL —— 导出「成功」，成片
+  // 却是黑的。现在按 selectedSegments × 单片秒数 ≥ 回放窗口来等。
+  //
+  // 【为什么必须多等一片】`recordSegments` 是服务**扫盘**数出来的
+  // （见 SegmentRecorder::RefreshDiskStatsLocked），它把"正在写的那一片"
+  // 也算进去了 —— 那一片还在 SinkWriter 手里、没 Finalize、index.csv 里
+  // 也没有它，导出端根本读不出来。于是"10 片"实际上只有 9 片可用，
+  // 9 × 2 秒 = 18 秒，剩下 2 秒只能补 NO SIGNAL。
+  // 实测（test-export 反复复现）：`selectedSegments=10` 恒定导成
+  // "9 个分片 / 20.0 秒 / 其中 2.0 秒没录到"，就是这一片之差。
+  //
+  // 环形缓冲现在保留 `回放窗口 + 两片`（见 MfEncoder::PurgeExpired 的
+  // keepSlack），20 秒窗口 + 2 秒片 = 最多 12 片，所以等 11 片（10 片已完成
+  // + 1 片在写）是安全的，不会像只留一片余量时那样"等到反而变少"。
+  const first = (await gui()) ?? {}
+  const replaySec = Number(first.formReplaySeconds) > 0 ? Number(first.formReplaySeconds) : 20
+  const segSec = Number(first.formSegmentSeconds) > 0 ? Number(first.formSegmentSeconds) : 2
+  const wantSegments = Math.ceil(replaySec / segSec) + 1
+  // 【等待时长要按"内容秒数"算，不能按墙钟给】分片按帧数切（每片
+  // `fps × 单片秒数` 帧），而喂帧线程在编码器跟不上时会补帧、时间轴按帧数
+  // 推进 —— 1440p@144 实测 actualFps 常常只有 120~130，于是 20 秒"内容"
+  // 要花 23~24 秒墙钟才录得出来。按 26 秒墙钟去等 10 片正好卡在边上，
+  // 机器一忙就超时。这里按 1.8 倍内容时长再加 10 秒兜住，别让它随机失败。
+  const waitWallSec = Math.max(waitSeconds, Math.ceil(replaySec * 1.8) + 10)
+  const deadline = Date.now() + Math.max(4, waitWallSec) * 1000
   let last = null
   while (Date.now() < deadline) {
     last = await gui()
-    if (last && last.liveSegments >= wantSegments) break
+    if (last && last.selectedSegments >= wantSegments) break
     await sleep(700)
   }
-  report.steps.push({ name: 'recording', wantSegments, ...(last ?? {}) })
-  if (!last || !(last.liveSegments >= wantSegments)) {
-    report.error = `等了 ${waitSeconds} 秒也没录出 ${wantSegments} 段（liveSegments=${last?.liveSegments}）`
+  report.steps.push({ name: 'recording', wantSegments, wantReplaySec: replaySec, ...(last ?? {}) })
+  if (!last || !(last.selectedSegments >= wantSegments)) {
+    report.error =
+      `等了 ${waitSeconds} 秒也没给选中的那一路录满回放窗口（需要 ${wantSegments} 段 ≈ ` +
+      `${wantSegments * segSec} 秒，实际 selectedSegments=${last?.selectedSegments}；` +
+      `全部路加起来=${last?.liveSegments}）`
     return finish(report, win)
   }
   if (last.canExport !== true) {
@@ -1818,10 +1926,13 @@ async function runGuiExport(waitSeconds) {
   report.steps.push({ name: 'export_click', ...(fired ?? {}) })
 
   // 结果由服务经 stdout 报回来，主进程转发成 service:event 的 export_result。
-  const res = await waitForExportResult(30000)
+  //
+  // 超时给到 180 秒：2560x1440@144 的 20 秒成片是 2880 帧，导出要把每片解码成
+  // RGB32 再重新编码，实测 20 秒上下；30 秒的旧值在机器一忙就会误报超时。
+  const res = await waitForExportResult(180000)
   report.steps.push({ name: 'export_result', ...(res ?? {}) })
   if (!res) {
-    report.error = '点了导出，30 秒内没等到 export_result 事件'
+    report.error = '点了导出，180 秒内没等到 export_result 事件'
     return finish(report, win)
   }
   if (res.failed || !res.ok) {
@@ -1836,6 +1947,14 @@ async function runGuiExport(waitSeconds) {
   report.exportSegments = res.segments ?? 0
   report.exportDurationSeconds = res.durationSeconds ?? 0
   report.exportProfile = id
+  // 计划诊断行：报告里带着"为什么补了 NO SIGNAL"，以后不必再靠猜。
+  //
+  // 【两个来源都要看】`live.lastExportPlan` 只在收到 `export_plan` 事件时才会
+  // 被填上，而界面点导出走的是插件（Electron 主进程内），服务根本不知道有这
+  // 回事 —— 那条诊断是插件通过 `exportStatus().plan` 捎过来的。这里优先用
+  // 结果对象自带的，再退回事件缓存。
+  if (res?.plan) report.exportPlan = res.plan
+  else if (live.lastExportPlan) report.exportPlan = live.lastExportPlan
   if (!outPath || !existsSync(outPath)) {
     report.error = `服务说导出成功了，但磁盘上没有这个文件：${outPath}`
     return finish(report, win)
@@ -1851,17 +1970,27 @@ async function runGuiExport(waitSeconds) {
     report.error = `导出的 MP4 时长是 ${res.durationSeconds}，等于没内容`
     return finish(report, win)
   }
+
+  // 时长达标**不等于**有画面：回放窗口里没录到的那段会被补成 NO SIGNAL，
+  // 于是"20 秒 / 3.4 MB / 只有 1 个分片"这种全黑成片也能一路通过。
+  // 摘要里那句「（其中 X 秒没录到，用 NO SIGNAL 补齐）」是唯一的口径，
+  // 抠出来当硬判据 —— 回放窗口 20 秒里补掉一半以上就没测到东西。
+  const detail = String(res.detail ?? '')
+  const m = /其中\s*([0-9.]+)\s*秒没录到/.exec(detail)
+  const noSignalSec = m ? Number(m[1]) : 0
+  report.noSignalSeconds = noSignalSec
+  const allowedNoSignal = Math.max(0.5, Number(res.durationSeconds) * 0.5)
+  if (noSignalSec > allowedNoSignal) {
+    report.error =
+      `成片里有 ${noSignalSec} 秒是补的 NO SIGNAL（允许 ${allowedNoSignal.toFixed(1)} 秒）` +
+      `，分片只用上了 ${res.segments ?? 0} 个。detail: ${detail}`
+    return finish(report, win)
+  }
+
   report.ok = true
   return finish(report, win)
 }
 
-/** 等一条 export_result（主进程转发的事件）。
- *
- *  注意不能只认 `type === 'export_result'`：服务在有状态变化时都会补一条，
- *  而 jobId 从 0 变成 1 的那次比较会产出一条**内容全空的**结果
- *  （ok=false、failed=false、outPath=""），把它当成"导出结束"会误判成失败。
- *  所以这里只认"这次导出真的收尾了"的两条：ok 或 failed 之一为真。
- */
 /** 等一次导出收尾（自检 --gui-export 用）。
  *
  *  认两种事件：

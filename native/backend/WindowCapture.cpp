@@ -50,6 +50,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <emmintrin.h> // SSE2：non-temporal 存储
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -110,6 +111,46 @@ constexpr GUID kItemClosedIid =
 
 constexpr ::ABI::Windows::Graphics::DirectX::DirectXPixelFormat kPixelFormat =
     ::ABI::Windows::Graphics::DirectX::DirectXPixelFormat::DirectXPixelFormat_B8G8R8A8UIntNormalized;
+
+// 窗口尺寸要稳定这么久，才认定用户拖完了、该重建采集会话。
+//
+// 用户拖边框时窗口尺寸每几十毫秒变一次，每变一次就重建会话的话，一次重建
+// 200ms 下来，整段拖拽会被拖成"一格一格"的卡顿。250ms 是折中：人手停顿
+// 通常比这长，而重建延迟用户还能忍。
+//
+// 【现在还有用吗】这段判定已经不在 Capture 里了 —— 帧池按屏幕尺寸建、
+// 永不重建，窗口缩放的尺寸跟随是零成本的（见 Init 里那段说明）。
+// 常量留着是因为 TakeResizeNotice 这个接口还对外暴露着。
+constexpr uint64_t kResizeSettleMs = 250;
+
+/**
+ * 把一行像素拷到目标，用非临时（streaming）存储绕开缓存。
+ *
+ * 为什么不用 memcpy：这块数据（窗口一帧几 MB）拷完之后只被下游读一次，
+ * 走普通存储会把它塞进 L3、把采集线程正在用的东西挤出去。non-temporal
+ * 写入直达内存，快且不污染缓存。
+ *
+ * 源不要求对齐（loadu 容忍），目标按 16 字节对齐后再 stream 存储。
+ */
+void CopyRowStreaming(uint8_t* dst, const uint8_t* src, size_t bytes) {
+    const size_t misalign = (16u - (reinterpret_cast<uintptr_t>(dst) & 15u)) & 15u;
+    const size_t head = misalign < bytes ? misalign : bytes;
+    if (head) {
+        std::memcpy(dst, src, head);
+        dst += head;
+        src += head;
+        bytes -= head;
+    }
+    while (bytes >= 16) {
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
+        _mm_stream_si128(reinterpret_cast<__m128i*>(dst), v);
+        dst += 16;
+        src += 16;
+        bytes -= 16;
+    }
+    if (bytes) std::memcpy(dst, src, bytes);
+    _mm_sfence();
+}
 
 // WGC 需要 Windows 10 1809（17763）以上；帧池的 CreateFreeThreaded 要 1903。
 bool IsWgcAvailable(std::string& why) {
@@ -641,6 +682,53 @@ bool WindowCapture::Init(void* hwnd, std::string& outError) {
     width_ = static_cast<uint32_t>(size.Width);
     height_ = static_cast<uint32_t>(size.Height);
 
+    // ---- 帧池尺寸：一次建成"屏幕那么大"，之后**永不重建** ---------------
+    //
+    // 【为什么不是窗口尺寸】这是本鱼花了两天、几百个泄漏线程换来的一条结论。
+    //
+    // 帧池的尺寸只是"每帧缓冲的容量"，不是"画面尺寸" —— WGC 按窗口当前的
+    // ContentSize 往这个容量的纹理里画。原来的做法是用窗口尺寸建池，窗口
+    // 一变就跟帧池对不上，只好 Cleanup + Init 重建整个会话（连 D3D11 设备、
+    // DispatcherQueue、泵线程一起重建）。
+    //
+    // 实测那条路的代价极其惨重：每次重建泄漏 17 个线程（泵线程被设计成
+    // 永不 return，见 PumpProc 末尾）加一份设备、一个队列、几个帧池。拖动
+    // 窗口十几次就是 187 个线程、250MB 工作集，而且这些残留对象都还在跟
+    // DWM 打交道。主人报的现象完全对得上：
+    //     「被捕捉的资源管理器出现非常严重的掉帧卡顿」
+    //     「shadow-capture.exe 的 CPU 占用率太高了（40%）」
+    //     「内存 800M，隔壁英伟达回放才 200M 不到」
+    //
+    // 改成"按屏幕尺寸建一次"就全没了。探针实测（probe_pool_grow.cpp，
+    // 池 2560x1440）：窗口从 900x650 放大到 1600x930 再缩回来，**全程持续
+    // 投帧**，纹理恒为 2560x1440，ContentSize 精确跟随窗口尺寸。所以缩放
+    // 期间一帧都不用丢，也不需要任何重建。
+    //
+    // 代价是每帧的 GPU 纹理按屏幕尺寸算（1440p 一帧 14.7MB × 2 个缓冲）。
+    // 这是 WGC 自己的显存开销，不进我们的内存统计；换来的是零重建。
+    ::ABI::Windows::Graphics::SizeInt32 poolSize = size;
+    {
+        // 用虚拟桌面总尺寸兜住"窗口比屏幕还大"（跨屏拉伸）的情况。
+        const int32_t vx = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const int32_t vy = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const int32_t vw = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        const int32_t vh = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        (void)vy;
+        const uint32_t screenW = static_cast<uint32_t>(vw > 0 ? vw : 1920);
+        const uint32_t screenH = static_cast<uint32_t>(vh > 0 ? vh : 1080);
+        (void)vx;
+        // 留 1/8 余量：窗口被拖到比屏幕还大（用户把窗口拉出画面边缘时，
+        // 窗口的 ContentSize 会超过屏幕尺寸）。
+        const uint32_t wantW = screenW + screenW / 8u;
+        const uint32_t wantH = screenH + screenH / 8u;
+        if (static_cast<uint32_t>(poolSize.Width) < wantW) poolSize.Width = static_cast<int32_t>(wantW);
+        if (static_cast<uint32_t>(poolSize.Height) < wantH)
+            poolSize.Height = static_cast<int32_t>(wantH);
+    }
+    // 上限兜一下：4K 屏幕的 1.125 倍就是 4320x2430，再大没意义。
+    if (poolSize.Width > 5120) poolSize.Width = 5120;
+    if (poolSize.Height > 3072) poolSize.Height = 3072;
+
     // ---- 把裸 D3D11 设备包成 WinRT 的 IDirect3DDevice ---------------------
     ComPtr<IDXGIDevice> dxgiDevice;
     hr = device_->QueryInterface(__uuidof(IDXGIDevice),
@@ -700,7 +788,7 @@ bool WindowCapture::Init(void* hwnd, std::string& outError) {
     // REGDB_E_CLASSNOTREG (0x80040154)。记法：接口名去掉前导 I 就是类名。
     impl_->poolStatics = poolStatics;
     impl_->poolDevice = rtDevice;
-    impl_->poolSize = size;
+    impl_->poolSize = poolSize;
     if (!impl_->CreatePoolOnPump(outError)) {
         CleanupLocked();
         return false;
@@ -914,11 +1002,24 @@ void WindowCapture::CleanupLocked() {
     hwndPid_ = 0;
     width_ = height_ = 0;
     lastPresentQpc_ = 0;
+    // 尺寸稳定判定的中间状态跟着清掉：新会话的池尺寸是全新的，
+    // 留着上一轮的"疑似新尺寸"会让第一拍就误判成又变了。
+    pendingW_ = 0;
+    pendingH_ = 0;
+    pendingSince_ = 0;
+    resizeNotice_ = false;
 }
 
 void WindowCapture::Cleanup() {
     std::lock_guard<std::mutex> lk(mu_);
     CleanupLocked();
+}
+
+bool WindowCapture::TakeResizeNotice() {
+    std::lock_guard<std::mutex> lk(mu_);
+    const bool had = resizeNotice_;
+    resizeNotice_ = false;
+    return had;
 }
 
 bool WindowCapture::CreateFramePool() { return true; } // 实际在 Init 里做，留着占位
@@ -967,6 +1068,40 @@ CaptureStatus WindowCapture::Capture(FrameView& out, uint8_t* buffer, size_t buf
     HRESULT hr = impl_->pool->TryGetNextFrame(frame.GetAddressOf());
     if (FAILED(hr) || !frame) return CaptureStatus::NoChange;
 
+    // ---- 这一帧里真正的画面尺寸（窗口内容尺寸）---------------------------
+    //
+    // 帧池是按屏幕尺寸建的（见 Init 里那段说明），纹理永远是池子那么大；
+    // 窗口只有左上角 content 那么大一块是真内容，其余是没动过的填充。
+    // 所以**每一帧**都要问一次 ContentSize，只把左上角这块交出去。
+    //
+    // 这就是"窗口缩放不需要重建会话"的关键：窗口拖大拖小只是 content 变，
+    // 纹理和池子都不动，投帧一分钟都不中断，尺寸零成本跟随。
+    uint32_t contentW = 0;
+    uint32_t contentH = 0;
+    {
+        ::ABI::Windows::Graphics::SizeInt32 content{};
+        if (SUCCEEDED(frame->get_ContentSize(&content)) && content.Width > 0 &&
+            content.Height > 0) {
+            contentW = static_cast<uint32_t>(content.Width);
+            contentH = static_cast<uint32_t>(content.Height);
+        }
+    }
+    // ContentSize 拿不到就退回上次知道的尺寸（宁可交旧尺寸的帧，也别丢帧）。
+    if (contentW == 0 || contentH == 0) {
+        contentW = width_.load(std::memory_order_relaxed);
+        contentH = height_.load(std::memory_order_relaxed);
+    }
+    if (contentW == 0 || contentH == 0) return CaptureStatus::NoChange;
+
+    // 尺寸变了就更新对外宣称的宽高。**不重建任何东西**，下一次读 Width()
+    // 就是新值 —— Session 那边据此重建帧环和录制器（那两样是真改不了）。
+    const uint32_t prevW = width_.load(std::memory_order_relaxed);
+    const uint32_t prevH = height_.load(std::memory_order_relaxed);
+    if (prevW != contentW || prevH != contentH) {
+        width_.store(contentW, std::memory_order_relaxed);
+        height_.store(contentH, std::memory_order_relaxed);
+    }
+
     ComPtr<::ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DSurface> surface;
     hr = frame->get_Surface(surface.GetAddressOf());
     if (FAILED(hr) || !surface) {
@@ -997,8 +1132,11 @@ CaptureStatus WindowCapture::Capture(FrameView& out, uint8_t* buffer, size_t buf
 
     D3D11_TEXTURE2D_DESC desc{};
     tex->GetDesc(&desc);
-    const uint32_t w = desc.Width;
-    const uint32_t h = desc.Height;
+
+    // 纹理是帧池那么大（屏幕尺寸），但只有左上角 content 那块是真内容。
+    // 超出纹理就不能拷（池子被别的尺寸撑过之后可能不够），按纹理兜回来。
+    const uint32_t w = std::min(contentW, desc.Width);
+    const uint32_t h = std::min(contentH, desc.Height);
 
     const size_t need = static_cast<size_t>(w) * 4u * h;
     if (!buffer || bufferSize < need) {
@@ -1009,23 +1147,51 @@ CaptureStatus WindowCapture::Capture(FrameView& out, uint8_t* buffer, size_t buf
 
     // ---- 拷进自己的 staging（CPU 可映射） --------------------------------
     // 不能直接 Map 帧池给的纹理：它是 DWM 的，且下一帧回收后内容就变了。
-    if (!staging_ || stagingW_ != w || stagingH_ != h) {
+    //
+    // staging 按**容量**建（不是按这一次的内容尺寸），容量向上取整到 128
+    // 像素并对齐，只在装不下时才重建。
+    //
+    // 原来这里是"内容尺寸变了就重建一张"。听起来很省，但拖动窗口时 WGC
+    // 每帧报一个不同的 ContentSize（1 像素的抖动也算），于是每帧都
+    // CreateTexture2D 一次 —— 那是 GPU 资源创建，在拖拽那条路径上相当于
+    // 每帧多一次设备分配/销毁，实测就是"过渡不够丝滑"。
+    // 取整到 128 之后，正常拖动（几百像素以内）一张纹理都不必重建。
+    const uint32_t capW = ((w + 127u) / 128u) * 128u;
+    const uint32_t capH = ((h + 127u) / 128u) * 128u;
+    if (!staging_ || stagingW_ < w || stagingH_ < h) {
         if (staging_) { staging_->Release(); staging_ = nullptr; }
         D3D11_TEXTURE2D_DESC sd = desc;
+        sd.Width = capW < w ? w : capW;
+        sd.Height = capH < h ? h : capH;
         sd.Usage = D3D11_USAGE_STAGING;
         sd.BindFlags = 0;
         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         sd.MiscFlags = 0;
+        // MipLevels 必须跟着 desc 走（帧池纹理是 1），否则 CreateTexture2D
+        // 可能返回 E_INVALIDARG。
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.SampleDesc.Count = 1;
+        sd.SampleDesc.Quality = 0;
         if (FAILED(device_->CreateTexture2D(&sd, nullptr, &staging_))) {
             ++errorCount_;
             lastError_ = "创建 staging 纹理失败";
             return CaptureStatus::Error;
         }
-        stagingW_ = w;
-        stagingH_ = h;
+        stagingW_ = sd.Width;
+        stagingH_ = sd.Height;
     }
 
-    context_->CopyResource(staging_, tex.Get());
+    // 只拷左上角那一块：D3D11_BOX 的 right/bottom 是**开区间**（right 不包含
+    // 在内），写成 w-1/h-1 会少一列一行，画面右边和下边各留一条黑线。
+    D3D11_BOX box{};
+    box.left = 0;
+    box.top = 0;
+    box.right = w;
+    box.bottom = h;
+    box.front = 0;
+    box.back = 1;
+    context_->CopySubresourceRegion(staging_, 0, 0, 0, 0, tex.Get(), 0, &box);
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(context_->Map(staging_, 0, D3D11_MAP_READ, 0, &mapped))) {
@@ -1034,12 +1200,17 @@ CaptureStatus WindowCapture::Capture(FrameView& out, uint8_t* buffer, size_t buf
     }
 
     // 统一压成紧密排布：源行距通常比 w*4 大（D3D 按 256 字节对齐），
-    // 照着 RowPitch 拷下游会得到一条斜掉的画面。
-    for (uint32_t y = 0; y < h; ++y) {
-        std::memcpy(buffer + static_cast<size_t>(y) * w * 4u,
-                    static_cast<const uint8_t*>(mapped.pData) +
-                        static_cast<size_t>(y) * mapped.RowPitch,
-                    static_cast<size_t>(w) * 4u);
+    // 照着 RowPitch 拷下游会得到一条斜掉的画面。用 non-temporal 存储
+    // 避免把这份一次性数据灌进 L3 挤掉采集线程正在用的东西。
+    const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+    const size_t rowBytes = static_cast<size_t>(w) * 4u;
+    if (mapped.RowPitch == rowBytes) {
+        CopyRowStreaming(buffer, src, rowBytes * h);
+    } else {
+        for (uint32_t y = 0; y < h; ++y) {
+            CopyRowStreaming(buffer + static_cast<size_t>(y) * rowBytes,
+                             src + static_cast<size_t>(y) * mapped.RowPitch, rowBytes);
+        }
     }
     context_->Unmap(staging_, 0);
 

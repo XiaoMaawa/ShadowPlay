@@ -399,6 +399,8 @@ function guiSnapshot(): Record<string, unknown> {
     formFps: p?.video.fps ?? null,
     formBitrate: p?.video.bitrateMbps ?? null,
     formReplaySeconds: p?.video.replaySeconds ?? null,
+    // 自检要用"回放窗口 / 单片秒数"算够不够录满，别拿魔法数 3 段去催导出。
+    formSegmentSeconds: p?.video.segmentSeconds ?? 2,
     matchBy: p?.match?.by ?? null,
     matchPattern: p?.match?.pattern ?? null,
     liveOwned: live.value.owned === true,
@@ -412,8 +414,14 @@ function guiSnapshot(): Record<string, unknown> {
     // 只能数出错的东西；真正的连接计数在 usePreview 的 snapshot() 里
     // （readySessions / connectedSessions），别在这儿重算一遍。
     liveRecording: sessions.filter((x) => x.recording).length,
+    // `liveSegments/liveBytes` 是**所有路加起来**。自检脚本曾经拿它当"够录了"
+    // 的判据，于是三路配置下 p-win 出 2 段就把总数顶到 3，导出的其实是只录了
+    // 2 秒的主路 —— 20 秒回放窗口里 18 秒"还没录到"，补出一整段 NO SIGNAL。
+    // 要判"这一路可以导了"必须看下面这对按选中路取值的字段。
     liveSegments: sessions.reduce((n, x) => n + (x.recordSegments ?? 0), 0),
     liveBytes: sessions.reduce((n, x) => n + (x.recordBytes ?? 0), 0),
+    selectedSegments: s?.recordSegments ?? 0,
+    selectedBytes: s?.recordBytes ?? 0,
     // 服务用的配置和界面这份是不是同一个文件。不是的话，上面那两个数属于
     // 另一个服务的录制目录，界面要显式标出来（顶栏琥珀色"（配置不同）"）。
     profilesMismatch: live.value.profilesMismatch === true,
@@ -639,11 +647,31 @@ const serviceStatusTitle = computed(() => {
 // 主进程会在两处推这个值：设置页保存时，以及服务启动后把存下来的设置下发
 // 一遍。所以界面要能收到"外部改的"这个值，不能只信自己那次调用。
 onMounted(() => {
-  const pp = api() as { onPreviewFps?: (cb: (fps: number) => void) => () => void }
+  const pp = api() as {
+    onPreviewFps?: (cb: (fps: number) => void) => () => void
+    getSettings?: () => Promise<{ ok: boolean; settings?: { previewMaxFps: number } }>
+  }
   const off = pp?.onPreviewFps?.((fps) => {
     if (typeof fps === 'number' && Number.isFinite(fps)) previewMaxFps.value = fps
   })
   onBeforeUnmount(() => off?.())
+
+  // 启动时**主动问一次**存下来的值。
+  //
+  // 只靠上面那条推送是不够的：主进程把设置下发给页面的那一步挂在
+  // 「服务命令通道通了」之后（见 app/main.cjs 的 pushSettingsToService），
+  // 服务没起 / 管道没建好的时候它压根不会推 —— 于是界面一直停在
+  // ref(60) 的默认值，用户上次设的 30 或 120 全丢了，看起来就是"没保存"。
+  // 这里直接读文件里的值，跟推送谁先谁后都无所谓。
+  void (async () => {
+    try {
+      const res = (await pp?.getSettings?.()) ?? null
+      const fps = res?.settings?.previewMaxFps
+      if (typeof fps === 'number' && Number.isFinite(fps)) previewMaxFps.value = fps
+    } catch {
+      /* 主进程还没就绪，保持默认值 */
+    }
+  })()
 })
 
 // ---- 设置 -----------------------------------------------------------------

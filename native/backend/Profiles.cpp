@@ -22,7 +22,7 @@
 
 #include "JsonUtil.h"
 #include "EnvPath.h"    // ExpandEnv
-#include "FfmpegUtil.h" // FromUtf8 / ToUtf8
+#include "Utf8Path.h" // FromUtf8 / ToUtf8
 
 namespace shadow {
 namespace {
@@ -557,6 +557,41 @@ std::string SanitizeSessionId(const std::string& id) {
 
 std::string Profile::SessionId() const {
     return SanitizeSessionId(id.empty() ? name : id);
+}
+
+bool Profile::SameSettings(const Profile& o) const {
+    // 采集源
+    if (source.kind != o.source.kind) return false;
+    if (source.monitorIndex != o.source.monitorIndex) return false;
+    if (source.clientAreaOnly != o.source.clientAreaOnly) return false;
+    if (source.wgc != o.source.wgc) return false;
+
+    // 视频参数（scaleWidth/scaleHeight 直接决定编码器画布，必须比）
+    if (video.fps != o.video.fps) return false;
+    if (video.bitrateMbps != o.video.bitrateMbps) return false;
+    if (video.replaySeconds != o.video.replaySeconds) return false;
+    if (video.segmentSeconds != o.video.segmentSeconds) return false;
+    if (video.scaleWidth != o.video.scaleWidth) return false;
+    if (video.scaleHeight != o.video.scaleHeight) return false;
+
+    // 窗口匹配规则（只对窗口源有意义，但比一下也无害 —— 桌面源两边都是默认值）
+    if (hasMatch != o.hasMatch) return false;
+    if (hasMatch) {
+        if (match.field != o.match.field) return false;
+        if (match.mode != o.match.mode) return false;
+        if (match.pick != o.match.pick) return false;
+        if (match.pattern != o.match.pattern) return false;
+        if (match.pollMs != o.match.pollMs) return false;
+        if (match.excludeSelf != o.match.excludeSelf) return false;
+        if (match.requireVisible != o.match.requireVisible) return false;
+        if (match.titlePattern != o.match.titlePattern) return false;
+        if (match.classPattern != o.match.classPattern) return false;
+        if (match.processPattern != o.match.processPattern) return false;
+        // 优先级顺序是用户拖出来的，改了顺序就换了匹配语义
+        if (match.fields != o.match.fields) return false;
+    }
+
+    return true;
 }
 
 const Profile* ProfileDoc::Find(const std::string& id) const {

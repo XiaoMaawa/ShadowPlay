@@ -30,6 +30,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -693,8 +694,8 @@ napi_value Close(napi_env env, napi_callback_info info) {
 // ---------------------------------------------------------------------------
 //
 // 为什么导出要放在这里、而不是让服务去干：
-//   Exporter 只吃四个**纯字符串**参数（segmentsDir / exportDir / prefix /
-//   maxSeconds），分片是已经落在磁盘上的 MPEG-TS 文件，**谁读都行** —— 它跟
+//   Exporter 只吃几个**纯字符串/数字**参数（segmentsDir / exportDir / prefix /
+//   maxSeconds），分片是已经落在磁盘上的 MP4 文件，**谁读都行** —— 它跟
 //   会话、帧环、进程状态都没有关系。
 //   原先导出放在 shadow-capture.exe 里、靠 stdin 把命令送进去，唯一原因是
 //   "界面够不着 exe 里的类"。那带来一个死结：界面**复用用户自己起的服务**时
@@ -707,30 +708,12 @@ napi_value Close(napi_env env, napi_callback_info info) {
 
 #include "../native/backend/Exporter.h"
 
-// Exporter.cpp 只依赖这一个外部符号（它把 ffmpeg 子进程挂进作业对象，
-// 免得界面退出后留一堆孤儿 ffmpeg）。服务和插件各有一份自己的作业对象。
+// 【作业对象已经不需要了】
 //
-// 这里**必须**是 extern "C" 且签名完全一致：Exporter.cpp:21 就是这么声明的。
-extern "C" void* ShadowChildJob();
-
-namespace {
-// 插件侧的作业对象：第一次导出时建，进程退出时由内核自动收（KILL_ON_JOB_CLOSE）。
-void* PluginChildJob() {
-    static void* job = []() -> void* {
-        HANDLE h = CreateJobObjectW(nullptr, nullptr);
-        if (!h) return nullptr;
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl{};
-        jl.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(h, JobObjectExtendedLimitInformation, &jl, sizeof(jl));
-        return h;
-    }();
-    return job;
-}
-} // namespace
-
-// 定义 Exporter.cpp 期待的那个符号。注意不能放在匿名 namespace 里 ——
-// 那样就是内部链接，链接器找不到，表现为"未解析的外部符号 ShadowChildJob"。
-extern "C" void* ShadowChildJob() { return PluginChildJob(); }
+// 以前这里要给 Exporter.cpp 定义 ShadowChildJob()：它每合并一次就起一个
+// ffmpeg 子进程，得挂进作业对象，免得界面退出后留一堆孤儿 ffmpeg。
+// 现在 Exporter 走进程内 Media Foundation（SourceReader + SinkWriter 直拷），
+// 一个子进程都不起，这个符号没人引用了，连同 PluginChildJob 一起删掉。
 
 namespace {
 
@@ -739,6 +722,15 @@ namespace {
 // 让状态查询有个稳定的落点。
 std::mutex g_exportMu;
 std::unique_ptr<shadow::Exporter> g_exporter;
+
+// 最近一次导出算出的计划诊断行（Exporter 的 LogExportPlan 回调写这里）。
+//
+// 【为什么还要单独存一份】那条诊断原本只往 stderr 打，而 stderr 在 Electron
+// 主进程里是自由文本，主进程要把它和"哪一次导出"对上得靠时序猜。存成字段之后
+// exportStatus() 直接带着它，主进程轮询到的结果里天然就有这一行 —— 验收报告
+// 也就能自己带上"为什么补了 NO SIGNAL"，不必再翻日志。
+std::mutex g_planMu;
+std::string g_lastPlan;
 
 napi_value ExportStatusToJs(napi_env env, const shadow::ExportStatus& st) {
     napi_value out = nullptr;
@@ -754,6 +746,10 @@ napi_value ExportStatusToJs(napi_env env, const shadow::ExportStatus& st) {
     SetProp(env, out, "bytes", Number(env, static_cast<double>(st.bytes)));
     SetProp(env, out, "elapsedMs", Number(env, st.elapsedMs));
     SetProp(env, out, "jobId", Number(env, static_cast<double>(st.jobId)));
+    {
+        std::lock_guard<std::mutex> lk(g_planMu);
+        SetProp(env, out, "plan", Str(env, g_lastPlan));
+    }
     return out;
 }
 
@@ -767,15 +763,16 @@ napi_value ExportStatusToJs(napi_env env, const shadow::ExportStatus& st) {
 // 【targetFps 是干什么的】
 //
 // 分片里存的是"录的那一刻的帧率"。用户把某一路从 60fps 改成 240fps 之后，
-// 已经录好的那批分片仍是 60fps —— 直接 `-c copy` 拼出来的回放也还是 60fps，
+// 已经录好的那批分片仍是 60fps —— 直接直拷拼出来的回放也还是 60fps，
 // 用户看到的就是"我明明改了帧率，导出来的还是老样子"。
 //
-// 把当前的配置帧率传进来，Exporter 就会在导出时做一次重采样：
-//   * 目标帧率 < 源帧率 → 抽帧（`-vf fps=N`）
-//   * 目标帧率 > 源帧率 → 插帧补齐（同样用 `-vf fps=N`，ffmpeg 会复制邻近帧）
-// 时间轴始终按墙钟对齐，不会因为抽/插帧而变快变慢。
+// 把当前的配置帧率传进来，Exporter 就会在导出时按目标帧率重排时间轴：
+//   * 目标帧率是源帧率的**整数倍** → 每帧重复写 N 遍（60→240 就是每帧写 4 遍），
+//     时间轴精确，播放器看到标准 CFR，零画质损失（不用重编码）。
+//   * 其它情况（非整数倍、或目标低于源）→ 保持源帧率输出。播放器靠每帧
+//     自带时长照样按正确速度播，只是帧率不是配置里那个。
 //
-// targetFps <= 0 表示"保持源帧率"，此时走 `-c copy`，零损失、最快。
+// targetFps <= 0 表示"保持源帧率"，零损失、最快。
 // ---------------------------------------------------------------------------
 napi_value ExportStart(napi_env env, napi_callback_info info) {
     napi_value argv[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -810,6 +807,26 @@ napi_value ExportStart(napi_env env, napi_callback_info info) {
         SetProp(env, out, "error", Str(env, "上一轮导出还没结束。"));
         return out;
     }
+
+    // 把导出计划的诊断行接到 stderr。
+    //
+    // 【为什么这里必须接】Exporter 每次导出都会算出一份"铺了哪些分片、哪些
+    // 位置补了 NO SIGNAL"的计划，并想把它打出来（Exporter.cpp 的
+    // LogExportPlan）。服务进程在 main.cpp 里接的是 NDJSON 日志出口；而**界面
+    // 点导出走的是这个插件**（导出在 Electron 主进程里跑，服务根本不知道），
+    // 于是那条诊断一直没落到任何地方 —— 排查"导出里莫名出现 NO SIGNAL"时
+    // 只能靠猜（实测白查了好几轮）。
+    //
+    // 走 stderr 而不是 stdout：stdout 在 Electron 主进程里是被拿去解析服务
+    // NDJSON 的，插件写进去会污染那条流。主进程侧会把它原样转进自己的日志。
+    shadow::SetExporterPlanLog([](const std::string& line) {
+        std::fputs(line.c_str(), stderr);
+        std::fputc('\n', stderr);
+        std::fflush(stderr);
+        // 同时留给 exportStatus()，让轮询结果直接带着这一行。
+        std::lock_guard<std::mutex> lk(g_planMu);
+        g_lastPlan = line;
+    });
 
     auto ex = std::make_unique<shadow::Exporter>(
         segmentsDir, exportDir, prefix,
@@ -855,6 +872,10 @@ napi_value ExportStatusOf(napi_env env, napi_callback_info info) {
         SetProp(env, out, "bytes", Number(env, 0));
         SetProp(env, out, "elapsedMs", Number(env, 0));
         SetProp(env, out, "jobId", Number(env, 0));
+        {
+            std::lock_guard<std::mutex> lk(g_planMu);
+            SetProp(env, out, "plan", Str(env, g_lastPlan));
+        }
         return out;
     }
     return ExportStatusToJs(env, g_exporter->Status());

@@ -18,6 +18,7 @@
 //     纹理的裸指针交出去。
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -64,12 +65,32 @@ public:
     CaptureStatus Capture(FrameView& out, uint8_t* buffer, size_t bufferSize);
 
     bool     Valid() const { return valid_; }
-    uint32_t Width()  const { return width_; }
-    uint32_t Height() const { return height_; }
+
+    // 窗口当前的尺寸。**会跟着窗口变**（见 Capture 里的重建帧池逻辑），
+    // 不是 Init 时的快照 —— 调用方每拍都可以放心重新读一次。
+    //
+    // 读的是原子量而不是普通成员：Session 的采集线程和状态上报线程会同时
+    // 读它，而真正的写入发生在 Capture 里（持 mu_）。用一个 atomic 比让所有
+    // 读取方都去抢 mu_ 划算得多。
+    uint32_t Width()  const { return width_.load(std::memory_order_relaxed); }
+    uint32_t Height() const { return height_.load(std::memory_order_relaxed); }
     void*    Hwnd()   const { return hwnd_; }
 
     uint32_t ErrorCount() const { return errorCount_; }
     const std::string& LastError() const { return lastError_; }
+
+    /** 帧池因为窗口尺寸变化而重建过几次（诊断用：0 说明窗口从没缩放过） */
+    uint32_t ResizeCount() const { return resizeCount_; }
+
+    /**
+     * 上一次 AccessLost 是不是"窗口尺寸变了"引起的（取一次就清掉）。
+     *
+     * 上层要靠它区分两种完全不同的情况：
+     *   * 窗口关了 / 锁屏 —— 得重新按匹配规则找一个窗口，可能要找很久；
+     *   * 窗口只是被拖大了 —— 窗口还在、句柄还是那个，直接原地重建会话就行，
+     *     不用重新匹配（重新匹配还可能抓到另一个同类窗口，那就换错源了）。
+     */
+    bool TakeResizeNotice();
 
     // 多路共享时用不上（每个窗口各自一个实例），但保留同款语义，
     // 让 Session 里的加锁代码对两种采集器保持一致。
@@ -101,16 +122,33 @@ private:
     // Init 时这个窗口所属的进程。光看 IsWindow 不够 —— HWND 会被系统复用，
     // 窗口关掉之后同一个句柄值可能已经属于别的程序了。
     unsigned long hwndPid_ = 0;
-    uint32_t width_ = 0;
-    uint32_t height_ = 0;
+    // 窗口当前尺寸。Capture() 发现 ContentSize 变了、重建帧池成功之后更新。
+    std::atomic<uint32_t> width_{0};
+    std::atomic<uint32_t> height_{0};
+    uint32_t resizeCount_ = 0;
     uint32_t errorCount_ = 0;
     std::string lastError_;
+
+    // 尺寸稳定判定：用户拖边框时窗口尺寸每几十毫秒变一次，每变一次就重建
+    // 会话会把整段拖拽拖成卡顿。所以先把"疑似新尺寸"记在这儿，连续
+    // kResizeSettleMs 毫秒没再变才认定用户松手了（见 Capture 里那段）。
+    uint32_t pendingW_ = 0;
+    uint32_t pendingH_ = 0;
+    uint64_t pendingSince_ = 0;
+
+    // AccessLost 的原因是"窗口尺寸变了"。Capture() 置，Session 取一次清掉。
+    bool resizeNotice_ = false;
+
     int64_t  lastPresentQpc_ = 0;
 
     ID3D11Device*        device_ = nullptr;
     ID3D11DeviceContext* context_ = nullptr;
 
     // 把采到的帧拷进自己的纹理，避免帧池回收之后内容变掉。
+    //
+    // stagingW_/stagingH_ 是这张纹理的**容量**，不是当前帧的内容尺寸 ——
+    // 容量按 128 像素向上取整，只有装不下时才重建。拖动窗口时 WGC 每帧
+    // 报一个新尺寸，按内容尺寸建就等于每帧 CreateTexture2D 一次。
     ID3D11Texture2D* staging_ = nullptr;
     uint32_t stagingW_ = 0;
     uint32_t stagingH_ = 0;

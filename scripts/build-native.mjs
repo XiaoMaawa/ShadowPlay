@@ -1,9 +1,19 @@
 // scripts/build-native.mjs — 编译原生部分
 //
-//   node scripts/build-native.mjs            编译采集服务 + Electron 版 addon
-//   node scripts/build-native.mjs --node     额外再链接一个纯 Node 版 addon（自检用）
+//   node scripts/build-native.mjs            编译全部产物
+//   node scripts/build-native.mjs --node     额外再链接一个纯 Node 版插件（自检用）
 //
-// 为什么 addon 要链接两次：
+// 产物有三个：
+//
+//   shadow-capture.exe        采集服务。**独立进程**，界面退出它也继续跑
+//                             （detached 常驻）。内部零子进程：编码走进程内的
+//                             Media Foundation，导出走 IMFSourceReader +
+//                             IMFSinkWriter，不再 spawn ffmpeg.exe。
+//
+//   shadow_ring.node          渲染端消费共享内存帧环的插件（Electron 版）
+//   shadow_ring.nodejs.node   同上，指向 node.exe（加 --node 时才编，自检用）
+//
+// 为什么 addon 要链两次：
 //   N-API 的入口点（napi_*）由宿主进程导出。node.exe 和 electron.exe 都导出
 //   同一组 N-API 符号，但它们各自有一个 import library，导入描述符里写着
 //   宿主可执行文件名（node.exe / electron.exe）。
@@ -23,6 +33,45 @@ import { msvcScript } from './msvc-env.mjs'
 
 const BUILD_DIR = path.join(projectRoot, 'native', 'build')
 const WANT_NODE_VARIANT = process.argv.includes('--node')
+
+// 采集服务（shadow-capture.exe）的源文件。入口是 exe_main.cpp，它调
+// main.cpp 里的 shadow::ServiceMain —— 拆成两个文件是为了 argv 走
+// CommandLineToArgvW（UTF-16 → UTF-8），中文路径不会变成乱码。
+const SERVICE_SOURCES = [
+  'native\\backend\\exe_main.cpp',
+  'native\\backend\\main.cpp',
+  'native\\backend\\ScreenCapture.cpp',
+  'native\\backend\\FrameRing.cpp',
+  'native\\backend\\WindowCapture.cpp',
+  'native\\backend\\Profiles.cpp',
+  'native\\backend\\WindowEnum.cpp',
+  'native\\backend\\Session.cpp',
+  'native\\backend\\SegmentRecorder.cpp',
+  'native\\backend\\Exporter.cpp',
+  'native\\backend\\MfEncoder.cpp',
+  'native\\backend\\Utf8Path.cpp',
+  'native\\backend\\EnvPath.cpp',
+  'native\\backend\\StatusFile.cpp',
+]
+
+const SERVICE_LIBS = [
+  // Media Foundation：MfEncoder（IMFSinkWriter）和 Exporter（IMFSourceReader）
+  // 都在进程内做编解码/换封装，不再起 ffmpeg.exe 子进程。
+  //   mfplat     -- MFStartup / MFCreateSinkWriterFromURL / MFCreateSourceReaderFromURL
+  //   mfreadwrite-- SinkWriter / SourceReader 的实现体
+  //   mfuuid     -- MFVideoFormat_H264 这类 GUID
+  //   mf         -- 少数老接口（ICodecAPI 的 CODECAPI_* 属性键在 wmcodecdspuuid 里）
+  //   wmcodecdspuuid -- CODECAPI_AVEncMPVDefaultBPictureCount / AVEncCommonLowLatency
+  'd3d11.lib', 'dxgi.lib', 'user32.lib', 'gdi32.lib', 'ole32.lib', 'oleaut32.lib',
+  'kernel32.lib', 'advapi32.lib', 'mfplat.lib', 'mfreadwrite.lib', 'mfuuid.lib',
+  'mf.lib', 'wmcodecdspuuid.lib',
+  // windowsapp.lib 提供 WinRT 的激活底层：RoGetActivationFactory / WindowsCreateString /
+  // WindowsDeleteString。WindowCapture.cpp 用 Windows.Graphics.Capture 抓窗口
+  // （被挡住也能录）时离不开这三个符号，漏了就是 LNK2019。
+  'winmm.lib', 'windowsapp.lib',
+  // exe_main.cpp 用 CommandLineToArgvW
+  'shell32.lib',
+]
 
 /** 把一段批处理写到 native/build 下并执行 */
 function runBatch(label, body) {
@@ -65,29 +114,31 @@ function generateImportLib(exePath, name) {
 
 mkdirSync(BUILD_DIR, { recursive: true })
 
+const electronExe = path.join(projectRoot, '.electron', 'dist', 'electron.exe')
+if (!existsSync(electronExe)) {
+  throw new Error(`找不到 electron.exe：${electronExe}（先完成一次 Electron 下载）`)
+}
+
+const hosts = [{ exe: electronExe, name: 'electron', suffix: '' }]
+if (WANT_NODE_VARIANT) hosts.push({ exe: process.execPath, name: 'node', suffix: '.nodejs' })
+
 // ---------------------------------------------------------------------------
-// 1) 采集服务
+// 1) 采集服务 shadow-capture.exe
 // ---------------------------------------------------------------------------
 runBatch(
   '采集服务 shadow-capture.exe',
   [
     'cl /nologo /utf-8 /std:c++17 /permissive- /EHsc /O2 /MD /W3 /DNDEBUG ^',
     '   /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE ^',
+    // /Fo 的路径末尾必须是**两个反斜杠**（"native\build\\"）：
+    // Windows 的命令行解析里 `\"` 是「转义的双引号」，只写一个反斜杠会让
+    // 引号被吃掉，cl 收到的就是一串以 `"` 结尾的乱参数，报 D8003
+    // 「缺少源文件名」。原来那版 `/Fo"native\build\\"` 看着奇怪，正是这个原因。
     '   /I"native" /Fo"native\\build\\\\" /Fd"native\\build\\shadow-capture.pdb" ^',
-    '   native\\backend\\main.cpp native\\backend\\ScreenCapture.cpp native\\backend\\FrameRing.cpp ^',
-    '   native\\backend\\WindowCapture.cpp ^',
-    '   native\\backend\\Profiles.cpp native\\backend\\WindowEnum.cpp ^',
-    '   native\\backend\\Session.cpp native\\backend\\SegmentRecorder.cpp ^',
-    '   native\\backend\\Exporter.cpp native\\backend\\FfmpegUtil.cpp ^',
-    '   native\\backend\\EnvPath.cpp ^',
-    '   native\\backend\\StatusFile.cpp ^',
+    ...SERVICE_SOURCES.map((s) => `   ${s} ^`),
     '   /Fe"native\\build\\shadow-capture.exe" ^',
     '   /link /SUBSYSTEM:CONSOLE /OPT:REF /OPT:ICF ^',
-    '   d3d11.lib dxgi.lib user32.lib gdi32.lib ole32.lib kernel32.lib advapi32.lib ^',
-    // windowsapp.lib 提供 WinRT 的激活底层：RoGetActivationFactory / WindowsCreateString /
-    // WindowsDeleteString。WindowCapture.cpp 用 Windows.Graphics.Capture 抓窗口
-    // （被挡住也能录）时离不开这三个符号，漏了就是 LNK2019。
-    '   winmm.lib windowsapp.lib',
+    `   ${SERVICE_LIBS.join(' ')}`,
   ].join('\r\n'),
 )
 
@@ -107,24 +158,22 @@ runBatch(
 )
 
 // ---------------------------------------------------------------------------
-// 2b) 导出那部分也编进 addon
+// 2b) 导出/编码那部分也编进 addon
 //
 // Exporter 编进插件，界面才能直接调 C++ 导出（原因见 bridge/shadow_ring.cc
 // 里 ExportStart 上方的长注释）。这带来一个必须留意的约束：
-// Exporter.cpp / FfmpegUtil.cpp 会被**编译两遍**（一遍进服务，一遍进插件），
-// 两边是各自独立的副本。它们目前只依赖 Windows API 和 ffmpeg 命令行，
-// 没有需要跨副本共享的全局状态，所以是安全的 —— 但如果以后往里加
-// "记录当前导出状态"这类全局变量，要记住服务和插件的副本互不可见。
-//
-// 单独编成 .obj 而不是把 .cpp include 进来：一个是编译单元更清楚，
-// 另一个是 /Fo 的路径不会互相覆盖（服务那批 .obj 在 native\build\ 根下）。
+// Exporter.cpp / MfEncoder.cpp / Utf8Path.cpp 会被**编译两遍**（服务、插件），
+// 各份是彼此独立的副本。它们目前只依赖 Windows API 和 Media Foundation，
+// 没有需要跨副本共享的全局状态，所以是安全的 —— 但 MfAcquire() 的引用计数
+// 就是典型的"每个副本各数各的"：各份和自己的 MFStartup 配对，互不影响。
+// 如果以后往里加"记录当前导出状态"这类全局变量，要记住这几份副本互不可见。
 //
 // EnvPath.cpp 也在里面：Exporter 用它展开导出目录里的 `%TEMP%`，而
 // Profiles.cpp（服务和 addon 共用的那个 ExpandEnv 定义）并不参与 addon
 // 的编译，漏掉就是 LNK2019。
 // ---------------------------------------------------------------------------
 const addonExtraObjs = []
-for (const src of ['Exporter', 'FfmpegUtil', 'EnvPath']) {
+for (const src of ['Exporter', 'MfEncoder', 'Utf8Path', 'EnvPath']) {
   const o = path.join(BUILD_DIR, `addon_${src}.obj`)
   runBatch(
     `编译 addon_${src}.obj`,
@@ -140,32 +189,29 @@ for (const src of ['Exporter', 'FfmpegUtil', 'EnvPath']) {
 }
 
 // ---------------------------------------------------------------------------
-// 3) 分别链接 Electron 版 / Node 版
+// 3) 分别链接 Electron 版 / Node 版 shadow_ring
 // ---------------------------------------------------------------------------
-const electronExe = path.join(projectRoot, '.electron', 'dist', 'electron.exe')
-if (!existsSync(electronExe)) {
-  throw new Error(`找不到 electron.exe：${electronExe}（先完成一次 Electron 下载）`)
-}
-
-const hosts = [{ exe: electronExe, name: 'electron', out: 'shadow_ring.node' }]
-if (WANT_NODE_VARIANT) {
-  hosts.push({ exe: process.execPath, name: 'node', out: 'shadow_ring.nodejs.node' })
-}
-
 for (const host of hosts) {
   const defPath = generateImportLib(host.exe, host.name)
   const libPath = path.join(BUILD_DIR, `${host.name}.lib`)
   runBatch(`生成 ${host.name}.lib`, `lib /nologo /def:"${defPath}" /machine:x64 /out:"${libPath}"`)
 
-  const outPath = path.join(BUILD_DIR, host.out)
+  const outPath = path.join(BUILD_DIR, `shadow_ring${host.suffix}.node`)
   runBatch(
-    `链接 ${host.out}`,
+    `链接 shadow_ring${host.suffix}.node`,
     [
       'link /nologo /DLL /OPT:REF /OPT:ICF /INCREMENTAL:NO ^',
       `   /OUT:"${outPath}" "${objPath}" ` +
         addonExtraObjs.map((o) => `"${o}"`).join(' ') +
         ` "${libPath}" ^`,
-      '   kernel32.lib user32.lib advapi32.lib shell32.lib',
+      '   kernel32.lib user32.lib advapi32.lib shell32.lib ole32.lib ^',
+      // 插件里也有 MfEncoder/Exporter 的那份副本，MF 的库一个都不能少。
+      //   ole32    -- CoInitializeEx / CoUninitialize / PropVariantClear
+      //   oleaut32 -- VariantInit（ICodecAPI 的 PROPVARIANT 属性）
+      //   d3d11/dxgi -- MfSharedDeviceReady 里的 D3D11CreateDevice /
+      //                 MFCreateDXGIDeviceManager（MfEncoder 常驻共用设备）
+      '   mfplat.lib mfreadwrite.lib mfuuid.lib mf.lib wmcodecdspuuid.lib oleaut32.lib ^',
+      '   d3d11.lib dxgi.lib',
     ].join('\r\n'),
   )
 
