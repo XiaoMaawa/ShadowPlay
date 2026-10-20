@@ -198,6 +198,30 @@ public:
      */
     bool FlushSegment();
 
+    /**
+     * 就地改帧率（不中断录制、不换轮次目录、切片序号继续递增）。
+     *
+     * 【为什么需要】用户在界面里把帧率从 144 改成 60（或反过来）时，服务收到
+     * 的是 reload。原来的 reload 判定「配置变了」就把整路 Session 拆掉重建：
+     * 新 Session -> 新 SegmentRecorder -> 新 MfEncoder -> 新轮次目录，于是
+     *   1. 旧片刚收尾、新片用**真实墙钟**开（nextSegStartUnix_ 被清零），
+     *      中间那段重建耗时（实测 300~500ms，WGC 更久）变成时间轴空洞，
+     *      超过 gapFloor（0.5 秒）就被导出端补成 NO SIGNAL；
+     *   2. recordSegments 从 0 重新数，界面的导出按钮变灰；
+     *   3. 刚切过去那一瞬间点导出，那一路还没有任何分片 —— 报"该路未在录制"。
+     *
+     * 用户的原话：「降帧率的时候，会出现短暂的 no signal，和导出按钮被禁用，
+     * 帧率刚切换那会点击会出现该路未在录制」。
+     *
+     * 【为什么必须重开分片】帧率写在 SinkWriter 的**输出流**上
+     * （MFSetAttributeRatio(MF_MT_FRAME_RATE)），改它只能新建 SinkWriter。
+     * 但重开分片 ≠ 重建会话：segmentSeq_ 继续递增、nextSegStartUnix_ 继续
+     * 顺延（墙钟连续）、轮次目录不变，所以导出端看到的是一条连续的时间轴。
+     *
+     * 返回 true 表示已经按新帧率开好新片（或者新帧率跟当前一致、什么都不用做）。
+     */
+    bool SetFps(uint32_t fps);
+
     bool Running() const { return status_.running; }
 
     /** 状态快照。 */
@@ -497,9 +521,28 @@ private:
         // 端会退回文件帧尺寸。
         uint32_t    contentW = 0;
         uint32_t    contentH = 0;
+        // 这一片里**最多有多少帧**（"这一片的内容有多长"的分子）。
+        //
+        // 【为什么不能只记 frames】分片是按 fps_ × segmentSeconds_ 切出来的，
+        // 但 fps_ 可以被就地改（见 SetFps）。改帧率前那一片有 144×2=288 帧、
+        // 改完那一片只有 60×2=120 帧，如果只记帧数、再用"当前 fps_"去换算
+        // 时长，前一片会被算成 288/60=4.8 秒（实测就是 4.80，时间轴直接错乱）。
+        // 所以帧数必须连它的"分母"一起记下来。
+        uint32_t    fps = 0;           // 这一片录制时的编码器帧率
+        uint32_t    segmentFrames = 0; // 这一片录制时的 segmentFrames_
     };
     std::vector<DoneSegment> done_;
     double doneSeconds_ = 0.0;        // 已完成分片累计时长（秒）
+
+    /**
+     * 一片的真实时长（毫秒）。
+     *
+     * 【为什么不能用"当前 fps_"换算】帧率可以被就地改（见 SetFps）：改之前的
+     * 片有 144×2=288 帧、改之后的片只有 60×2=120 帧。拿当前 fps_ 去除所有
+     * 片的帧数，前面的片会被算成 288/60=4.8 秒 —— 实测就是这个数字，时间轴
+     * 当场错乱。所以每片自带 fps 与 segmentFrames，时长只按它自己的算。
+     */
+    static int64_t SegmentDurationMs(const DoneSegment& d);
 
     MfEncoderStatus status_;
 

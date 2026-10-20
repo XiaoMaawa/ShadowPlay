@@ -472,10 +472,22 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
 
     // ---- 命令通道（stdin，NDJSON 一行一条）--------------------------------
     //
-    // 命令有三条：
+    // 命令有四条：
     //   {"cmd":"export","id":"p-desk"}            导出最近 replaySeconds 秒
     //   {"cmd":"export","id":"p-desk","seconds":30}  覆盖时长
     //   {"cmd":"reload","id":"p-desk"}            重新读盘，只重建这一路会话
+    //   {"cmd":"flush","id":"p-desk"}             把正在写的那一片立刻收尾落盘
+    //
+    // 【为什么有 flush】界面点导出走的是**插件**（bridge/shadow_ring.cc 的
+    // exportStart，在 Electron 主进程里跑），服务根本不知道有这回事 —— 于是
+    // Session::ExportNow 里那句 recorder_->FlushSegment() 从来没被执行过。
+    // 后果就是用户报的（m12714）：「导出的视频都是点击前一秒或两秒就停止了」：
+    // 点导出时总有一片正在写，它没 Finalize、index.csv 里也没有它，导出端只能
+    // 读到最后一片**已完成**的，那一片最多 2 秒的内容永远导不出来。
+    //
+    // 所以界面在调 exportStart 之前，先发这条 flush 让服务把那一片收尾。
+    // 收尾不中断录制：紧接着开新片继续录、切片序号继续递增、不换轮次目录，
+    // 代价只是那一片比标称短（导出端按每片真实时长铺时间轴，不受影响）。
     //
     // 【为什么有 reload】界面保存配置后，新参数（帧率、位码率、窗口匹配规则）
     // 只落在磁盘上的 profiles.json 里，而正在跑的 Session 手里拿的是**启动时
@@ -494,6 +506,7 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
     std::mutex cmdMutex;
     std::vector<std::string> pendingExports;  // 待处理的 "id\tseconds"
     std::vector<std::string> pendingReloads;  // 待重载的 profile id
+    std::vector<std::string> pendingFlushes;  // 待收尾分片的 profile id
 
     // ---- 会话表 / 后台重载 ------------------------------------------------
     //
@@ -547,6 +560,23 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                     pendingReloads.push_back(id);
                 }
                 SetEvent(wakeEvent);  // 别等节拍，马上处理
+            }
+            return;
+        }
+        // 收尾正在写的那一片：{"cmd":"flush","id":"p-desk"}
+        //
+        // 必须在 "export" 之前判 —— 界面发的是 {"cmd":"flush",...}，
+        // 里面不含 "export" 字样，两条不会误伤；但反过来如果以后有人
+        // 写成 {"cmd":"export","flush":true}，先判 flush 会把它截走。
+        // 用 "flush" 字样识别，和 reload/export 同一套风格。
+        if (line.find("\"flush\"") != std::string::npos) {
+            const std::string id = FindJsonString(line, "id");
+            if (!id.empty()) {
+                {
+                    std::lock_guard<std::mutex> lk(cmdMutex);
+                    pendingFlushes.push_back(id);
+                }
+                SetEvent(wakeEvent);
             }
             return;
         }
@@ -846,6 +876,26 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                                     "\"配置没有实质变化，保留原会话\"}");
                             continue;
                         }
+                        // ---- 只改了帧率：就地改，别拆会话 ----------------------
+                        //
+                        // 用户把 144 改成 60（或反过来）时，其它参数一个字没动。
+                        // 拆掉重建会换轮次目录、recordSegments 归零、时间轴出现
+                        // 空洞 —— 界面表现就是「短暂的 no signal」「导出按钮被禁用」
+                        // 「刚切过去点导出报该路未在录制」（m13003）。
+                        //
+                        // ApplyLiveSettings 只改帧率：录制器让编码器收掉当前片、
+                        // 按新帧率开新片，墙钟靠 nextSegStartUnix_ 继续顺延，
+                        // 导出端看到的是一条连续的时间轴。
+                        if (it != sessions.end() && want &&
+                            (*it)->SameSettingsIgnoringFps(*np)) {
+                            const bool applied = (*it)->ApplyLiveSettings(*np);
+                            (*it)->SetPreviewFps(previewFps.load(std::memory_order_relaxed));
+                            LogLine("{\"type\":\"session_reloaded\",\"id\":\"" + JsonEscape(id) +
+                                    "\",\"active\":true,\"applied\":" +
+                                    (applied ? "true" : "false") +
+                                    ",\"detail\":\"只改了帧率，已就地生效（不重建会话）\"}");
+                            if (applied) continue;
+                        }
                         // 配置确实变了（或者要停用）。旧的摘出来，锁外收尾。
                         if (it != sessions.end()) {
                             old = std::move(*it);
@@ -895,6 +945,35 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                     ++it;
                 }
             }
+        }
+
+        // 再处理 flush 命令：把正在写的那一片立刻收尾落盘。
+        //
+        // 必须在导出之前处理（同一次被叫醒时 flush 先到就先做）—— 界面点导出
+        // 时会先发 flush 再调插件的 exportStart，这里做完它，导出端才读得到
+        // "点按钮那一刻"的分片。FlushSegment 会等喂帧线程把片写完，通常
+        // 十几毫秒（它只是 Finalize 当前片再开新片），不会卡住状态上报。
+        std::vector<std::string> flushIds;
+        {
+            std::lock_guard<std::mutex> lk(cmdMutex);
+            flushIds.swap(pendingFlushes);
+        }
+        for (const std::string& id : flushIds) {
+            Session* target = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(sessionsMutex);
+                for (auto& s : sessions) {
+                    if (s->Id() == id) { target = &*s; break; }
+                }
+            }
+            if (!target) {
+                LogLine("{\"type\":\"flush_result\",\"id\":\"" + JsonEscape(id) +
+                        "\",\"ok\":false,\"detail\":\"没有这个配置的会话。\"}");
+                continue;
+            }
+            const bool ok = target->FlushRecording();
+            LogLine("{\"type\":\"flush_result\",\"id\":\"" + JsonEscape(id) +
+                    "\",\"ok\":" + (ok ? "true" : "false") + "}");
         }
 
         // 先处理导出命令（导一次要一秒多，不能占着状态上报的节拍）。

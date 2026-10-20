@@ -1021,6 +1021,10 @@ void MfEncoder::CloseSegment() {
         d.startSec = doneSeconds_;
         d.startUnixMs = segStartUnix_;
         d.slot = slotInUse_;
+        // 这一片的"分母"：它录制时的帧率与切片帧数。帧率可以就地改（SetFps），
+        // 所以每片必须自带，否则改帧率后前面所有片的时长都会被算错。
+        d.fps = fps_;
+        d.segmentFrames = segmentFrames_;
         // 真实画面尺寸（过渡期画布会补出黑边，导出端要按这个定画布，
         // 否则用户的画面会缩成左上角一小块）。0 = 这一片从没走过渡路径。
         d.contentW = segContentW_ ? segContentW_ : width_;
@@ -1037,9 +1041,10 @@ void MfEncoder::CloseSegment() {
         //
         // 帧率取 fps_（喂帧线程按这个补帧，帧数与墙钟严格对应），不做四舍五入：
         // 误差会随片数累积，宁可留着小数让导出端按墙钟裁。
-        const double secPerFrame = 1.0 / static_cast<double>(fps_ ? fps_ : 60);
-        nextSegStartUnix_ =
-            segStartUnix_ + static_cast<int64_t>(static_cast<double>(framesInSegment_) * secPerFrame * 1000.0);
+        // 帧率取**这一片自己的** fps（不是当前 fps_）：帧率可以被就地改，
+        // 拿新帧率去换算旧片的帧数会凭空造出空洞（实测 288 帧被算成 4.8 秒）。
+        // 用 done_.back() 而不是 d：d 已经被 move 进 done_ 了。
+        nextSegStartUnix_ = segStartUnix_ + SegmentDurationMs(done_.back());
         RewriteIndex();
     }
 }
@@ -1056,11 +1061,15 @@ void MfEncoder::CloseSegment() {
  * 改成按时间清之后，"能回放多久"只由墙钟决定：片多片少都无所谓，只要
  * 覆盖到回放窗口就行。槽位数量则给足余量（keepSlots_ = 标称片数 × 8）。
  */
+int64_t MfEncoder::SegmentDurationMs(const DoneSegment& d) {
+    const double secPerFrame = 1.0 / static_cast<double>(d.fps ? d.fps : 60u);
+    return static_cast<int64_t>(static_cast<double>(d.frames) * secPerFrame * 1000.0);
+}
+
 void MfEncoder::PurgeExpired(int64_t nowMs) {
     if (done_.empty()) return;
     const int64_t windowMs = WindowMs();
     if (windowMs <= 0) return;
-    const double secPerFrame = 1.0 / static_cast<double>(fps_ ? fps_ : 60);
     // 【"现在"要用时间轴上的现在，不是墙钟的现在】
     //
     // 分片的 startUnixMs 是**内容时间轴**：第一片开片时取一次真实墙钟，之后
@@ -1077,8 +1086,7 @@ void MfEncoder::PurgeExpired(int64_t nowMs) {
     int64_t axisNow = nowMs;
     if (!done_.empty()) {
         const DoneSegment& newest = done_.back();
-        const int64_t newestEnd =
-            newest.startUnixMs + static_cast<int64_t>(static_cast<double>(newest.frames) * secPerFrame * 1000.0);
+        const int64_t newestEnd = newest.startUnixMs + SegmentDurationMs(newest);
         // 时间轴只会落后墙钟（编码慢）或持平，正常不会超前；万一超前也夹回墙钟。
         if (newestEnd > 0 && newestEnd < axisNow) axisNow = newestEnd;
     }
@@ -1099,8 +1107,7 @@ void MfEncoder::PurgeExpired(int64_t nowMs) {
         // 的片会被留着 —— 它的起点早就跌出窗口了，清单里于是出现一条
         // 18 秒前的记录，而窗口是 20 秒，看起来"只留了 7 片"。
         // 判终点保证不留早于窗口的尾巴，判起点保证清单不会倒着长。
-        const int64_t endMs =
-            it->startUnixMs + static_cast<int64_t>(static_cast<double>(it->frames) * secPerFrame * 1000.0);
+        const int64_t endMs = it->startUnixMs + SegmentDurationMs(*it);
         if (endMs < cutoff || it->startUnixMs < cutoff) {
             // 已经彻底跌出窗口了：删除文件、从清单里去掉，槽位随之释放。
             std::error_code ec;
@@ -1162,10 +1169,10 @@ uint32_t MfEncoder::PickSlot() {
 void MfEncoder::RewriteIndex() {
     if (dir_.empty()) return;
 
-    const double secPerFrame = 1.0 / static_cast<double>(fps_);
-
     std::ostringstream out;
     for (const DoneSegment& d : done_) {
+        // 时长按**这一片自己的**帧率算（帧率可以被就地改，见 SetFps）。
+        const double secPerFrame = 1.0 / static_cast<double>(d.fps ? d.fps : 60u);
         const double end = d.startSec + static_cast<double>(d.frames) * secPerFrame;
         char line[512];
         // 六列：文件名,起始秒,结束秒,起始墙钟Unix毫秒,真实宽,真实高。
@@ -1409,6 +1416,112 @@ bool MfEncoder::FlushSegment() {
         return false;
     }
     return true;
+}
+
+bool MfEncoder::SetFps(uint32_t fps) {
+    // 没在录：只更新一下记录值，下次 Start 会按它来。
+    if (!status_.running) {
+        if (fps > 240) fps = 240;
+        requestedFps_ = fps ? fps : 60;
+        fps_ = requestedFps_;
+        return true;
+    }
+
+    if (fps > 240) fps = 240;
+    if (fps == 0) fps = 60;
+    if (fps == requestedFps_ && fps == fps_) return true; // 真的没变
+
+    // CloseSegment / OpenSegment 都要碰 SinkWriter，必须在本线程有套间。
+    MfThreadScope threadScope;
+    if (!threadScope.ok) {
+        status_.failed = true;
+        status_.detail = "换帧率时拿不到 COM 套间";
+        return false;
+    }
+
+    // 收掉当前片。它已经写了几十上百帧，Finalize 之后是完整可读的分片，
+    // 导出端照样能用 —— 这就是"改帧率之前的画面还在回放里"的关键。
+    //
+    // 【一帧都没有的例外】跟 ResizeTo 一样：刚开出来就赶上改帧率的话，
+    // 直接按新帧率重开，不占槽位、不推进 segmentSeq_（否则时间轴上会多
+    // 出一个 0 帧的洞）。
+    const bool emptySegment = (framesInSegment_ == 0 && writer_ != nullptr);
+    if (emptySegment) {
+        IMFSinkWriter* w = static_cast<IMFSinkWriter*>(writer_);
+        w->Finalize();
+        w->Release();
+        writer_ = nullptr;
+        ReleaseSample();
+        std::error_code ec;
+        if (!currentPath_.empty()) fs::remove(fs::u8path(currentPath_), ec);
+    } else {
+        CloseSegment();
+        ++segmentSeq_;
+    }
+
+    // 换帧率重开。**不走 StartWithFpsFallback**：那个是入口用的，会重置
+    // segmentSeq_ / nextSegStartUnix_ / done_，等于把会话拆了重建 —— 正是
+    // 本函数要避免的事。这里自己走一遍"改值 -> 试开 -> 不行就降档"。
+    //
+    // 为什么要重试降档：新帧率同样受硬件"分辨率 × 帧率"吞吐上限约束
+    // （1440p 上限 172fps，见 StartWithFpsFallback 的注释）。用户从 60
+    // 改到 240 时一样会被拒，那时必须降到硬件能接受的档位继续录，不能
+    // 整路失败。
+    static const uint32_t kLadder[] = {240, 165, 144, 120, 90, 60, 30};
+    const uint32_t requested = fps;
+    uint32_t candidate = requested;
+    for (;;) {
+        fps_ = candidate;
+        // 分片按帧数切，帧率变了必须跟着重算，否则"每片 2 秒"会变成
+        // 2×(原帧率/新帧率) 秒。
+        segmentFrames_ = fps_ * segmentSeconds_;
+        if (segmentFrames_ < fps_) segmentFrames_ = fps_;
+
+        // 码率跟着帧率重估（ResizeTo 里同样的口径）：帧率翻倍时同样的
+        // 码率会让每帧分到的比特减半，画质掉得厉害。
+        {
+            const double px = static_cast<double>(width_) * height_;
+            uint32_t mbps = static_cast<uint32_t>(px * 0.15 * fps_ / 1e6 + 0.5);
+            if (mbps < 2) mbps = 2;
+            if (mbps > 100) mbps = 100;
+            bitrateBps_ = mbps * 1000000u;
+        }
+
+        status_.failed = false;
+        status_.detail.clear();
+        if (OpenSegment()) {
+            requestedFps_ = fps;
+            if (candidate != fps || candidate != requested) {
+                status_.detail = "录制中（帧率已改为 " + std::to_string(candidate) +
+                                 " 帧，配置要的是 " + std::to_string(requested) + " 帧）";
+            } else {
+                status_.detail = "录制中";
+            }
+            return true;
+        }
+
+        // 只有"媒体类型不被接受"才值得降帧率重试。
+        if (status_.detail.find("MF_E_INVALIDMEDIATYPE") == std::string::npos &&
+            status_.detail.find("0xC00D36B4") == std::string::npos) {
+            status_.failed = true;
+            return false;
+        }
+
+        uint32_t next = 0;
+        for (uint32_t v : kLadder) {
+            if (v < candidate) {
+                next = v;
+                break;
+            }
+        }
+        if (next == 0) {
+            status_.failed = true;
+            status_.detail = "改帧率失败：硬件编码器不接受任何候选帧率（最后试到 " +
+                             std::to_string(candidate) + " 帧）";
+            return false;
+        }
+        candidate = next;
+    }
 }
 
 void MfEncoder::Finish() {

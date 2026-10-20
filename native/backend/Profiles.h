@@ -187,6 +187,19 @@ struct Profile {
     //   * enabled   它变了必须重建（开→关要停线程），由调用方单独判；
     //   * num / createdAt  纯界面用的元数据。
     bool SameSettings(const Profile& other) const;
+
+    // 同上，但**忽略帧率**（video.fps）。
+    //
+    // 【为什么需要】帧率是可以就地改的：录制器的喂帧线程按新帧率走、编码器
+    // 收掉当前片按新帧率开新片，墙钟靠 nextSegStartUnix_ 继续顺延。而其它
+    // 字段（码率、分片时长、回放窗口、采集源）都写死在录制器/采集器构造时，
+    // 改不了。
+    //
+    // reload 用它来决定走「就地改帧率」还是「拆掉重建」：用户把 144 改成 60
+    // 时绝不能重建 —— 那会换轮次目录、recordSegments 归零、时间轴出现空洞，
+    // 界面表现就是「短暂的 no signal」「导出按钮被禁用」「该路未在录制」
+    // （m13003）。
+    bool SameSettingsIgnoringFps(const Profile& other) const;
 };
 
 // ---------------------------------------------------------------------------

@@ -639,6 +639,39 @@ SinkWriter 手里、没 `Finalize`、`index.csv` 里也没有它，导出端 `Li
 SinkWriter 只由那个线程碰，从命令线程直接 `Finalize` 会和正在进行的
 `WriteSample` 撞车。
 
+#### 9.4.1.1 界面点导出时，`flush` 必须**等到回执**再开始
+
+用户又说「请你回放导出的视频一直到点击按钮的那一刻才停止，我看现在导出的
+视频都是点击前一秒或两秒就停止了」（m12714）。
+
+上面那句 `Session::ExportNow` 里的 `FlushSegment()` **从来没在界面点导出时
+执行过** —— 界面导出走的是插件（`bridge/shadow_ring.cc` 的 `exportStart`，
+在 Electron 主进程里跑），服务完全不知道有这回事。所以补了一条命令
+`{"cmd":"flush","id":...}`，由 `app/main.cjs` 在调 `exportStart` 之前发出。
+
+**但第一版发完就直接往下走了，等于没做。** 命令管道是单向的
+（`PIPE_ACCESS_INBOUND`），服务没法回话，`pipeSend` 写完就 `return { ok: true }`；
+而服务端是在主循环里排队处理 `pendingFlushes`（`WaitForSingleObject(wakeEvent,
+100)` 醒来才轮询），`FlushSegment` 本身还要 `Finalize` 排空编码队列、几十到
+几百毫秒。导出端抢在这之前就把目录扫完了 —— 实测 `export_plan` 里的 `segs`
+仍然只到 flush 之前的那一片，症状一点没变。
+
+修法：状态文件里加一个只增不减的计数 `flushSeq`（`SessionStatus::flushSeq`，
+`Session::FlushRecording()` 真的切出一片才 `fetch_add(1)`）。界面发完 flush
+后轮询它，变了才去 `exportStart`；最多等 3 秒（`FlushSegment` 内部超时 2 秒
++ 1 秒给状态写盘节拍），等不到就打一条日志照旧导出。
+
+为什么不数 `index.csv` 的行数 / 比 mtime：槽位复用会让同一个文件名出现两次，
+轮次目录切换会让"最新的 index.csv"换一个路径，两种都会误判。计数是唯一
+不受这些影响的信号。
+
+实测（`node scripts/test-export.mjs 30` 的 `exportPlan`）：
+- 修前 `segs=10 copies=10`，最后一片 `wall` 等于 `axisNow`，flush 切出的那一片
+  在窗口外 → 成片末尾比点击时刻早 1~2 秒。
+- 修后 `segs=11 copies=11`，最后一片 `10:1__000010.mp4 ok=1 dur=1.958326`，
+  `axisNow` 正好等于它的末尾，`noSignalSeconds=0`，`VIDEO 10 sec=1.958326`
+  完整铺上 —— 成片一直录到点按钮那一刻。
+
 ### 9.4.2 导出的计划必须能打出来（`export_plan`）
 
 「导出里莫名出现 NO SIGNAL」有三种完全不同的成因：分片集合里真有空洞（录制端
@@ -871,6 +904,52 @@ SinkWriter 只由那个线程碰，从命令线程直接 `Finalize` 会和正在
 
 **教训**：这个钳制第一版只写在重编码分支里，而「所有分片尺寸一致 + 没有 NO
 SIGNAL」时走的是**直拷**分支 —— 所以钳制形同不存在，白改一次。两条路必须同时改。
+
+#### 9.6.2 混合帧率：成片必须是恒定帧率，两条路都要管
+
+用户原话 (m13003)：「当前半段是 144fps 的，后半段是 60fps 时，因为 144fps
+性能不足，录制出来的视频很卡」。
+
+**症状与根因**：144fps 录一段、改成 60fps 再录一段，导出成片
+`ffprobe` 报 `avg_frame_rate=106920000/1200047`（≈89.1）—— 这是**可变帧率**
+（VFR）。直拷通道搬的是现成的压缩样本，每一片只把自己那一段接在游标后面，
+于是成片"这一段每帧 1/144 秒、那一段每帧 1/60 秒"。播放器按平均帧率去解码，
+144 段每帧挤在半帧时间里、60 段又被重复显示，看起来就是"卡成 PPT"。
+
+**修法一：帧率不一致就不许直拷。** `Exporter.cpp` 的 `uniform` 判定新增一条：
+逐片比 `shapes[si].fps`，只要有一片和别的不一样就 `uniform = false`，强制走
+重编码。重编码路径能把每一片按真实时间戳重采样到同一个网格上。
+
+**修法二：重编码路径改成「按 canvasFps 铺固定网格，源样本按时间戳贴上去」。**
+
+原来是算 `repeat = canvasFps / srcFps`（只认整数倍）再按 `rateFps` 推时间轴。
+单个帧率时没问题，混合帧率时每一片各按自己的帧率推，成片照样是 VFR。
+
+现在每一片在成品时间轴上占 `wantOutFrames = round(takeSec × canvasFps)` 个
+**固定网格点**，源样本按它自己的真实时间戳落到网格上：
+
+- 网格点号 `gridIdx = round((sampleSec - skipSec) × canvasFps)`；
+- 网格比源帧密（采集跟不上 / 60fps 段铺到 144fps 网格）→ 中间空出来的点用
+  **上一帧重复填**，这就是用户要的「用插帧的方法，一帧多放几次补齐」；
+- 网格比源帧疏（144fps 段铺到 60fps 网格）→ 连续几帧落到同一个点，后面的
+  覆盖前面的，相当于丢帧；
+- 片尾剩下的网格点用最后一帧补满，保证下一片的起点不漂。
+
+成片严格恒定帧率，时长精确等于计划里那一段。
+
+**实测**（`%TEMP%\shadow-play\mixfps`，7 秒 144fps + 8 秒 60fps，配置 20 秒）：
+
+| | 修前 | 修后 |
+|---|---|---|
+| 成片帧率 | `106920000/1200047`（VFR ≈89） | `60/1`（CFR） |
+| 时长 | 20.000767 | 20.083317 |
+| 帧数 | 1721 | 1205 |
+
+**顺带**：录制端的插帧早就在 `SegmentRecorder::FeederLoop` 里了 ——
+`const uint64_t due = elapsedSec * fps + 1; need = due - framesWritten`，
+补帧**没有上限**（注释写明「允许卡、不允许变速」）。采集只到 120fps 而配置
+要 144fps 时，缺的那些帧就是重复上一帧。1440p@144 实测每片
+`distinct/frames = 0.97~0.99`，说明本机采集跟得上、几乎不需要补。
 
 ### 9.7 录制根目录：`recordings/`
 

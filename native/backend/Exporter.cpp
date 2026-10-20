@@ -567,7 +567,29 @@ bool ListSegments(const fs::path& dir, std::vector<SegmentFile>& out, std::strin
     return true;
 }
 
-/** 复制一个文件并校验字节数。 */
+/** 复制一个文件并校验字节数。
+ *
+ * 【expectBytes 只是"扫描那一刻"的快照，不能当死判据】
+ *
+ * 用户报的「回放导出的视频到点击前一秒/两秒就停了」（m12714）根因就在这。
+ * 点导出的链路是：先 `recorder_->FlushSegment()`（立刻把正在写的那一片切出来
+ * 落盘），紧接着 `ExportNow()` 扫目录。而 FlushSegment 里 `CloseSegment()`
+ * 要调 `IMFSinkWriter::Finalize()`，那是**异步排空编码队列 + 写 moov 索引**，
+ * 几十到几百毫秒；`ExportNow()` 在这期间就开始扫了，`ListSegments` 拿到的
+ * `bytes` 是 Finalize 写到一半的大小。等 `copy_file` 真正执行时文件又长大了，
+ * 于是 `got != expectBytes` → 重试三次都失败 → 这一片被 `continue` 跳过。
+ *
+ * 被跳过的那一片**恰恰就是 flush 刚切出来的、含"点击那一刻"画面的那一片**
+ * （短、只有一两秒），所以成片总是在点击前一秒/两秒就停 —— 症状与机制完全
+ * 吻合。而其余完整分片是早就 Finalize 完的，字节数稳定，不会被跳过。
+ *
+ * 修法：字节数对不上时**重新 stat 一次源文件**。只要 `got` 等于源文件此刻的
+ * 真实大小，就说明我们完整复制了一个自洽的快照（文件在复制过程中没再长），
+ * 只是它比扫描时记录的更大 —— 那是正常现象，不是复制失败。
+ *
+ * 仍然保留"必须与某个真实大小完全相等"这条底线：真正被截断/写坏的复制
+ * （`copy_file` 中途源文件被 remove 后重建）依然会被判失败。
+ */
 bool CopyChecked(const fs::path& from, const fs::path& to, uint64_t expectBytes,
                  std::string& err) {
     std::error_code ec;
@@ -577,12 +599,19 @@ bool CopyChecked(const fs::path& from, const fs::path& to, uint64_t expectBytes,
         return false;
     }
     const uint64_t got = static_cast<uint64_t>(fs::file_size(to, ec));
-    if (ec || got != expectBytes) {
-        err = "复制分片后字节数不对（期望 " + std::to_string(expectBytes) + "，实际 " +
-              std::to_string(got) + "）";
+    if (ec) {
+        err = "读不到复制出来的分片大小：" + ec.message();
         return false;
     }
-    return true;
+    if (got == expectBytes) return true;
+    // 源文件可能还在长（Finalize 正在写索引）：以复制完成后源文件的大小为准。
+    std::error_code ec2;
+    const uint64_t srcNow = static_cast<uint64_t>(fs::file_size(from, ec2));
+    if (!ec2 && got == srcNow) return true;
+    err = "复制分片后字节数不对（期望 " + std::to_string(expectBytes) + "，实际 " +
+          std::to_string(got) + (ec2 ? std::string() : "，源文件此刻 " + std::to_string(srcNow)) +
+          "）";
+    return false;
 }
 
 /** 目录里挑一个不重名的文件名。 */
@@ -1326,6 +1355,7 @@ void Exporter::Run() {
         // 「一样大」看的是真实画面尺寸：分片文件本身可能带着过渡期的黑边
         // （比画布大），那种片子不能直拷 —— 搬过去就把黑边一起搬进成品了。
         bool uniform = true;
+        uint32_t uniformFps = 0;
         for (const auto& s : shapes) {
             if (!s.ok) continue;
             if (s.contentW != canvasW || s.contentH != canvasH) {
@@ -1335,6 +1365,27 @@ void Exporter::Run() {
             if (s.width != s.contentW || s.height != s.contentH) {
                 uniform = false; // 文件里带黑边，必须重编码裁掉
                 break;
+            }
+            // 【帧率不一致也必须重编码】见 DESIGN.md 9.9.2。
+            //
+            // 直拷通道搬的是现成的压缩样本，各片只把自己那一段接在游标后面，
+            // 于是成片的帧率是"这一段 144、那一段 60"——ffprobe 报出来的
+            // avg_frame_rate 是 106920000/1200047（≈89），也就是**可变帧率**。
+            // 播放器按平均帧率去解码，144 段每帧挤在半帧的时间里、60 段又
+            // 重复显示，看起来就是"卡成 PPT"。
+            //
+            // 用户原话（m13003）："当前半段是 144fps 的，后半段是 60fps 时，
+            // 因为 144fps 性能不足，录制出来的视频很卡"。
+            //
+            // 只要有一片帧率和别人不一样，就改走重编码 —— 那条路会把每一片
+            // 按真实时间戳重采样到同一个 canvasFps 网格上，成片是恒定帧率。
+            if (s.fps > 0) {
+                if (uniformFps == 0) {
+                    uniformFps = s.fps;
+                } else if (s.fps != uniformFps) {
+                    uniform = false;
+                    break;
+                }
             }
         }
         // 要补 NO SIGNAL 就只能重编码：直拷通道搬的是现成的压缩样本，
@@ -1840,18 +1891,29 @@ void Exporter::Run() {
                     continue;
                 }
 
-                // 每帧写几遍才能跟上画布帧率（只认整数倍，理由同直拷路径）。
-                uint32_t repeat = 1;
-                if (canvasFps > srcFps && srcFps > 0 && (canvasFps % srcFps) == 0) {
-                    repeat = canvasFps / srcFps;
-                }
-                // 时间轴的名义帧率：重复时就是画布帧率；源帧率更高时按源帧率
-                // 走 —— 宁可帧率不是用户设的那个，也绝不能变速。
-                const uint32_t rateFps = (repeat > 1 || srcFps >= canvasFps) ? canvasFps : srcFps;
+                // 【输出帧网格：按 canvasFps 铺固定网格，源样本按时间戳"贴"上去】
+                //
+                // 以前这里算 `repeat = canvasFps / srcFps`（只认整数倍）再
+                // 按 `rateFps` 推时间轴。单个帧率时没问题，但**混合帧率**
+                // （前 10 秒 144、后 10 秒 60）时每一片各按自己的帧率推，
+                // 成片就变成可变帧率（ffprobe 报 avg_frame_rate≈89），
+                // 播放器按平均帧率解码 → 144 段挤、60 段重复 → "卡成 PPT"。
+                //
+                // 现在改成：这一片在成品时间轴上占 `wantOutFrames` 个固定
+                // 网格点（= takeSec × canvasFps），源样本按它自己的真实时间
+                // 戳往里填，网格点比源帧密就重复上一帧（用户原话 m13003
+                // "用插帧的方法，一帧多放几次的方法补齐"），比源帧疏就丢帧。
+                // 成片严格恒定帧率，时长精确等于计划里那一段。
+                const double itemSec = takeSec > 0.0 ? takeSec : 0.0;
+                const uint64_t wantOutFrames =
+                    static_cast<uint64_t>(itemSec * static_cast<double>(canvasFps) + 0.5);
 
                 const long long segBaseTicks = cursorTicks;
                 uint64_t segOutFrames = 0;
                 uint64_t segFrames = 0;
+                // 本片是否已经有过一帧落到画布上。用来区分"片头空网格"
+                // （没有上一帧可重复，只能跳过）和"片尾空网格"（重复最后一帧）。
+                bool havePrevCanvas = false;
 
                 for (;;) {
                     DWORD flags = 0;
@@ -1966,18 +2028,55 @@ void Exporter::Run() {
                     mbuf->Release();
                     sample->Release();
 
-                    // 同一帧写 repeat 遍。
-                    for (uint32_t k = 0; k < repeat; ++k) {
+                    // 把这一帧"贴"到输出网格上：源样本时间戳落到哪个网格点，
+                    // 就从那个网格点开始重复写到下一个源样本到来之前。
+                    //
+                    // 网格点号 = round((sampleSec - skipSec) * canvasFps)。
+                    // 源帧比网格密时连续几帧会落到同一个点，后面的覆盖前面的
+                    // （相当于丢帧）；比网格疏时中间那些点就用这一帧重复填
+                    // （相当于插帧）。两种情况都是"一帧多放几次"的自然结果。
+                    const double relSec = sampleSec - skipSec;
+                    if (relSec < -1e-6) { sample->Release(); continue; }
+                    uint64_t gridIdx = 0;
+                    if (relSec > 0.0) {
+                        gridIdx = static_cast<uint64_t>(
+                            relSec * static_cast<double>(canvasFps) + 0.5);
+                    }
+                    if (gridIdx > segOutFrames) {
+                        // 中间空出来的网格点用上一帧补（源帧率低于画布帧率）。
+                        // 没有上一帧（片头）就先跳过，等第一帧落下来。
+                        if (havePrevCanvas) {
+                            while (segOutFrames < gridIdx) {
+                                const long long t0 = static_cast<long long>(
+                                    static_cast<double>(segOutFrames) * 10000000.0 /
+                                        static_cast<double>(canvasFps) +
+                                    0.5);
+                                const long long t1 = static_cast<long long>(
+                                    static_cast<double>(segOutFrames + 1) * 10000000.0 /
+                                        static_cast<double>(canvasFps) +
+                                    0.5);
+                                if (!pushCanvas(segBaseTicks + t0, t1 - t0)) break;
+                                ++segOutFrames;
+                            }
+                        } else {
+                            segOutFrames = gridIdx;
+                        }
+                    }
+                    // 这一帧占据 [gridIdx, 下一帧的 gridIdx) 这段网格。先把它
+                    // 记下来，等下一个源样本到了再决定写几个点 —— 但如果这是
+                    // 本片最后一帧，收尾时会用 wantOutFrames 补满。
+                    if (gridIdx >= segOutFrames) {
                         const long long t0 = static_cast<long long>(
-                            static_cast<double>(segOutFrames) * 10000000.0 /
-                                static_cast<double>(rateFps) +
+                            static_cast<double>(gridIdx) * 10000000.0 /
+                                static_cast<double>(canvasFps) +
                             0.5);
                         const long long t1 = static_cast<long long>(
-                            static_cast<double>(segOutFrames + 1) * 10000000.0 /
-                                static_cast<double>(rateFps) +
+                            static_cast<double>(gridIdx + 1) * 10000000.0 /
+                                static_cast<double>(canvasFps) +
                             0.5);
                         if (!pushCanvas(segBaseTicks + t0, t1 - t0)) break;
-                        ++segOutFrames;
+                        segOutFrames = gridIdx + 1;
+                        havePrevCanvas = true;
                     }
                     if (!mergeErr.empty()) break;
 
@@ -1985,10 +2084,30 @@ void Exporter::Run() {
                     ++totalFrames;
                 }
 
+                // 收尾：网格还剩没铺的点，用最后一帧补满（源帧率低于画布帧率
+                // 时，最后那段本来就没有新样本了）。这一片在计划里占
+                // itemSec 秒，就必须正好铺 wantOutFrames 个点，否则下一片的
+                // 起点会漂。
+                if (havePrevCanvas && wantOutFrames > 0) {
+                    while (segOutFrames < wantOutFrames) {
+                        const long long t0 = static_cast<long long>(
+                            static_cast<double>(segOutFrames) * 10000000.0 /
+                                static_cast<double>(canvasFps) +
+                            0.5);
+                        const long long t1 = static_cast<long long>(
+                            static_cast<double>(segOutFrames + 1) * 10000000.0 /
+                                static_cast<double>(canvasFps) +
+                            0.5);
+                        if (!pushCanvas(segBaseTicks + t0, t1 - t0)) break;
+                        ++segOutFrames;
+                    }
+                }
+                // 源帧比网格密时 segOutFrames 可能超过 wantOutFrames（最后几帧
+                // 落到同一段末尾之外），按网格点推游标而不是按写出去的帧数。
                 cursorTicks = segBaseTicks +
                               static_cast<long long>(static_cast<double>(segOutFrames) *
                                                          10000000.0 /
-                                                     static_cast<double>(rateFps) +
+                                                     static_cast<double>(canvasFps) +
                                                      0.5);
 
                 reader->Release();

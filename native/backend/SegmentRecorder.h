@@ -141,6 +141,22 @@ public:
      */
     bool FlushSegment(uint32_t timeoutMs = 2000);
 
+    /**
+     * 就地改帧率（不重建录制器、不换轮次目录、分片序号继续递增）。
+     *
+     * 【为什么需要】界面把帧率从 144 改成 60 时，服务走的是 reload。原来
+     * reload 判「配置变了」就整路拆掉重建：新轮次目录、recordSegments 归零、
+     * 时间轴出现空洞 —— 于是用户看到「短暂的 no signal」「导出按钮被禁用」
+     * 「刚切过去点导出报该路未在录制」（m13003）。
+     *
+     * 现在改帧率不再重建会话（见 Profile::SameSettings），由 Session 直接
+     * 调这里：喂帧线程在两帧之间看到请求就调 encoder_->SetFps()，编码器收尾
+     * 当前片、按新帧率开新片，时间轴靠 nextSegStartUnix_ 继续顺延。
+     *
+     * 返回 true = 已经按新帧率工作（或帧率本来就没变）；false = 没在录 / 超时。
+     */
+    bool SetFps(uint32_t fps, uint32_t timeoutMs = 3000);
+
     bool Running() const;
 
     /** 取状态快照（会顺手扫一遍分片目录，别用太高的频率调）。 */
@@ -175,7 +191,9 @@ private:
     VideoSpec   video_;
     uint32_t    width_ = 0;
     uint32_t    height_ = 0;
-    uint32_t    fps_ = 0;      // 喂帧声明的帧率（0 -> 用 60）
+    // 喂帧线程用的帧率**不在这里** —— 它改成了 fps_（见下面「改帧率请求」
+    // 那段里的 atomic 成员）。改帧率是热操作：命令线程随时会写、喂帧线程
+    // 每一拍都要读它算节拍，放普通成员会有数据竞争。
 
     // 编码器。用 unique_ptr 是为了让头文件不必包含 MfEncoder.h
     // （它会把 mfreadwrite.h 拖给所有包含者），也方便 Start() 失败后重建。
@@ -220,6 +238,23 @@ private:
     uint64_t flushWant_ = 0;   // 请求序号
     uint64_t flushDone_ = 0;   // 已完成到的序号
     bool flushOk_ = false;     // 最近一次切片的成败
+
+    // ---- 改帧率请求（界面改配置时用）--------------------------------------
+    //
+    // 与 flush 同一套「序号 + 条件变量」的机制：命令线程置 wantFps_/fpsWant_，
+    // 喂帧线程在两帧之间看到就调 encoder_->SetFps()，完成后置 fpsDone_。
+    //
+    // 【为什么不在命令线程直接调】跟 FlushSegment 一样：SinkWriter 只由喂帧
+    // 线程碰，从命令线程直接 Finalize 会和正在进行的 WriteSample 撞车。
+    //
+    // 用 atomic 是因为喂帧线程每一拍都要读 fps_ 算节拍，加锁不值得。
+    std::atomic<uint32_t> fps_{0};        // 喂帧线程当前用的帧率（0 -> 60）
+    std::mutex fpsMu_;
+    std::condition_variable fpsCv_;
+    uint32_t fpsWantValue_ = 0;           // 命令线程要改成多少
+    uint64_t fpsWant_ = 0;                // 请求序号
+    uint64_t fpsDone_ = 0;                // 已完成到的序号
+    bool fpsOk_ = false;                  // 最近一次改帧率的成败
 };
 
 } // namespace shadow

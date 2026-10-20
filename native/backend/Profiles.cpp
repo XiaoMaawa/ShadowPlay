@@ -594,6 +594,19 @@ bool Profile::SameSettings(const Profile& o) const {
     return true;
 }
 
+bool Profile::SameSettingsIgnoringFps(const Profile& o) const {
+    // 唯一和 SameSettings 的区别就是**不比 video.fps**（它可以在录制过程中
+    // 就地改，见 Session::ApplyLiveSettings 与 SegmentRecorder::SetFps）。
+    //
+    // 实现上直接复制一份、把 fps 抹平再交给 SameSettings：这样将来
+    // SameSettings 加了新字段，这里自动跟着比，不会漏。
+    Profile a = *this;
+    Profile b = o;
+    a.video.fps = 0.0;
+    b.video.fps = 0.0;
+    return a.SameSettings(b);
+}
+
 const Profile* ProfileDoc::Find(const std::string& id) const {
     for (const auto& p : profiles) {
         if (p.id == id) return &p;

@@ -397,8 +397,12 @@ SegmentRecorder::SegmentRecorder(std::string dir, VideoSpec video, uint32_t widt
     if (!dir_.empty()) {
         segmentsDir_ = PathToUtf8(fs::u8path(dir_) / "segments");
     }
-    fps_ = video_.fps ? video_.fps : 60u;
-    if (fps_ > 240) fps_ = 240; // 离谱值兜一下，别让 GOP 算爆
+    // 帧率是可热改的（见 SetFps），所以存进 atomic 成员。
+    {
+        uint32_t f = video_.fps ? video_.fps : 60u;
+        if (f > 240) f = 240; // 离谱值兜一下，别让 GOP 算爆
+        fps_.store(f, std::memory_order_relaxed);
+    }
 }
 
 SegmentRecorder::~SegmentRecorder() { Stop(); }
@@ -574,7 +578,7 @@ bool SegmentRecorder::Start() {
     // 一个 MfEncoder = 一个进程内 SinkWriter，没有子进程、没有 ffmpeg.exe。
     // 自己把 BGRA 转成 NV12 再喂（见 MfEncoder.h 里 ConvertToNv12 的注释）。
     encoder_ = std::make_unique<MfEncoder>();
-    if (!encoder_->Start(runDir_, width_, height_, fps_,
+    if (!encoder_->Start(runDir_, width_, height_, fps_.load(std::memory_order_relaxed),
                          video_.bitrateMbps ? video_.bitrateMbps : 20u, segmentSeconds, keep)) {
         const MfEncoderStatus es = encoder_->Status();
         std::lock_guard<std::mutex> lk(mu_);
@@ -595,7 +599,7 @@ bool SegmentRecorder::Start() {
                 << std::strtoul(fs::path(runDir_).filename().u8string().c_str(), nullptr, 10)
                 << ",\n"
                 << "  \"fps\": " << actualFps << ",\n"
-                << "  \"requestedFps\": " << fps_ << ",\n"
+                << "  \"requestedFps\": " << fps_.load(std::memory_order_relaxed) << ",\n"
                 << "  \"width\": " << width_ << ",\n"
                 << "  \"height\": " << height_ << ",\n"
                 << "  \"segmentSeconds\": " << segmentSeconds << ",\n"
@@ -682,7 +686,13 @@ bool SegmentRecorder::Feed(const void* pixels, uint32_t stride, uint32_t width, 
 }
 
 void SegmentRecorder::FeederLoop() {
-    const double fps = fps_ > 0 ? static_cast<double>(fps_) : 60.0;
+    // 帧率每一拍都重新读（见 SetFps）：它可以在录制过程中被改，
+    // 循环外固定成 const 会让新帧率永远不生效。
+    auto currentFps = [this]() {
+        const uint32_t f = fps_.load(std::memory_order_relaxed);
+        return f > 0 ? static_cast<double>(f) : 60.0;
+    };
+    double fps = currentFps();
 
     // 本地复用的帧缓冲：取出槽里的帧之后立刻放开槽锁，编码时不再占着它。
     std::vector<uint8_t> frame;
@@ -828,6 +838,62 @@ void SegmentRecorder::FeederLoop() {
                 flushCv_.notify_all();
             }
         }
+
+        // ---- 有人要求"改帧率"（界面改配置时）------------------------------
+        //
+        // 与 flush 同一套「序号 + 条件变量」的机制，也放在补帧**之后**：
+        // 这一刻该写的帧都写完了，切片的时间轴右端正好是"现在"。
+        //
+        // 【为什么不重建会话】原来改帧率走 reload 整路拆建 —— 新轮次目录、
+        // recordSegments 归零、时间轴出现空洞，用户看到的就是「短暂的
+        // no signal」「导出按钮被禁用」「刚切过去点导出报该路未在录制」
+        // （m13003）。这里只是让编码器收掉当前片、按新帧率开新片，墙钟靠
+        // nextSegStartUnix_ 继续顺延，导出端看到的是一条连续的时间轴。
+        if (alive) {
+            uint32_t wantFps = 0;
+            uint64_t wantSeq = 0;
+            {
+                std::lock_guard<std::mutex> lk(fpsMu_);
+                wantFps = fpsWantValue_;
+                wantSeq = fpsWant_;
+            }
+            if (wantSeq != fpsDone_) {
+                const bool ok = encoder_ && encoder_->SetFps(wantFps);
+                if (ok) {
+                    // 喂帧线程的节拍立刻切到新帧率（可能被编码器降过档）。
+                    fps_.store(encoder_ ? encoder_->EffectiveFps() : wantFps,
+                               std::memory_order_relaxed);
+                    const double newFps = currentFps();
+                    if (newFps > 0 && newFps != fps) {
+                        // ---- 【必须把基准时刻 t0 往前挪】--------------------
+                        //
+                        // 节拍是 `nextDue = t0 + framesWritten / fps`。帧率从
+                        // 144 降到 60 时 framesWritten 已经有一千多，用**新**
+                        // 帧率去除会算出一个远在未来的时刻（实测 1684/60 =
+                        // 28 秒，而实际才过了 14 秒）→ 喂帧线程一路睡到那时，
+                        // recordFrames 冻结十几秒（实测 13 秒），界面看着就是
+                        // 「改完帧率录制卡死」。
+                        //
+                        // 把 t0 挪到「按新帧率算，已写帧数正好对应现在」的
+                        // 位置：帧数（= 编码器时间轴）不动，成片时长不变，
+                        // 只是节拍立刻接上。反过来升帧率时 t0 会往后挪一点，
+                        // 同样立刻接上，不会睡。
+                        const auto nowTp = std::chrono::steady_clock::now();
+                        t0 = nowTp -
+                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                 std::chrono::duration<double>(
+                                     static_cast<double>(framesWritten) / newFps));
+                        fps = newFps;
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lk(fpsMu_);
+                    fpsDone_ = wantSeq;
+                    fpsOk_ = ok;
+                }
+                fpsCv_.notify_all();
+            }
+        }
     }
 
     if (!alive) {
@@ -875,6 +941,35 @@ bool SegmentRecorder::FlushSegment(uint32_t timeoutMs) {
                                         [&] { return flushDone_ >= want; });
     if (!done) return false;
     return flushOk_;
+}
+
+bool SegmentRecorder::SetFps(uint32_t fps, uint32_t timeoutMs) {
+    if (fps == 0) fps = 60;
+    if (fps > 240) fps = 240;
+
+    // 喂帧线程没起来（Start 失败 / 已经 Stop）：只改记录值，下次 Start 会用。
+    if (!feeder_.joinable() || !encoder_ || !encoder_->Running()) {
+        fps_.store(fps, std::memory_order_relaxed);
+        return true;
+    }
+
+    // 跟当前一致就不用麻烦喂帧线程（改一次要重开 SinkWriter，约 300~400ms）。
+    if (fps == fps_.load(std::memory_order_relaxed)) return true;
+
+    uint64_t want = 0;
+    {
+        std::lock_guard<std::mutex> lk(fpsMu_);
+        fpsWantValue_ = fps;
+        want = ++fpsWant_;
+        fpsOk_ = false;
+    }
+    slotCv_.notify_all(); // 让喂帧线程从 wait 里醒过来，别等满一个节拍
+
+    std::unique_lock<std::mutex> lk(fpsMu_);
+    const bool done = fpsCv_.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                                     [&] { return fpsDone_ >= want; });
+    if (!done) return false;
+    return fpsOk_;
 }
 
 void SegmentRecorder::Stop() {    // 先收喂帧线程：它可能正卡在 WriteSample 上等编码器。

@@ -90,6 +90,21 @@ struct SessionStatus {
     uint32_t recordedSegments = 0; // 当前保留的分片数
     uint64_t recordedBytes = 0;    // 分片总字节数
     uint64_t recordedFrames = 0;
+    // 「立刻切片」完成的次数（只增不减）。
+    //
+    // 【为什么要有这个计数】界面点导出走的是插件（Electron 主进程里跑），
+    // 服务完全不知道。而导出前必须先把正在写的那一片收尾落盘，否则那一片
+    // （最多一整片 = 2 秒，含"点按钮那一刻"的画面）导不出来 —— 用户报的
+    // 「导出的视频都是点击前一秒或两秒就停止了」就是这个（m12714）。
+    //
+    // 所以界面先发 `{"cmd":"flush","id":...}` 让服务切片。**但管道是单向的**
+    // （PIPE_ACCESS_INBOUND），服务没法回话；`pipeSend` 写完就返回 ok，
+    // 导出端于是抢在 flush 完成之前扫了目录，那一片照样读不到。
+    //
+    // 这个计数就是那个"回话"：flush 真的切完一片才 +1，界面轮询到它变了
+    // 才去调 exportStart。比让主进程去猜 index.csv 路径、数行数、比 mtime
+    // 都稳（那几种在槽位复用、轮次目录切换时都会误判）。
+    uint64_t flushSeq = 0;
     // 这一路到底在用哪种方式拿画面。
     CaptureKind captureKind = CaptureKind::None;
     // 诊断：预览限流是否真的在起作用（发进环的帧数 / 被跳过拍数 / 当前上限）。
@@ -134,7 +149,30 @@ public:
     // 这份新配置和本会话正在用的那份，采集 + 编码参数是否完全一致。
     // reload 用它决定「其实什么都没改、不必重建」（见 Profiles.h 的说明）。
     bool SameSettings(const Profile& other) const { return profile_.SameSettings(other); }
+
+    // 同上，但忽略帧率 —— 帧率可以就地改（见 ApplyLiveSettings）。
+    bool SameSettingsIgnoringFps(const Profile& other) const {
+        return profile_.SameSettingsIgnoringFps(other);
+    }
     const Profile& Config() const { return profile_; }
+
+    /**
+     * 把新配置里**可以就地生效**的部分应用到正在跑的会话上（目前只有帧率）。
+     *
+     * 【为什么需要】用户把帧率从 144 改成 60 时，服务走 reload。原来 reload
+     * 判「配置变了」就整路拆掉重建：新 Session -> 新录制器 -> 新轮次目录，
+     * 于是 recordSegments 归零（导出按钮变灰）、时间轴出现空洞（被补成
+     * NO SIGNAL）、刚切过去点导出报"该路未在录制"。用户的原话（m13003）：
+     * 「降帧率的时候，会出现短暂的 no signal，和导出按钮被禁用，帧率刚切换
+     * 那会点击会出现该路未在录制」。
+     *
+     * 现在 reload 先看 Profile::SameSettingsIgnoringFps()：除了帧率以外都
+     * 一样就调这里，改完立刻生效，不换目录、不清分片、不动时间轴。
+     *
+     * 返回 true 表示真的就地应用了；false 表示这份配置不能只靠改帧率，
+     * 必须重建会话（码率、分片时长、回放窗口、采集源变了都算）。
+     */
+    bool ApplyLiveSettings(const Profile& next);
 
     // 配置显示名（导出文件名前缀、事件里给界面显示用）。
     const std::string& Name() const { return profile_.name; }
@@ -149,6 +187,20 @@ public:
      * 返回 false 表示"这一次没接"：没有录像器、上一轮还在导。
      */
     bool ExportNow(const std::string& exportDir, double maxSeconds);
+
+    /**
+     * 把正在写的那一片立刻收尾落盘（不中断录制）。
+     *
+     * 【为什么单独开一个方法】界面点导出走的是插件（bridge/shadow_ring.cc 的
+     * exportStart，在 Electron 主进程里跑），不经过服务 —— 于是 ExportNow 里
+     * 那句 FlushSegment() 从来没被执行过，用户看到的就是"导出总在点击前
+     * 一两秒就停了"（m12714）。界面现在会在调 exportStart 之前先发一条
+     * `{"cmd":"flush","id":...}` 让服务切一次片，走的就是这个方法。
+     *
+     * 返回 false 表示"没切"（没在录 / 当前片一帧都没有 / 等超时），
+     * 导出端照旧拿已完成的分片，最多还是丢那一小段。
+     */
+    bool FlushRecording();
 
     // 导出状态（给操作日志/自检用）。
     ExportStatus ExportState() const;
@@ -232,6 +284,10 @@ private:
     // 用 atomic 而不是加锁：会话线程每一拍都要读它，而改它的频率极低
     // （用户点一次设置页），没必要为它引入一把锁去打断采集节拍。
     std::atomic<uint32_t> previewFps_{0};
+
+    // 「立刻切片」的完成计数（对外暴露成 SessionStatus::flushSeq）。
+    // 命令线程在 FlushRecording() 里自增，界面轮询到变化才去启动导出。
+    std::atomic<uint64_t> flushSeq_{0};
 
     mutable std::mutex mu_;
     SessionStatus status_;

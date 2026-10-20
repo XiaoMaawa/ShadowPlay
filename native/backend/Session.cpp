@@ -147,7 +147,12 @@ std::string Session::StatusJson() const {
                  ",\"recordDetail\":\"" + JsonEscape(status_.recordDetail) + "\"" +
                  ",\"recordSegments\":" + std::to_string(status_.recordedSegments) +
                  ",\"recordBytes\":" + std::to_string(status_.recordedBytes) +
-                 ",\"recordFrames\":" + std::to_string(status_.recordedFrames);
+                 ",\"recordFrames\":" + std::to_string(status_.recordedFrames) +
+                 // 立刻切片完成计数：界面发完 flush 命令后轮询这个字段，
+                 // 变了才说明"点按钮那一刻"的分片真的落盘了，可以开始导出。
+                 // 管道是单向的，服务没法回话，这就是那条回执。
+                 ",\"flushSeq\":" +
+                 std::to_string(flushSeq_.load(std::memory_order_relaxed));
     }
 
     // 导出状态另拼：它来自 exporter_（自己带锁），而且字段里有字符串路径。
@@ -276,12 +281,56 @@ void Session::EnsureRecorder(uint32_t w, uint32_t h) {
     status_.recordDetail = ok ? "录制中" : recorder_->Stats().detail;
 }
 
+// 把新配置里可以就地生效的部分应用到正在跑的会话上。
+bool Session::ApplyLiveSettings(const Profile& next) {
+    // 只有「除了帧率以外全都一样」才允许就地改。别的字段都写死在采集器 /
+    // 录制器的构造里（码率、分片时长、回放窗口、采集源），改不了。
+    if (!profile_.SameSettingsIgnoringFps(next)) return false;
+
+    const double oldFps = profile_.video.fps;
+    const double newFps = next.video.fps;
+
+    // 除了帧率之外的元数据（名字用于导出文件名前缀，改了要跟着走）
+    profile_.name = next.name;
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        status_.targetFps = newFps > 0.0 ? newFps : kDefaultFps;
+    }
+
+    if (oldFps == newFps) return true;
+
+    profile_.video.fps = newFps;
+
+    // 录制器那边也要跟着改。它内部会让编码器收掉当前片、按新帧率开新片
+    // （见 SegmentRecorder::SetFps / MfEncoder::SetFps），**不换轮次目录、
+    // 不归零分片序号、时间轴继续顺延**。
+    //
+    // 失败也不回滚：编码器可能被硬件吞吐上限卡住，但那时它会自己降档并
+    // 把原因写进 recordDetail，比把会话拆了重建好得多。
+    if (recorder_) {
+        recorder_->SetFps(newFps > 0.0 ? static_cast<uint32_t>(newFps + 0.5) : 60u);
+    }
+    return true;
+}
+
 // 导出（需求 6）。
 //
 // 两个调用约束值得写下来：
 //   1) 只在录制器活着的时候建 Exporter —— 它的分片目录就是录制器的 SegmentsDir()。
 //   2) 导出目录和"最多导多少秒"每次导出时都重新传。界面可以随时改导出目录；
 //      而时长上限（回放时长）跟着配置走，改了配置不该影响已经在导的那一次。
+bool Session::FlushRecording() {
+    if (!recorder_) return false;
+    // 超时给 2 秒：FlushSegment 只是 Finalize 当前片（排空编码队列）+ 开新片，
+    // 正常十几到几十毫秒；2 秒是"编码器彻底卡住"时的兜底，别让主循环无限等。
+    const bool ok = recorder_->FlushSegment(2000);
+    // 只有真的切出一片才推进计数：界面拿它当"flush 已生效"的信号，
+    // 没在录 / 当前片一帧都没有 / 等超时 都不该让界面误以为可以导出了。
+    if (ok) flushSeq_.fetch_add(1, std::memory_order_relaxed);
+    return ok;
+}
+
 bool Session::ExportNow(const std::string& exportDir, double maxSeconds) {
     if (!recorder_) return false;
     const std::string segDir = recorder_->SegmentsDir();
@@ -541,12 +590,20 @@ void Session::ThreadMain() {
         // 分辨率到这里才确定，录制器得现在才能起（见 EnsureRecorder 的说明）。
         EnsureRecorder(w, h);
 
-        const double fps = profile_.video.fps > 0.0 ? profile_.video.fps : kDefaultFps;
+        // 帧率是可热改的（见 ApplyLiveSettings）：用户把 144 改成 60 时不能
+        // 拆掉这一路重建 —— 那会换轮次目录、recordSegments 归零、时间轴出现
+        // 空洞（用户报的「短暂的 no signal」「导出按钮被禁用」「该路未在录制」
+        // 就是它，m13003）。这里每一拍从 profile_ 里重新读，改完下一拍生效。
+        auto currentFps = [this]() {
+            const double f = profile_.video.fps > 0.0 ? profile_.video.fps : kDefaultFps;
+            return f > 0.0 ? f : kDefaultFps;
+        };
+        double fps = currentFps();
         // 目标帧间隔。统一用 steady_clock 的原生 duration（整数 tick），
         // 这样后面跟 time_point 相加不用反复转换。
-        const auto frameInterval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        auto frameInterval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(1.0 / fps));
-        const auto republishInterval = frameInterval;
+        auto republishInterval = frameInterval;
 
         auto lastPublish = std::chrono::steady_clock::now() - std::chrono::hours(1);
         // 上一帧**预览**（Publish 进共享环）的时刻。和 lastPublish 是两回事：
@@ -659,6 +716,27 @@ void Session::ThreadMain() {
                 }
                 std::lock_guard<std::mutex> lk(mu_);
                 status_.consumerPid = ring_.ConsumerPid();
+            }
+
+            // ---- 帧率可能被就地改过（见 ApplyLiveSettings）---------------------
+            // 每一拍重新读一次配置里的帧率。用户把 144 改成 60 时不能拆掉
+            // 这一路重建 —— 那会换轮次目录、recordSegments 归零、时间轴出现
+            // 空洞（m13003 报的「短暂的 no signal」「导出按钮被禁用」
+            // 「该路未在录制」）。改完这里立刻换节拍，录制器那边由
+            // ApplyLiveSettings 直接通知编码器。
+            {
+                const double wantFps = currentFps();
+                if (wantFps != fps) {
+                    fps = wantFps;
+                    frameInterval =
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double>(1.0 / fps));
+                    republishInterval = frameInterval;
+                    // nextPublish_ 不能按新间隔重排历史：它可能已经落在未来
+                    // 好几拍之后（从 240 降到 30 时尤其明显）。夹到"现在"，
+                    // 让节拍器从这一拍重新起步，不追赶也不停顿。
+                    if (nextPublish_ > loopStart) nextPublish_ = loopStart;
+                }
             }
 
             // ---- 到点才动手 ---------------------------------------------------

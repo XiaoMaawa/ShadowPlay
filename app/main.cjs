@@ -1491,7 +1491,7 @@ function registerIpc() {
   //
   // 导出目录/前缀从哪来：分片目录是服务分配的（不是配置里写的字段），
   // 所以从状态镜像的 recordDir 取；拿不到就退回配置的 recordRoot + 惯例目录名。
-  ipcMain.handle('service:export', (_evt, req) => {
+  ipcMain.handle('service:export', async (_evt, req) => {
     const id = String(req?.id ?? '')
     if (!id) return { ok: false, error: '没有指定要导出哪一路配置。' }
 
@@ -1533,6 +1533,59 @@ function registerIpc() {
     }
 
     try {
+      // 【第一步：让服务把正在写的那一片收尾落盘】
+      //
+      // 这一步不能省。分片是按固定片长切的，点导出的那一刻总有一片正在写：
+      // 它没 Finalize、index.csv 里也没有它，导出端只能读到最后一片**已完成**
+      // 的分片 —— 于是"点按钮之前那 1~2 秒"永远导不出来。用户报的就是这个
+      // （m12714：「请你回放导出的视频一直到点击按钮的那一刻才停止，我看现在
+      // 导出的视频都是点击前一秒或两秒就停止了」）。
+      //
+      // 【为什么必须发命令，而不是在这里直接切】导出走的是插件
+      // （addon.exportStart，在 Electron 主进程里跑），服务完全不知道有这回事，
+      // 所以 Session::ExportNow 里那句 FlushSegment() 从来没被执行过。只有
+      // 服务自己知道"这一路现在写到哪一片"，切片的动作只能它来做。
+      //
+      // 失败不影响导出：服务没起 / 这一路没在录 / 等超时，都只是"没切成"，
+      // 导出端照旧拿已完成的分片，最多还是丢那一小段（和以前一样）。
+      //
+      // 【发完必须等它真的切完，否则前面这些全白做】
+      //
+      // 命令管道是单向的（`PIPE_ACCESS_INBOUND`），服务没法回话；`pipeSend`
+      // 写完就返回 ok。第一版就是"发完直接往下走"，实测（test-export 的
+      // export_plan）里 `segs` 仍然只到 flush 之前的那一片 —— 导出端在服务
+      // 还没开始 Finalize 时就把目录扫完了，那一片照样读不到。
+      //
+      // 回执走状态文件里的 `flushSeq`（Session::FlushRecording 成功一次 +1）：
+      // 它变了才说明"点按钮那一刻"的分片真的落盘了。比让主进程去猜
+      // index.csv 路径、数行数、比 mtime 都稳 —— 那几种在槽位复用和轮次
+      // 目录切换时都会误判。
+      if (serviceChild || serviceRunningFast()) {
+        const before = readStatusFile()?.doc?.items?.find((s) => s.id === id)?.flushSeq ?? 0
+        const flushed = await pipeSend({ cmd: 'flush', id })
+        if (!flushed?.ok) {
+          logErr(`[export] 收尾分片失败（${flushed?.error ?? '未知'}），照旧导出已完成的分片。`)
+        } else {
+          // 最多等 3 秒：FlushSegment 内部超时就是 2 秒（编码器彻底卡住时），
+          // 再留 1 秒给状态文件的写盘节拍。
+          const flushDeadline = Date.now() + 3000
+          let seen = before
+          while (Date.now() < flushDeadline) {
+            const now = readStatusFile()?.doc?.items?.find((s) => s.id === id)?.flushSeq ?? 0
+            if (now !== before) {
+              seen = now
+              break
+            }
+            await new Promise((r) => setTimeout(r, 40))
+          }
+          if (seen === before) {
+            logErr('[export] 等了 3 秒也没看到 flush 完成（服务可能没在录这一路），照旧导出已完成的分片。')
+          } else {
+            log(`[export] 分片已收尾（flushSeq ${before} → ${seen}），开始导出。`)
+          }
+        }
+      }
+
       // Exporter 要的是"分片所在目录"，服务报的 recordDir 是配置目录，
       // 分片在它下面的 segments/ 里（见 SegmentRecorder.h）。
       const segmentsDir = path.join(recordDir, 'segments')

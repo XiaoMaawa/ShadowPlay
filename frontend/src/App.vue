@@ -422,6 +422,13 @@ function guiSnapshot(): Record<string, unknown> {
     liveBytes: sessions.reduce((n, x) => n + (x.recordBytes ?? 0), 0),
     selectedSegments: s?.recordSegments ?? 0,
     selectedBytes: s?.recordBytes ?? 0,
+    // 「立刻切片」的完成计数（服务端 Session::flushSeq）。
+    //
+    // 【为什么自检要盯这个】点导出前必须先让服务把正在写的那一片收尾落盘，
+    // 否则那一片（最多 2 秒，含"点按钮那一刻"的画面）导不出来 —— 用户报的
+    // 「导出的视频都是点击前一秒或两秒就停止了」（m12714）就是这个。
+    // 主进程发完 flush 命令后要等这个数变了才能启动导出，自检脚本同样要能读到它。
+    selectedFlushSeq: s?.flushSeq ?? 0,
     // 服务用的配置和界面这份是不是同一个文件。不是的话，上面那两个数属于
     // 另一个服务的录制目录，界面要显式标出来（顶栏琥珀色"（配置不同）"）。
     profilesMismatch: live.value.profilesMismatch === true,
