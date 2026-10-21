@@ -23,8 +23,10 @@ const EXPORT_DIR = path.join(PROOF, 'exports')
 const PROFILES = path.join(PROOF, 'profiles.json')
 const STATUS = path.join(tempRoot, 'status', 'status-v1.json')
 
-const REPLAY_SECONDS = 10
-const SEGMENT_SECONDS = 1
+// 可用环境变量覆盖（默认沿用 10 秒窗口 / 1 秒分片；复现用户配置时传
+// SHADOW_SEG=2 SHADOW_REPLAY=20）
+const REPLAY_SECONDS = Number(process.env.SHADOW_REPLAY ?? 10)
+const SEGMENT_SECONDS = Number(process.env.SHADOW_SEG ?? 1)
 
 if (!existsSync(backend)) {
   console.error('[test] 找不到采集服务，先 npm run build:native')

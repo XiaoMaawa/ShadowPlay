@@ -335,6 +335,22 @@ constexpr GUID kClsidDispatcherQueueController =
 DWORD WINAPI WindowCapture::Impl::PumpProc(LPVOID param) {
     auto* impl = static_cast<WindowCapture::Impl*>(param);
 
+    // 【提高这个线程的优先级】它是"窗口画面能不能按时到"的唯一通道：
+    // WGC 的 FrameArrived 只投到这条线程的 DispatcherQueue 上，泵得不及时
+    // （哪怕只被抢占几百毫秒），Session 那边这一拍就拿到 NoChange，只能
+    // 把上一帧重发给录制器 —— 成片里就是一段定格。
+    //
+    // 踩过的现象（%TEMP%\shadow-play 里 2026-10-22 那轮的 1815x1140@60 分片）：
+    // 每个 2 秒分片都有一段连续 17 帧（283ms）完全相同的画面，位置还一模
+    // 一样。同时刻编码器正在做切片轮转（Finalize + 重建 SinkWriter，实测
+    // 150~250ms 的 CPU/GPU 尖峰）—— 桌面路（DXGI 复制，不走这条线程）
+    // 同样的轮转下 1512 帧一个重复都没有，差别就在这里。
+    //
+    // 用 HIGHEST 而不是 TIME_CRITICAL：够压过普通优先级的编码/转换线程，
+    // 又不至于到"能饿死系统线程"的程度。失败也无所谓（权限/策略不允许时
+    // 返回 0），只是回到默认优先级。
+    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
     // 本线程自己初始化 COM（MTA，和 CreateDevice 那边一致）。
     // RPC_E_CHANGED_MODE 说明外面已经用别的模式初始化过，那就复用，别去 Uninit。
     const HRESULT hrCom = ::RoInitialize(RO_INIT_MULTITHREADED);

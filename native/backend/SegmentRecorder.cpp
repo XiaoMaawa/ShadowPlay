@@ -640,6 +640,7 @@ bool SegmentRecorder::Start() {
     std::lock_guard<std::mutex> lk(mu_);
     stats_.active = true;
     stats_.failed = false;
+
     // 【这里必须沿用编码器的 detail，不能无条件写「录制中」】
     // MfEncoder::StartWithFpsFallback 降过档时会在 detail 里写
     // 「录制中（硬件编码器最高接受 N 帧，已从配置的 M 帧降下来）」，
@@ -662,9 +663,13 @@ void SegmentRecorder::StartFeeder() {
     {
         std::lock_guard<std::mutex> lk(slotMu_);
         feedStop_ = false;
-        slotFull_ = false;
-        slotSeq_ = 0;
-        slotTakenSeq_ = 0;
+        // 队列深度按第一帧的尺寸现算（见 Feed），这里先清空。
+        ringDepth_ = 0;
+        ringWrite_ = 0;
+        ringRead_ = 0;
+        ringW_ = 0;
+        ringH_ = 0;
+        ring_.clear();
         slotOverwritten_.store(0, std::memory_order_relaxed);
         slotFed_.store(0, std::memory_order_relaxed);
     }
@@ -715,18 +720,40 @@ bool SegmentRecorder::Feed(const void* pixels, uint32_t stride, uint32_t width, 
 
     {
         std::lock_guard<std::mutex> lk(slotMu_);
-        // 【这一行就是"丢帧"的计量】槽里还躺着一帧没被喂帧线程取走，现在要
-        // 被这一帧覆盖掉 —— 那一帧的像素永远进不了编码器了。采集快于编码
-        // （比如 240 帧采集、165 帧编码）时它必然发生，是降帧率的固有代价，
-        // 但用户要能看见它，不能像以前那样静默发生（m15478「最好不要丢帧」）。
-        if (slotFull_ && slotSeq_ != slotTakenSeq_) {
+
+        // 尺寸变了要按新的一帧重算队列深度（窗口拖大拖小都会走到这里）。
+        if (ringDepth_ == 0 || width != ringW_ || height != ringH_ || ring_.size() != ringDepth_) {
+            const size_t frameBytes = static_cast<size_t>(rowBytes) * height;
+            size_t depth = frameBytes ? (kPendingBytes / frameBytes) : 0;
+            // 再按"时间"夹一次：至少盖住一次切片轮转（见 .h 里的说明）。
+            const double f = static_cast<double>(fps_.load(std::memory_order_relaxed));
+            const size_t byTime = static_cast<size_t>((f > 0.0 ? f : 60.0) * kPendingSeconds + 0.5);
+            if (byTime < depth) depth = byTime;
+            if (depth < 4) depth = 4;      // 至少要能盖住"一两帧"的抖动
+            if (depth > 40) depth = 40;    // 再深就是白吃内存（滞后也变明显）
+            ringDepth_ = static_cast<uint32_t>(depth);
+            ring_.clear();
+            ring_.resize(ringDepth_);
+            // 尺寸换代的瞬间队列里的旧帧尺寸已经对不上，直接作废。
+            ringWrite_ = 0;
+            ringRead_ = 0;
+            ringW_ = width;
+            ringH_ = height;
+        }
+
+        // 队列满了：顶掉最旧的一帧。这才是真丢内容，要计量。
+        if (ringWrite_ - ringRead_ >= ringDepth_) {
+            ++ringRead_;
             slotOverwritten_.fetch_add(1, std::memory_order_relaxed);
         }
-        slot_.swap(writeBuf_);
-        slotW_ = width;
-        slotH_ = height;
-        slotFull_ = true;
-        ++slotSeq_;
+
+        // O(1) 交换：把刚拷好的缓冲换进队尾那格，那格的旧缓冲回到 writeBuf_
+        // （下次 resize/写会被覆盖）。锁只护住这个 swap。
+        PendingFrame& p = ring_[static_cast<size_t>(ringWrite_ % ringDepth_)];
+        p.buf.swap(writeBuf_);
+        p.w = width;
+        p.h = height;
+        ++ringWrite_;
         slotFed_.fetch_add(1, std::memory_order_relaxed);
     }
     slotCv_.notify_one();
@@ -744,7 +771,6 @@ void SegmentRecorder::FeederLoop() {
 
     // 本地复用的帧缓冲：取出槽里的帧之后立刻放开槽锁，编码时不再占着它。
     std::vector<uint8_t> frame;
-    uint64_t lastSeq = 0;
     // 槽里那一帧的尺寸（会随窗口缩放变化，见 Feed 的注释）。
     uint32_t frameW = width_;
     uint32_t frameH = height_;
@@ -793,24 +819,57 @@ void SegmentRecorder::FeederLoop() {
         return true;
     };
 
+    // ---- 取帧的三个助手（都在 slotMu_ 里挪指针，O(1)）------------------
+    //
+    // 队列是"采集线程写、喂帧线程读"的单生产者单消费者环。取帧只挪读指针，
+    // 缓冲用 swap 换成自己的，不做 memcpy。
+    auto queued = [&]() {
+        std::lock_guard<std::mutex> lk(slotMu_);
+        return ringWrite_ - ringRead_;
+    };
+    // 取最旧的一帧（落后补帧时用：按顺序补上，画面才连续）。
+    auto popFront = [&]() -> bool {
+        std::lock_guard<std::mutex> lk(slotMu_);
+        if (ringRead_ >= ringWrite_ || ringDepth_ == 0) return false;
+        PendingFrame& p = ring_[static_cast<size_t>(ringRead_ % ringDepth_)];
+        frame.swap(p.buf);
+        frameW = p.w;
+        frameH = p.h;
+        ++ringRead_;
+        return true;
+    };
+    // 取最新的一帧（正常节奏用）：中间那些跳过，计进 captureDropped。
+    auto popNewest = [&]() -> bool {
+        std::lock_guard<std::mutex> lk(slotMu_);
+        if (ringRead_ >= ringWrite_ || ringDepth_ == 0) return false;
+        const uint64_t skip = (ringWrite_ - ringRead_) - 1;
+        if (skip > 0) {
+            ringRead_ += skip;
+            slotOverwritten_.fetch_add(skip, std::memory_order_relaxed);
+        }
+        PendingFrame& p = ring_[static_cast<size_t>(ringRead_ % ringDepth_)];
+        frame.swap(p.buf);
+        frameW = p.w;
+        frameH = p.h;
+        ++ringRead_;
+        return true;
+    };
+
     bool alive = true;
     while (alive) {
         // 还没采到第一帧：帧数是 0 时没有任何东西可写，等第一帧到了再开始
         // 计时。否则 t0 会在"空转"期间把欠账攒成天文数字。
-        if (frame.empty()) {
+        if (frame.empty() && queued() == 0) {
             std::unique_lock<std::mutex> lk(slotMu_);
             if (feedStop_) break;
-            slotCv_.wait(lk, [this] { return feedStop_ || slotFull_; });
+            slotCv_.wait(lk, [this] { return feedStop_ || ringRead_ < ringWrite_; });
             if (feedStop_) break;
-            if (slotFull_ && slotSeq_ != lastSeq) {
-                frame.swap(slot_);
-                lastSeq = slotSeq_;
-                slotFull_ = false;
-                // 记下"取到哪一帧了"，Feed() 靠它区分「覆盖了还没人要的帧」
-                // （真的丢了内容）和「槽本来就是空的」。
-                slotTakenSeq_ = slotSeq_;
-                frameW = slotW_;
-                frameH = slotH_;
+            if (frame.empty() && ringRead_ < ringWrite_ && ringDepth_ > 0) {
+                PendingFrame& p = ring_[static_cast<size_t>(ringRead_ % ringDepth_)];
+                frame.swap(p.buf);
+                frameW = p.w;
+                frameH = p.h;
+                ++ringRead_;
                 if (frameW > 0 && frameH > 0) {
                     width_ = frameW;
                     height_ = frameH;
@@ -856,34 +915,43 @@ void SegmentRecorder::FeederLoop() {
         const uint64_t need = due > framesWritten ? (due - framesWritten) : 0;
         if (need == 0) continue; // 还没到点，槽里的帧留着下一步用
 
-        // ---- 取槽里的最新帧 ----------------------------------------------
+        // ---- 取这一拍要用的真实帧 -----------------------------------------
+        //
+        // 【两种取法，取决于落后多少】
+        //   need <= 1：正常节奏 —— 只取**最新**那一帧，队列里更早的跳过（算丢帧）。
+        //              画面必须跟得上实时，攒着的旧帧没有价值。
+        //   need > 1 ：被堵过（切片轮转 150~250ms、编码器抖动）—— 队列里躺的
+        //              正是这段时间真实发生过的画面，按顺序取出来写，画面就是
+        //              连续的。这就是"每两秒顿一下"的解法：补真画面，不是补重复。
         bool haveNew = false;
+        uint64_t takeReal = 0;
         {
-            std::unique_lock<std::mutex> lk(slotMu_);
-            if (feedStop_) break;
-            // 【节拍到了但槽里还是旧帧时，给它半帧时间】见下面那段注释：
-            // 采集和编码同速却异相时，一半节拍会白白补重复帧。这里最多等
-            // 半个帧周期（165fps 是 3.0ms），拿到就写真实画面，拿不到才补重复。
-            //
-            // wait_for 等待期间会释放 slotMu_，所以采集线程能照常写槽并
-            // notify_one 把我们叫醒 —— 不会互相卡死。
-            if (slotSeq_ == lastSeq) {
-                const auto budget =
-                    std::chrono::microseconds(static_cast<long long>(500000.0 / fps));
-                slotCv_.wait_for(lk, budget, [this, lastSeq] {
-                    return feedStop_ || slotSeq_ != lastSeq;
-                });
+            // 【节拍到了但队列还没新帧时，给它半帧时间】采集和编码同速却异相时，
+            // 一半节拍会白白补重复帧。最多等半个帧周期（165fps 是 3.0ms）。
+            // wait_for 期间会释放 slotMu_，采集线程照常入队并叫醒我们。
+            {
+                std::unique_lock<std::mutex> lk(slotMu_);
                 if (feedStop_) break;
+                if (ringRead_ == ringWrite_) {
+                    const auto budget =
+                        std::chrono::microseconds(static_cast<long long>(500000.0 / fps));
+                    const uint64_t want = ringWrite_;
+                    slotCv_.wait_for(lk, budget,
+                                     [this, want] { return feedStop_ || ringWrite_ != want; });
+                    if (feedStop_) break;
+                }
             }
-            if (slotFull_ && slotSeq_ != lastSeq) {
-                frame.swap(slot_); // 交换而不是拷贝：连一次 memcpy 都省掉
-                lastSeq = slotSeq_;
-                slotFull_ = false;
-                slotTakenSeq_ = slotSeq_; // 见 Feed() 里那个丢帧计数
-                haveNew = true;
-                // 尺寸跟着帧走：槽里这一帧有多大，这拍就按多大编码。
-                frameW = slotW_;
-                frameH = slotH_;
+
+            if (need <= 1) {
+                haveNew = popNewest();
+                takeReal = haveNew ? 1 : 0;
+            } else {
+                const uint64_t avail = queued();
+                if (avail > 0) {
+                    takeReal = avail < need ? avail : need;
+                    haveNew = popFront(); // 第一张先取出来（循环里 i>0 再取）
+                    if (!haveNew) takeReal = 0;
+                }
             }
         }
         // 换尺寸时把本地缓冲整理成紧凑排布（swap 之后行距就是新尺寸的）。
@@ -897,9 +965,9 @@ void SegmentRecorder::FeederLoop() {
         //
         // 这一步同时覆盖两种情况：
         //   * 正常节奏：due 比已写的多 1，就是正常写一帧；
-        //   * 落后了：due 比已写的多 k 张，连续写 k 张（内容是同一帧），
-        //     把欠账一次补齐，时间轴立刻回到真实时间。
-
+        //   * 落后了：due 比已写的多 k 张，把队列里这段时间的真实画面**按顺序**
+        //     写 k 张（不够的才补重复），时间轴回到真实时间，画面还是连续的。
+        //
         // ---- 为什么这里**绝对不能**给补帧设上限 ----------------------------
         //
         // 原来这里是 `if (due > framesWritten + 240) { 重起基准 }`：机器被彻底
@@ -907,28 +975,29 @@ void SegmentRecorder::FeederLoop() {
         // 后果就是主人看到的那种情况 —— 画面卡但时间轴被压短，回放成了快进。
         // 帧率越高、机器越忙，这种缺口越多，240fps 尤其明显。
         //
-        // 现在的取舍（用户明确要求）：**允许卡，不允许变速**。落后多少就补多少
-        // 重复帧。补帧现在**不再拷贝像素**（EncodeRepeat 让编码器复用样本缓冲），
-        // 一帧只花 WriteSample 的代价，所以补得动 —— 这是让"允许卡"真正成立的
-        // 前提。以前补帧也走全量 ConvertToNv12 + memcpy（1440p 要 8~9ms，而
-        // 165fps 预算只有 6.06ms），欠账越补越滚，实测写进去的真实更新率只剩
-        // 0.9%，主人看到的就是"切片卡成 PPT、好几秒才动一帧"。
+        // 现在的取舍（用户明确要求）：**允许卡，不允许变速**。落后多少就补多少。
         //
-        // 唯一的例外是"从没采到过任何帧"（frame 为空），那种情况下面补不了，
-        // 只能等，等到了重新计时。
-        //
-        // 【第一帧写真实画面，其余补重复】第一帧必须是槽里刚取到的新画面
-        // （否则采到的新内容永远进不了编码器），多出来的欠账才是重复帧。
-        // 这一拍没取到新帧（haveNew 为假）时，连第一帧也只能补重复 ——
-        // 手里 `frame` 里那份内容是上一拍已经写过的，再全量转一遍纯属浪费。
-        //
-        // `need` 在上面「先算该写多少帧」那一步已经算好了（那时还没取槽），
-        // 这里直接用它，别再算一遍 —— 中间隔了取槽和尺寸判断，重算会得到
-        // 略微不同的值，且会与上面的定义冲突。
+        // 【2026-10-21 改：补的是真画面，不是重复帧】以前这里只写"一张新画面 +
+        // N 张重复"，于是切片轮转堵 200ms 就定格 200ms —— 用户原话是
+        // 「两秒顿一次」。现在队列里存着堵住期间采到的真实帧，按顺序补进去。
+        // 只有队列空了（刚开录 / 采集端自己卡住）才退回补重复。
         uint64_t wroteReal = 0;
         uint64_t wroteRepeat = 0;
         for (uint64_t i = 0; i < need; ++i) {
-            const bool isReal = (i == 0 && haveNew);
+            bool isReal = false;
+            if (i < takeReal) {
+                if (i == 0) {
+                    isReal = haveNew;
+                } else {
+                    isReal = popFront(); // 换进 frame；失败就退回补重复
+                }
+            }
+            // 补帧之间的尺寸可能变（拖窗口），跟着这一帧改。
+            if (isReal && frameW > 0 && frameH > 0 &&
+                (frameW != width_ || frameH != height_)) {
+                width_ = frameW;
+                height_ = frameH;
+            }
             const bool ok = isReal ? writeOnce(frame) : writeRepeat();
             if (!ok) {
                 alive = false;
@@ -940,9 +1009,8 @@ void SegmentRecorder::FeederLoop() {
                 ++wroteRepeat;
             }
         }
-        // wroteRepeat 现在只用来标记"这一拍补了几帧重复"；重复帧总数仍由
-        // writeRepeat() 自己累加进 stats_.repeatFrames（见下面那个函数），
-        // 界面和服务状态照旧看得到。
+        // wroteRepeat 只用来标记"这一拍补了几帧重复"；重复帧总数由
+        // writeRepeat() 自己累加进 stats_.repeatFrames（见下面那个函数）。
 
         // ---- 吞吐看门狗：已删除 --------------------------------------------
         //
