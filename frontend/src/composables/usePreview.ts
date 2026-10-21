@@ -34,6 +34,13 @@ interface ShadowPreviewApi {
   stats(): Record<string, unknown> | null
   onEvent(cb: (payload: Record<string, unknown>) => void): () => void
   retry(): boolean
+  /**
+   * 把预览面板的设备像素尺寸报给采集服务（可缺省：老版 preload 没有它）。
+   *
+   * 服务据此决定预览发原分辨率还是砍半 —— 面板大就发全尺寸保证清晰，
+   * 面板小就砍半省带宽。见 Session::SetPreviewTarget。
+   */
+  setPreviewSize?(w: number, h: number): Promise<unknown>
   serviceInfo(): Promise<Record<string, unknown>>
   listWindows?(): Promise<{ ok: boolean; items: unknown[]; error?: string }>
   saveProfiles?(doc: unknown): Promise<{ ok: boolean; path?: string; error?: string; restarted?: boolean }>
@@ -395,6 +402,47 @@ export function usePreview() {
   }
 
   /**
+   * 把预览面板的真实设备像素尺寸报给采集服务。
+   *
+   * 【为什么要有这一步】服务端原来用一条固定阈值决定预览要不要降采样
+   * （宽 > 1600 就砍半），它并不知道面板到底多大：2560 的桌面被砍成 1280，
+   * 界面再把它铺到 1400+ 设备像素宽的面板上 —— 先丢一半细节再放大，文字边缘
+   * 全糊。现在把面板尺寸告诉服务，它就能只在"面板用不上这么多像素"时才降：
+   * 面板大 → 发全尺寸（1:1，最清楚）；面板小 → 砍半（带宽只花在看得见的像素上）。
+   *
+   * 防抖 250ms + 尺寸没变就不发：拖动窗口时服务每一拍都在发布，别让改尺寸
+   * 这件事本身变成噪声。dpr 上限取 2 与 renderer 里建 canvas 的口径一致，
+   * 否则这里报的尺寸会比实际画布大，服务就会白发一份用不上的像素。
+   */
+  let sizeTimer: ReturnType<typeof setTimeout> | null = null
+  let reportedSize = ''
+  let sizeObserver: ResizeObserver | null = null
+
+  function reportPreviewSize(): void {
+    const el = canvas.value
+    if (!el) return
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    const w = Math.max(1, Math.round((el.clientWidth || 0) * dpr))
+    const h = Math.max(1, Math.round((el.clientHeight || 0) * dpr))
+    // 面板还没布局（0 宽）时报上去只会让服务误判成"面板很小"，宁可先不报。
+    if (w < 2 || h < 2) return
+    const key = `${w}x${h}`
+    if (key === reportedSize) return
+    reportedSize = key
+    void api?.setPreviewSize?.(w, h)?.catch?.(() => {
+      /* 老版主进程没有这个通道，忽略即可：服务会退回旧的阈值行为 */
+    })
+  }
+
+  function scheduleReportPreviewSize(): void {
+    if (sizeTimer) clearTimeout(sizeTimer)
+    sizeTimer = setTimeout(() => {
+      sizeTimer = null
+      reportPreviewSize()
+    }, 250)
+  }
+
+  /**
    * 帧环的看门狗：预览没有 `view` 时，每 400ms 试着重挂一次。
    *
    * 事件（session-ready）已经能在"环刚建好"那一刻立刻接上，但事件可能早于
@@ -650,6 +698,10 @@ export function usePreview() {
         // 没有它的话就是用户报的那个 bug：NO SIGNAL → 改匹配方式 → 保存 →
         // 服务已经在出帧了，预览却一直黑着，非得切到别的分路再切回来。
         const id = String(payload.session ?? '')
+        // 服务刚（重新）建好这一路的环 —— 它多半是新起的进程，预览尺寸还不
+        // 知道。把缓存清掉再报一次，否则服务会一直按"没报过"的旧阈值砍半。
+        reportedSize = ''
+        scheduleReportPreviewSize()
         if (!activeSessionId || id === activeSessionId) void reconnectActive()
         break
       }
@@ -706,6 +758,15 @@ export function usePreview() {
     // 帧环看门狗：没有 view 时定时重挂（窗口源后来才匹上、配置改完重建会话…）
     startAttachWatch()
 
+    // 把面板尺寸报给服务（决定预览发原尺寸还是砍半）。
+    // 用 ResizeObserver 而不是只听 window.resize：侧栏折叠、配置列表增减都会
+    // 改变画布尺寸但不触发窗口 resize，那种情况一样要重新报。
+    if (canvas.value && typeof ResizeObserver !== 'undefined' && !sizeObserver) {
+      sizeObserver = new ResizeObserver(() => scheduleReportPreviewSize())
+      sizeObserver.observe(canvas.value)
+    }
+    scheduleReportPreviewSize()
+
     if (await connect()) return
 
     // 没连上：可能是采集服务还没起来。挂个定时器等它。
@@ -730,6 +791,12 @@ export function usePreview() {
     rafId = 0
     stopRetryTimer()
     stopAttachWatch()
+    sizeObserver?.disconnect()
+    sizeObserver = null
+    if (sizeTimer) {
+      clearTimeout(sizeTimer)
+      sizeTimer = null
+    }
     unlisten?.()
     unlisten = null
     view = null

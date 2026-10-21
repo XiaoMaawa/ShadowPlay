@@ -561,6 +561,20 @@ const api = {
     return overallState() === 'ready'
   },
 
+  /**
+   * 把预览面板的设备像素尺寸报给采集服务。
+   *
+   * 服务用它在"发原分辨率"和"砍半"之间决定（见 Session::SetPreviewTarget）：
+   * 面板大就发全尺寸保证 1:1 清晰，面板小就砍半把上传量降到 1/4。
+   * 不阻塞渲染循环：命令走命名管道，主进程异步发，这里不等结果。
+   */
+  setPreviewSize(w, h) {
+    const width = Math.round(Number(w) || 0)
+    const height = Math.round(Number(h) || 0)
+    if (width < 2 || height < 2) return Promise.resolve({ ok: false, error: '尺寸无效' })
+    return ipcRenderer.invoke('preview:size', { w: width, h: height })
+  },
+
   serviceInfo() {
     return ipcRenderer.invoke('service:info')
   },

@@ -599,6 +599,24 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                     std::to_string(previewFps.load(std::memory_order_relaxed)) + "}");
             return;
         }
+        if (line.find("\"set-preview-size\"") != std::string::npos) {
+            // 界面把预览面板的设备像素尺寸报上来：{"cmd":"set-preview-size","w":2400,"h":1350}
+            //
+            // 服务用它决定预览要不要降采样（见 Session::SetPreviewTarget）。
+            // 这条命令必须和 set-preview-fps 一样"立刻套到所有会话上"：改了窗口
+            // 大小之后下一拍就该按新尺寸发，否则要等一次重新连接才生效。
+            const double w = FindJsonNumber(line, "w", 0.0);
+            const double h = FindJsonNumber(line, "h", 0.0);
+            const uint32_t tw = w > 0.0 ? static_cast<uint32_t>(w + 0.5) : 0u;
+            const uint32_t th = h > 0.0 ? static_cast<uint32_t>(h + 0.5) : 0u;
+            {
+                std::lock_guard<std::mutex> lk(sessionsMutex);
+                for (auto& s : sessions) s->SetPreviewTarget(tw, th);
+            }
+            LogLine("{\"type\":\"preview_size_set\",\"w\":" + std::to_string(tw) +
+                    ",\"h\":" + std::to_string(th) + "}");
+            return;
+        }
         if (line.find("\"reload\"") != std::string::npos) {
             const std::string id = FindJsonString(line, "id");
             if (!id.empty()) {

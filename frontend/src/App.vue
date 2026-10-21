@@ -110,20 +110,6 @@
           </div>
           <p v-if="restartNotice" class="hint">{{ restartNotice }}</p>
 
-          <!-- 停止服务：连同守护一起退出（写停机哨兵，守护不再拉起服务）。
-               等价于托盘图标右键菜单里的「退出」。 -->
-          <div class="row danger-row">
-            <span class="row-label">
-              停止采集服务
-              <em class="row-hint">服务与守护进程一起退出，录制会停止（也可从托盘图标退出）</em>
-            </span>
-            <span class="row-ctl">
-              <button class="sheet-btn danger" :disabled="stopping" @click="stopService">
-                {{ stopping ? '停止中…' : '停止服务' }}
-              </button>
-            </span>
-          </div>
-          <p v-if="stopNotice" class="hint">{{ stopNotice }}</p>
         </div>
 
         <div class="sheet-foot">
@@ -961,35 +947,6 @@ async function restartService() {
     restartNotice.value = `重启出错：${(err as Error).message}`
   } finally {
     restarting.value = false
-  }
-}
-
-// ---- 停止整套（服务 + 守护）------------------------------------------------
-//
-// 等价于托盘图标右键菜单里的「退出」：写停机哨兵让守护不再拉起服务，再把两个
-// 进程都结束掉。设置页放这个按钮，是给「托盘够不到」时的双保险。
-const stopping = ref(false)
-const stopNotice = ref('')
-
-async function stopService() {
-  if (stopping.value) return
-  stopping.value = true
-  stopNotice.value = ''
-  try {
-    const res = (await (
-      api() as { stopService?: () => Promise<{ ok: boolean; everKilled?: boolean; stillRunning?: boolean }> }
-    )?.stopService?.()) ?? null
-    if (!res) {
-      stopNotice.value = '这台界面不支持停止服务（主进程没有这个接口）。'
-      return
-    }
-    stopNotice.value = res.ok
-      ? '已停止采集服务（含守护进程）。'
-      : '停止失败：仍有采集服务在运行，可稍后重试，或从托盘图标退出。'
-  } catch (err) {
-    stopNotice.value = `停止出错：${(err as Error).message}`
-  } finally {
-    stopping.value = false
   }
 }
 

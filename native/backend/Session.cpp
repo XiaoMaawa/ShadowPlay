@@ -294,6 +294,47 @@ uint32_t Session::RingCapHeight(uint32_t h) {
     return (base + 1u) & ~1u;
 }
 
+// 预览这一帧要不要砍半。
+//
+// 【判据的来历】原来是"源宽 > 1600 就砍半"，那是个猜的阈值：服务不知道
+// 预览面板多大，只能假设"面板顶多 1600 宽"。实际上一块 2560×1440 的桌面被
+// 砍成 1280×720 之后，界面把它铺到 1400~2400 设备像素宽的面板上，等于先丢一半
+// 细节再放大 —— 文字边缘全是糊的，用户一眼就能看出来。
+//
+// 现在界面会把自己的 canvas 设备像素尺寸报上来，判据变成"源是不是明显比面板大"：
+//   * 源宽 <= 面板宽 × 1.15  -> 发原分辨率（1:1，最清楚，且没有一像素是白花的）
+//   * 源宽 >  面板宽 × 1.15  -> 砍半（面板用不上那么多像素，省一半带宽）
+// 1.15 的余量是为了避免"面板 1250 / 源 1280"这种边界上为了 30 个像素发全尺寸，
+// 也避免面板一拖动就在 1:1 和 1:2 之间来回抖。
+//
+// 界面还没报过尺寸（老版本界面 / 刚启动）时退回旧阈值，行为与以前一致。
+bool Session::PreviewNeedsHalf(uint32_t srcW, uint32_t srcH) const {
+    if (srcW < 2 || srcH < 2) return false;
+    const uint32_t targetW = previewTargetW_.load(std::memory_order_relaxed);
+    if (targetW == 0) return srcW > kPreviewDownscaleAboveWidth;
+    // 面板宽度的 115% 作为"够用"的上界。
+    const uint32_t enough = targetW + targetW / 8u + targetW / 16u;
+    return srcW > enough;
+}
+
+// 全分辨率预览的帧率硬上限。
+//
+// 【为什么必须收这一道】发原图时每帧的像素是砍半时的 4 倍：1440p 在 60fps 下
+// 就是 880MB/s 的上传，120fps 是 1.77GB/s。而 9.9 那节实测过：预览帧率超过
+// 60 之后 GPU 占用饱和、肉眼也看不出区别（采集端天花板约 140fps，显示器多数
+// 只有 60Hz）。所以"高质量"这条路只配 60 的帧率预算 —— 再往上纯属白烧。
+//
+// 砍半的那条路照旧听用户的：像素少了 4 倍，就算 120fps 也只要 440MB/s，
+// 想要更跟手（高刷屏）完全给得起。
+constexpr uint32_t kFullResPreviewMaxFps = 60;
+
+uint32_t Session::EffectivePreviewFps(uint32_t srcW, uint32_t srcH) const {
+    const uint32_t want = previewFps_.load(std::memory_order_relaxed);
+    if (PreviewNeedsHalf(srcW, srcH)) return want; // 已经砍半：完全听用户的
+    // 0（不限）在全分辨率下同样收到 60：那是调试开关，不该把带宽打满。
+    return (want == 0 || want > kFullResPreviewMaxFps) ? kFullResPreviewMaxFps : want;
+}
+
 void Session::EnsureRecorder(uint32_t w, uint32_t h) {
     if (recordRoot_.empty() || w == 0 || h == 0) return;
 
@@ -1157,7 +1198,8 @@ void Session::ThreadMain() {
                     // 录制完全不受影响 —— 它走下面的 frameAction，每拍都喂。
                     //
                     // previewFps = 0 表示不限，退回"每拍都发"的老行为。
-                    const uint32_t pvFps = previewFps_.load(std::memory_order_relaxed);
+                    // （发原分辨率时这里会被再收到 60，见 EffectivePreviewFps）
+                    const uint32_t pvFps = EffectivePreviewFps(pubW, pubH);
                     bool allowPublish = true;
                     if (pvFps > 0) {
                         // 判据留 20% 容差，别按"必须够满一个间隔"卡。
@@ -1180,13 +1222,13 @@ void Session::ThreadMain() {
                         }
                     }
                     if (allowPublish) {
-                        // 宽超标的先降一半再进环：界面上传量降到 1/4
-                        // （见上面 kPreviewDownscaleAboveWidth 的说明）。
+                        // 只在"面板用不上这么多像素"时才降一半（判据见
+                        // PreviewNeedsHalf）。降了以后上传量降到 1/4。
                         uint32_t outW = pubW;
                         uint32_t outH = pubH;
                         const uint8_t* outSrc = src;
                         uint32_t outStride = snapStride;
-                        if (pubW > kPreviewDownscaleAboveWidth && pubW >= 2 && pubH >= 2) {
+                        if (PreviewNeedsHalf(pubW, pubH)) {
                             outW = pubW / 2;
                             outH = pubH / 2;
                             previewBuf.resize(static_cast<size_t>(outW) * outH * 4u);
@@ -1364,7 +1406,7 @@ void Session::ThreadMain() {
                 // 帧率重发（120fps 的采集就是 120 次/秒），把上限整个绕过。
                 // 实测设置页填 60，界面画出 83fps，而服务端诊断显示
                 // "预览 Publish 39/s" —— 差的那些正是从这里出去的。
-                const uint32_t rvFps = previewFps_.load(std::memory_order_relaxed);
+                const uint32_t rvFps = EffectivePreviewFps(snapW_, snapH_);
                 bool allowRepublish = true;
                 if (rvFps > 0) {
                     // 重发的间隔取「预览上限间隔」和「采集帧间隔」里**更慢**的那个。
@@ -1395,7 +1437,7 @@ void Session::ThreadMain() {
                     uint32_t rpH = snapH_;
                     const uint8_t* rpSrc = src;
                     uint32_t rpStride = snapStride;
-                    if (snapW_ > kPreviewDownscaleAboveWidth && snapW_ >= 2 && snapH_ >= 2) {
+                    if (PreviewNeedsHalf(snapW_, snapH_)) {
                         rpW = snapW_ / 2;
                         rpH = snapH_ / 2;
                         previewBuf.resize(static_cast<size_t>(rpW) * rpH * 4u);

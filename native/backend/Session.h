@@ -259,6 +259,27 @@ public:
     void SetPreviewFps(uint32_t fps) { previewFps_.store(fps, std::memory_order_relaxed); }
     uint32_t PreviewFps() const { return previewFps_.load(std::memory_order_relaxed); }
 
+    /**
+     * 告诉服务"预览面板实际有多少设备像素"。
+     *
+     * 【为什么需要这个】预览画质由"发布的像素数"决定，而发布的像素数应该由
+     * 面板的真实大小决定，不该由一条固定阈值决定：
+     *   * 面板只有 900 设备像素宽时，发 2560 是白烧 8 倍带宽（还看不出区别）；
+     *   * 面板有 2400 设备像素宽时，发 1280 是糊 1.9 倍（用户能一眼看出来）。
+     * 以前用固定阈值（宽 > 1600 就砍半），于是"面板多大"这个唯一重要的信息
+     * 被服务猜掉了：2560 的桌面砍成 1280，再被合成器放大回 1500+ —— 又糊又白费。
+     *
+     * 现在界面把自己 canvas 的设备像素尺寸报上来，服务据此决定 1:1 还是 1:2：
+     * 只在"源明显大于面板"时才降，够用就发原分辨率。这样上传带宽只花在
+     * 面板真的用得上的像素上 —— 高画质和低占用不再互相排斥。
+     *
+     * 传 0 表示"还没报过"，服务退回旧的固定阈值行为。
+     */
+    void SetPreviewTarget(uint32_t w, uint32_t h) {
+        previewTargetW_.store(w, std::memory_order_relaxed);
+        previewTargetH_.store(h, std::memory_order_relaxed);
+    }
+
 private:
     void ThreadMain();
     // 解析采集源，成功则填好 capture_ / windowCapture_，返回是否可用。
@@ -270,6 +291,10 @@ private:
     // 到上限还可以再重建一次（见 Session.cpp 里的换环逻辑）。
     static uint32_t RingCapWidth(uint32_t w);
     static uint32_t RingCapHeight(uint32_t h);
+    // 预览这一帧要不要砍半（见 SetPreviewTarget 的说明）。
+    bool PreviewNeedsHalf(uint32_t srcW, uint32_t srcH) const;
+    // 这一路实际生效的预览帧率上限（在用户设置的基础上按分辨率再收一道）。
+    uint32_t EffectivePreviewFps(uint32_t srcW, uint32_t srcH) const;
     // 把状态里的录制信息刷新一遍（每秒调一次，扫目录有开销）。
     void RefreshRecordStatus();
 
@@ -322,6 +347,10 @@ private:
     // 用 atomic 而不是加锁：会话线程每一拍都要读它，而改它的频率极低
     // （用户点一次设置页），没必要为它引入一把锁去打断采集节拍。
     std::atomic<uint32_t> previewFps_{0};
+
+    // 预览面板的设备像素尺寸（见 SetPreviewTarget）。0 = 界面还没报过。
+    std::atomic<uint32_t> previewTargetW_{0};
+    std::atomic<uint32_t> previewTargetH_{0};
 
     // 「立刻切片」的完成计数（对外暴露成 SessionStatus::flushSeq）。
     // 命令线程在 FlushRecording() 里自增，界面轮询到变化才去启动导出。

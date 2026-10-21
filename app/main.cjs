@@ -2257,6 +2257,25 @@ function registerIpc() {
     const res = await sendServiceCommand({ cmd: 'list_sessions' })
     return { ...res, owned: !!serviceChild }
   })
+
+  // -------------------------------------------------------------------------
+  // 预览面板尺寸 → 服务
+  //
+  // 服务用这个数字决定预览发原分辨率还是砍半（Session::SetPreviewTarget）。
+  // 面板大就发全尺寸（1:1 最清楚），面板小就砍半（上传量降到 1/4）——
+  // 这样"清晰"和"省 GPU"不再是对立的，省下来的都是面板看不见的像素。
+  //
+  // 失败一律静默：服务可能还没起来（管道没建好），这时候服务会退回旧阈值，
+  // 预览照常出画面，用户不该看到任何报错。
+  // -------------------------------------------------------------------------
+  ipcMain.handle('preview:size', async (_evt, payload) => {
+    const w = Math.round(Number(payload?.w) || 0)
+    const h = Math.round(Number(payload?.h) || 0)
+    if (w < 2 || h < 2) return { ok: false, error: '尺寸无效' }
+    const res = await pipeSend({ cmd: 'set-preview-size', w, h })
+    if (!res.ok) log('[preview] 上报面板尺寸失败（服务可能还没起来）：', res.error)
+    return res
+  })
 }
 
 // ---------------------------------------------------------------------------
