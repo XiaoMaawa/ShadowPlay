@@ -305,10 +305,11 @@ private:
     // 到上限还可以再重建一次（见 Session.cpp 里的换环逻辑）。
     static uint32_t RingCapWidth(uint32_t w);
     static uint32_t RingCapHeight(uint32_t h);
-    // 预览这一帧要不要砍半（见 SetPreviewTarget 的说明）。
-    bool PreviewNeedsHalf(uint32_t srcW, uint32_t srcH) const;
+    // 预览这一帧要不要砍半（见 SetPreviewTarget 的说明）。带迟滞，会更新
+    // lastHalfDecision_/halfDecisionValid_，所以不是 const。
+    bool PreviewNeedsHalf(uint32_t srcW, uint32_t srcH);
     // 这一路实际生效的预览帧率上限（在用户设置的基础上按分辨率再收一道）。
-    uint32_t EffectivePreviewFps(uint32_t srcW, uint32_t srcH) const;
+    uint32_t EffectivePreviewFps(uint32_t srcW, uint32_t srcH);
     // 把状态里的录制信息刷新一遍（每秒调一次，扫目录有开销）。
     void RefreshRecordStatus();
 
@@ -365,6 +366,17 @@ private:
     // 预览面板的设备像素尺寸（见 SetPreviewTarget）。0 = 界面还没报过。
     std::atomic<uint32_t> previewTargetW_{0};
     std::atomic<uint32_t> previewTargetH_{0};
+
+    // 上一次的砍半决策（迟滞状态，见 PreviewNeedsHalf）。
+    //
+    // 【为什么需要】砍半与否由"面板宽度 vs 源宽"决定，面板宽度在临界点附近
+    // 抖动时（滚动条出现/消失、dpr 取整、ResizeObserver 偶发触发）会让决策
+    // 一拍拍地翻转。而 EffectivePreviewFps 又把"是否砍半"和"帧率是否收到 60"
+    // 绑在一起 —— 决策翻转一次，预览帧率就在 60↔120 之间跳一次，用户看到
+    // 的是"设置 120fps 却随机掉到 58"。这个 bool 记住上次结论，用两个不同
+    // 的阈值进出，把边界抖动吸收掉。只在采集线程里读写，不用 atomic。
+    bool lastHalfDecision_ = false;
+    bool halfDecisionValid_ = false;
 
     // 「立刻切片」的完成计数（对外暴露成 SessionStatus::flushSeq）。
     // 命令线程在 FlushRecording() 里自增，界面轮询到变化才去启动导出。

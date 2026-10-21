@@ -127,49 +127,57 @@
       <aside class="side">
         <div class="side-head">
           <span>配置</span>
-          <button class="mini" :disabled="saving" @click="addProfile">＋ 新建</button>
+          <!-- 编辑在左、新建在右。两个动作挨着，把"会多出一路"的新建
+               放远一点，手滑点到的不会是它 -->
+          <span class="head-btns">
+            <button class="mini" :disabled="!selectedProfile || saving" @click="startEdit()">
+              {{ editing ? '编辑中' : '编辑' }}
+            </button>
+            <button class="mini" :disabled="saving" @click="addProfile">＋ 新建</button>
+          </span>
         </div>
 
-        <div v-if="!profiles.length" class="empty">
-          还没有配置。点"＋ 新建"加一路。
-        </div>
+        <!-- 配置列表单独一层：它自己滚，"当前配置"是常驻信息，
+             不该跟着列表一起被滚出去 -->
+        <div class="plist-scroll">
+          <div v-if="!profiles.length" class="empty">
+            还没有配置。点"＋ 新建"加一路。
+          </div>
 
-        <ul class="plist">
-          <li
-            v-for="p in profiles"
-            :key="p.id"
-            class="pitem"
-            :class="{ active: p.id === selectedId, off: !p.enabled }"
-            @click="select(p.id)"
-          >
-            <!-- iPhone 那种滑动开关：一个 checkbox 用 CSS 画成轨道 + 圆钮。
-                 保留原生 input 是为了键盘可达性（空格能切）和无障碍语义。 -->
-            <label class="switch" :title="p.enabled ? '停用当前配置' : '启用当前配置'" @click.stop>
-              <input
-                type="checkbox"
-                :checked="p.enabled"
-                :aria-label="`启用 ${p.name || p.id}`"
-                @change="toggleEnabled(p)"
-              />
-              <span class="switch-track"><span class="switch-knob" /></span>
-            </label>
-            <div class="pmeta">
-              <div class="pname">
-                {{ p.name || p.id }}
-                <span class="pid">{{ p.id }}</span>
+          <ul class="plist">
+            <li
+              v-for="p in profiles"
+              :key="p.id"
+              class="pitem"
+              :class="{ active: p.id === selectedId, off: !p.enabled }"
+              @click="select(p.id)"
+            >
+              <!-- iPhone 那种滑动开关：一个 checkbox 用 CSS 画成轨道 + 圆钮。
+                   保留原生 input 是为了键盘可达性（空格能切）和无障碍语义。 -->
+              <label class="switch" :title="p.enabled ? '停用当前配置' : '启用当前配置'" @click.stop>
+                <input
+                  type="checkbox"
+                  :checked="p.enabled"
+                  :aria-label="`启用 ${p.name || p.id}`"
+                  @change="toggleEnabled(p)"
+                />
+                <span class="switch-track"><span class="switch-knob" /></span>
+              </label>
+              <div class="pmeta">
+                <div class="pname">
+                  {{ p.name || p.id }}
+                  <span class="pid">{{ p.id }}</span>
+                </div>
+                <div class="pdesc">{{ describeProfile(p) }}</div>
               </div>
-              <div class="pdesc">{{ describeProfile(p) }}</div>
-            </div>
-          </li>
-        </ul>
+            </li>
+          </ul>
+        </div>
 
-        <!-- 选中配置的详情 + 编辑入口 -->
-        <div v-if="selectedProfile" class="editor">
+        <!-- 选中配置的详情：钉在侧栏最底下，不跟着上面的列表滚 -->
+        <div v-if="selectedProfile" class="cur">
           <div class="side-head">
             <span>当前配置</span>
-            <button class="mini" @click="editing = !editing">
-              {{ editing ? '收起' : '编辑' }}
-            </button>
           </div>
 
           <!-- 详情面板只放用户真正要看的：当前配置录的是什么、录多大、录多清。
@@ -188,77 +196,56 @@
 
           <p v-if="selectedLive?.recordFailed" class="bad">{{ selectedLive.recordDetail }}</p>
 
-          <!-- 编辑表单：窗口匹配规则 / 帧率 / 比特率 / 回放时长 -->
-          <form v-if="editing && selectedProfile" class="form" @submit.prevent="saveEdits">
-            <label>
-              配置名称
-              <input v-model="draft.name" type="text" />
-            </label>
+        </div>
+      </aside>
 
-            <label>
-              采集方式
-              <select v-model="draft.sourceKind">
-                <option value="monitor">显示器捕获</option>
-                <option value="window">窗口捕获</option>
-              </select>
-            </label>
-
-            <!-- 显示器捕获：下拉选显示器，右边一个刷新按钮 -->
-            <label v-if="draft.sourceKind === 'monitor'">
-              显示器
-              <span class="pickrow">
-                <select v-model.number="draft.monitorIndex">
-                  <option v-for="m in monitors" :key="m.index" :value="m.index">
-                    显示器 {{ m.index + 1 }} · {{ m.width }}×{{ m.height
-                    }}{{ m.primary ? ' · 主屏' : '' }}
-                  </option>
-                  <!-- 列表还没拉回来 / 拉回来但没有当前这块：留一个占位，
-                       否则 <select> 会静默选中第一项，用户一存就换了显示器 -->
-                  <option v-if="!monitors.some((m) => m.index === draft.monitorIndex)" :value="draft.monitorIndex">
-                    显示器 {{ draft.monitorIndex + 1 }}（当前配置）
-                  </option>
-                </select>
-                <button
-                  type="button"
-                  class="iconbtn"
-                  :class="{ spin: loadingMonitors }"
-                  :title="loadingMonitors ? '正在刷新…' : '刷新显示器列表'"
-                  aria-label="刷新显示器列表"
-                  :disabled="loadingMonitors"
-                  @click="loadMonitors"
-                >
-                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M21 12a9 9 0 1 1-2.64-6.36" />
-                    <polyline points="21 3 21 9 15 9" />
-                  </svg>
-                </button>
-              </span>
-            </label>
-
-            <template v-if="draft.sourceKind === 'window'">
-              <!-- 窗口捕获：OBS 同款的窗口下拉 + 刷新按钮 -->
+      <!-- 编辑弹窗：参数单独一个窗口调。侧栏只留列表和"当前配置"，
+           列表一多也不会把编辑表单顶到视野外 -->
+      <div v-if="editing && (selectedProfile || editingNew)" class="sheet-mask editor-mask" @click.self="cancelEdit">
+        <div class="sheet editor-sheet" role="dialog" aria-modal="true">
+          <div class="sheet-head">
+            <strong>{{ editingNew ? '新建配置' : '编辑配置' }}</strong>
+            <span class="sheet-sub">{{ editingNew ? '还没加进列表' : selectedProfile?.name || selectedProfile?.id }}</span>
+            <button class="sheet-x" title="关闭" @click="cancelEdit">×</button>
+          </div>
+          <div class="sheet-body">
+            <form class="form in-modal" @submit.prevent="saveEdits">
               <label>
-                窗口
+                配置名称
+                <input v-model="draft.name" type="text" />
+              </label>
+
+              <label>
+                采集方式
+                <select v-model="draft.sourceKind">
+                  <option value="monitor">显示器捕获</option>
+                  <option value="window">窗口捕获</option>
+                </select>
+              </label>
+
+              <!-- 显示器捕获：下拉选显示器，右边一个刷新按钮 -->
+              <label v-if="draft.sourceKind === 'monitor'">
+                显示器
                 <span class="pickrow">
-                  <select :value="windowPickValue" @change="useWindow(($event.target as HTMLSelectElement).value)">
-                    <option value="">（选择一个窗口）</option>
-                    <!-- 服务手里握着的那个窗口如果已经不在枚举列表里（关掉重开换了
-                         hwnd / 被最小化），单独补一行，别让下拉只剩"请选择"。 -->
-                    <option v-if="capturedOption" :value="capturedOption.hwnd">
-                      当前正在录制：{{ capturedOption.title }}（已不在窗口列表中）
+                  <select v-model.number="draft.monitorIndex">
+                    <option v-for="m in monitors" :key="m.index" :value="m.index">
+                      显示器 {{ m.index + 1 }} · {{ m.width }}×{{ m.height
+                      }}{{ m.primary ? ' · 主屏' : '' }}
                     </option>
-                    <option v-for="w in windows" :key="w.hwnd" :value="String(w.hwnd)">
-                      {{ windowLabel(w) }}
+                    <!-- 列表还没拉回来 / 拉回来但没有当前这块：留一个占位，
+                         否则 <select> 会静默选中第一项，用户一存就换了显示器 -->
+                    <option v-if="!monitors.some((m) => m.index === draft.monitorIndex)" :value="draft.monitorIndex">
+                      显示器 {{ draft.monitorIndex + 1 }}（当前配置）
                     </option>
                   </select>
                   <button
                     type="button"
                     class="iconbtn"
-                    :class="{ spin: loadingWindows }"
-                    :title="loadingWindows ? '正在刷新…' : '刷新窗口列表'"
-                    aria-label="刷新窗口列表"
-                    :disabled="loadingWindows"
-                    @click="loadWindows"
+                    :class="{ spin: loadingMonitors }"
+                    :title="loadingMonitors ? '正在刷新…' : '刷新显示器列表'"
+                    aria-label="刷新显示器列表"
+                    :disabled="loadingMonitors"
+                    @click="loadMonitors"
                   >
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                       <path d="M21 12a9 9 0 1 1-2.64-6.36" />
@@ -268,75 +255,111 @@
                 </span>
               </label>
 
-              <!-- 匹配方式：下拉选四个组合，**应用程序（exe）永远是必要条件**。
-                   以前的"拖动排优先级"整个删掉了 —— 它是"标题对不上就降级到
-                   类名，于是录到同类的另一个窗口"的根源。现在没有降级：
-                   条件全部 AND，少一条就不匹配，这一路保持未采集。 -->
+              <template v-if="draft.sourceKind === 'window'">
+                <!-- 窗口捕获：OBS 同款的窗口下拉 + 刷新按钮 -->
+                <label>
+                  窗口
+                  <span class="pickrow">
+                    <select :value="windowPickValue" @change="useWindow(($event.target as HTMLSelectElement).value)">
+                      <option value="">（选择一个窗口）</option>
+                      <!-- 服务手里握着的那个窗口如果已经不在枚举列表里（关掉重开换了
+                           hwnd / 被最小化），单独补一行，别让下拉只剩"请选择"。 -->
+                      <option v-if="capturedOption" :value="capturedOption.hwnd">
+                        当前正在录制：{{ capturedOption.title }}（已不在窗口列表中）
+                      </option>
+                      <option v-for="w in windows" :key="w.hwnd" :value="String(w.hwnd)">
+                        {{ windowLabel(w) }}
+                      </option>
+                    </select>
+                    <button
+                      type="button"
+                      class="iconbtn"
+                      :class="{ spin: loadingWindows }"
+                      :title="loadingWindows ? '正在刷新…' : '刷新窗口列表'"
+                      aria-label="刷新窗口列表"
+                      :disabled="loadingWindows"
+                      @click="loadWindows"
+                    >
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                        <polyline points="21 3 21 9 15 9" />
+                      </svg>
+                    </button>
+                  </span>
+                </label>
+
+                <!-- 匹配方式：下拉选四个组合，**应用程序（exe）永远是必要条件**。
+                     以前的"拖动排优先级"整个删掉了 —— 它是"标题对不上就降级到
+                     类名，于是录到同类的另一个窗口"的根源。现在没有降级：
+                     条件全部 AND，少一条就不匹配，这一路保持未采集。 -->
+                <label>
+                  匹配方式
+                  <select v-model="draft.matchRule">
+                    <option v-for="o in MATCH_RULE_OPTIONS" :key="o.value" :value="o.value">
+                      {{ o.label }}
+                    </option>
+                  </select>
+                </label>
+
+                <!-- 当前这一档具体在比什么，逐条列出来 -->
+                <p v-if="matchRuleHint" class="rule-hint">{{ matchRuleHint }}</p>
+
+                <!-- 「列表里没有窗口满足条件」不再额外警告：这一路会保持未采集，
+                     下拉里就停在「选择一个窗口」，用户看得见，不需要一句话再说一遍。 -->
+
+                <!-- 「多个都匹配时选」不再给用户选：同时命中多个窗口时一律取面积
+                     最大的那个（看得最多的那个）。要求用户理解 foreground /
+                     oldest 的区别、还要自己猜为什么某个窗口没被选中，不值得。 -->
+              </template>
+
               <label>
-                匹配方式
-                <select v-model="draft.matchRule">
-                  <option v-for="o in MATCH_RULE_OPTIONS" :key="o.value" :value="o.value">
-                    {{ o.label }}
-                  </option>
+                录制帧率
+                <select v-model.number="draft.fps">
+                  <option v-for="f in fpsOptions" :key="f" :value="f">{{ f }} fps</option>
                 </select>
               </label>
 
-              <!-- 当前这一档具体在比什么，逐条列出来 -->
-              <p v-if="matchRuleHint" class="rule-hint">{{ matchRuleHint }}</p>
+              <!-- 这里不再显示录像尺寸：显示器源就用显示器自己的宽高，窗口源就用
+                   窗口自己的宽高，服务端按源的原始尺寸采集和编码。分辨率对用户
+                   是个纯展示的数字，改不了也不用管，占着地方反而分心。 -->
 
-              <!-- 「列表里没有窗口满足条件」不再额外警告：这一路会保持未采集，
-                   下拉里就停在「选择一个窗口」，用户看得见，不需要一句话再说一遍。 -->
+              <label>
+                比特率（Mbps）
+                <input v-model.number="draft.bitrateMbps" type="number" min="1" max="200" />
+              </label>
+              <label>
+                回放时长（秒）
+                <input v-model.number="draft.replaySeconds" type="number" min="5" max="3600" />
+              </label>
 
-              <!-- 「多个都匹配时选」不再给用户选：同时命中多个窗口时一律取面积
-                   最大的那个（看得最多的那个）。要求用户理解 foreground /
-                   oldest 的区别、还要自己猜为什么某个窗口没被选中，不值得。 -->
-            </template>
+              <!-- 「启用当前配置」不再放在编辑面板里：侧栏每一行右边本来就有开关，
+                   同一个开关摆两处只会让人搞不清哪次点击才算数。 -->
 
-            <label>
-              录制帧率
-              <select v-model.number="draft.fps">
-                <option v-for="f in fpsOptions" :key="f" :value="f">{{ f }} fps</option>
-              </select>
-            </label>
-
-            <!-- 这里不再显示录像尺寸：显示器源就用显示器自己的宽高，窗口源就用
-                 窗口自己的宽高，服务端按源的原始尺寸采集和编码。分辨率对用户
-                 是个纯展示的数字，改不了也不用管，占着地方反而分心。 -->
-
-            <label>
-              比特率（Mbps）
-              <input v-model.number="draft.bitrateMbps" type="number" min="1" max="200" />
-            </label>
-            <label>
-              回放时长（秒）
-              <input v-model.number="draft.replaySeconds" type="number" min="5" max="3600" />
-            </label>
-
-            <!-- 「启用当前配置」不再放在编辑面板里：侧栏每一行右边本来就有开关，
-                 同一个开关摆两处只会让人搞不清哪次点击才算数。 -->
-
-            <div class="actions">
-              <button type="submit" class="primary" :disabled="saving">
-                {{ saving ? '保存中…' : '保存' }}
-              </button>
-              <button type="button" class="mini" @click="editing = false">取消</button>
-              <!-- 删除：删的是**这一路配置**，已录好的分片不动（那是用户的素材）。
-                   放在最右边，跟保存/取消拉开距离，免得手滑点到。 -->
-              <button
-                type="button"
-                class="mini danger"
-                :disabled="deleting"
-                :title="`删除配置「${selectedProfile?.name || selectedProfile?.id}」`"
-                @click="deleteProfile"
-              >
-                {{ deleting ? '删除中…' : '删除' }}
-              </button>
-            </div>
-            <p v-if="saveError" class="bad">{{ saveError }}</p>
-            <p v-if="saveNotice" class="hint">{{ saveNotice }}</p>
-          </form>
+              <div class="actions">
+                <button type="submit" class="primary" :disabled="saving">
+                  {{ saving ? '保存中…' : editingNew ? '确定' : '保存' }}
+                </button>
+                <button type="button" class="mini" @click="cancelEdit">取消</button>
+                <!-- 删除：删的是**这一路配置**，已录好的分片不动（那是用户的素材）。
+                     放在最右边，跟保存/取消拉开距离，免得手滑点到。
+                     新建模式没有这一路可删，不显示。 -->
+                <button
+                  v-if="!editingNew"
+                  type="button"
+                  class="mini danger"
+                  :disabled="deleting"
+                  :title="`删除配置「${selectedProfile?.name || selectedProfile?.id}」`"
+                  @click="deleteProfile"
+                >
+                  {{ deleting ? '删除中…' : '删除' }}
+                </button>
+              </div>
+              <p v-if="saveError" class="bad">{{ saveError }}</p>
+              <p v-if="saveNotice" class="hint">{{ saveNotice }}</p>
+            </form>
+          </div>
         </div>
-      </aside>
+      </div>
 
       <!-- 预览区 -->
       <main class="stage">
@@ -584,6 +607,8 @@ const recordRoot = ref('')
 const exportDir = ref('')
 const selectedId = ref<string | null>(null)
 const editing = ref(false)
+/** 新建模式：弹窗里编的是一路还没加进列表的新配置，点确定才入列 */
+const editingNew = ref(false)
 const saving = ref(false)
 /** 正在删配置（删除按钮的禁用/文案） */
 const deleting = ref(false)
@@ -1089,11 +1114,41 @@ function nextProfileNum(): number {
   return max + 1
 }
 
+/**
+ * 新建一路 —— **先不进列表**。
+ *
+ * 用户点「＋ 新建」只打开一个空白的编辑弹窗，填好点「确定」才真正加进
+ * 列表并落盘。中途取消 / 关窗 / Esc，列表纹丝不动，也不会留下磁盘上
+ * 根本不存在的幽灵行（上一版的 draft 标记方案就是因为"先加进列表"才
+ * 需要那套复杂的草稿回收逻辑，现在从根上就不加）。
+ */
 function addProfile() {
+  editingNew.value = true
+  editing.value = true
   const p = emptyProfile()
-  profiles.value = [...profiles.value, p]
-  selectedId.value = p.id
-  startEdit()
+  draft.value = {
+    name: p.name,
+    enabled: p.enabled,
+    sourceKind: p.source.kind,
+    monitorIndex: p.source.monitorIndex,
+    matchRule: deriveMatchRule(p.match),
+    matchTitle: p.match?.title ?? '',
+    matchClass: p.match?.className ?? '',
+    matchProcess: p.match?.process ?? '',
+    matchHwnd: Number(p.match?.hwnd ?? 0) || 0,
+    matchMode: p.match?.mode ?? 'contains',
+    matchPattern: p.match?.pattern ?? '',
+    fps: p.video.fps,
+    bitrateMbps: p.video.bitrateMbps,
+    replaySeconds: p.video.replaySeconds,
+  }
+  extraFps.value = null
+  saveError.value = ''
+  saveNotice.value = ''
+  // 新建默认是窗口捕获还是显示器捕获由 emptyProfile 定（默认窗口源），
+  // 打开弹窗就先把对应列表拉一遍，下拉框是空的用户没法选。
+  if (p.source.kind !== 'window') void loadMonitors()
+  if (p.source.kind === 'window') void loadWindows()
 }
 
 /**
@@ -1211,15 +1266,41 @@ function startEdit() {
   }
   extraFps.value = FPS_CHOICES.includes(p.video.fps) ? null : p.video.fps
   saveError.value = ''
+  saveNotice.value = ''
   editing.value = true
+  editingNew.value = false
   // 打开编辑面板就把当前显示器和窗口列表拉一遍，下拉框是空的用户没法选
   if (p.source.kind !== 'window') void loadMonitors()
   if (p.source.kind === 'window') void loadWindows()
 }
 
+/**
+ * 关编辑弹窗（取消 / 点遮罩 / Esc 都走这里）。
+ *
+ * draft 是选中配置的一份副本（见它的声明处），弹窗里改的是副本，
+ * 关掉直接丢掉即可，配置本身没动过 —— 所以这里不需要回滚任何东西。
+ * 只是顺手把上次保存留下的提示清掉：草稿已经丢了，再显示"已保存"会让人
+ * 以为刚才那次取消也存了盘。
+ */
+function cancelEdit() {
+  editing.value = false
+  editingNew.value = false
+  saveError.value = ''
+  saveNotice.value = ''
+  // 新建模式：关掉就是放弃，列表本来就还没加这一路，什么都不用回滚。
+}
+
+/** Esc 关编辑弹窗。挂在 document 上，因为焦点可能停在表单里某个下拉上。 */
+function editKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && editing.value) cancelEdit()
+}
+onMounted(() => document.addEventListener('keydown', editKeydown))
+onBeforeUnmount(() => document.removeEventListener('keydown', editKeydown))
+
 function select(id: string) {
   selectedId.value = id
   editing.value = false
+  editingNew.value = false
   exportNotice.value = null
 }
 
@@ -1231,9 +1312,51 @@ function toggleEnabled(p: Profile) {
 }
 
 async function saveEdits() {
+  const d = draft.value
+
+  // 新建模式：填完点「确定」才真正把这一路加进列表 + 落盘。
+  if (editingNew.value) {
+    const p = emptyProfile()
+    const next: Profile = {
+      ...p,
+      name: d.name,
+      enabled: d.enabled,
+      source: { ...p.source, kind: d.sourceKind, monitorIndex: d.monitorIndex },
+      video: {
+        ...p.video,
+        fps: d.fps,
+        bitrateMbps: d.bitrateMbps,
+        replaySeconds: d.replaySeconds,
+      },
+    }
+    if (d.sourceKind === 'window') {
+      next.match = {
+        rule: d.matchRule,
+        by: MATCH_RULE_FIELDS[d.matchRule]?.[0] ?? 'process',
+        mode: d.matchMode,
+        pattern: d.matchPattern,
+        pick: 'largest',
+        pollMs: 1000,
+        requireVisible: true,
+        title: d.matchTitle,
+        className: d.matchClass,
+        process: d.matchProcess,
+        hwnd: d.matchHwnd || 0,
+      }
+    }
+    // 先落盘（拿到服务端 normalize 后的最终形状再入列，避免界面和磁盘两套值），
+    // 成功才 push 进列表；失败留在弹窗里让用户改。
+    const ok = await saveOneProfile(p.id, next)
+    if (!ok) return
+    profiles.value = [...profiles.value, next]
+    selectedId.value = p.id
+    editing.value = false
+    editingNew.value = false
+    return
+  }
+
   const p = selectedProfile.value
   if (!p) return
-  const d = draft.value
   const next: Profile = {
     ...p,
     name: d.name,
@@ -1355,6 +1478,7 @@ async function deleteProfile() {
   const p = selectedProfile.value
   if (!p) return
   const label = p.name || p.id
+
   // 删除不可撤销（配置里这一整行参数都会没），所以问一句。
   // Electron 渲染进程里 window.confirm 是可用的原生对话框。
   if (typeof window.confirm === 'function') {
@@ -1656,16 +1780,23 @@ const statusClass = computed(() => {
 
 // ---- 顶栏帧率显示 ---------------------------------------------------------
 //
-// 显示的是**当前选中那一路**自己的帧率（usePreview 里按路各存一份账本），
-// 而且取的是那一路算好的**滑动中位数**，不是瞬时值 —— 瞬时值每 500ms 现算
-// 一次，60fps 下一个窗口多收一帧就成 62、少收一帧就成 58，数字一直跳，看着
-// 像"帧数不稳"，其实采集侧是稳的。
+// 显示的是**录制实测帧率**（服务端每秒上报的 actualFps），不是预览渲染帧率。
 //
-// 以前这里是"跟着 stats.renderFpsShown 走 + 差不到 1.5 就不改"的滞后闸门：
-// 那个闸门本来是为了挡抖动，副作用是切配置时要等新数字和旧数字差够 1.5 才
-// 肯更新，看起来就是"切过去了还在慢慢过渡"。现在帧率按路存，切换只是换一个
-// 指针（watch selectedId），所以直接取那一路的值就行，不需要任何过渡。
-const fpsShown = computed(() => Math.round(fpsOf(selectedId.value)))
+// 【为什么要改】以前这里显示 fpsOf() —— 那是页面**预览**实际画出来的帧率。
+// 预览帧率被服务端按"面板大小"做限流（面板大就发全分辨率、顺带把帧率收到 60），
+// 于是"设置 120fps 录制"的显示器源，顶栏却显示 60 甚至更低；一旦面板宽度在
+// 砍半/不砍半的临界点附近抖动，预览帧率就在 60↔120 之间乱跳，用户看着就像
+// "录制的帧率坏了、随机掉"。
+//
+// 真相是录制一直稳稳跑在 120（actualFps 从未掉），乱跳的只是预览的**显示帧率**。
+// 顶栏这个数字该回答"我设置的录制帧率到底跑没跑到"，所以改读 actualFps。
+// 预览帧率仍可从 stats.renderFpsShown 拿到，只是不再占顶栏这个最显眼的位置。
+const fpsShown = computed(() => {
+  const a = selectedLive.value?.actualFps
+  if (typeof a === 'number' && Number.isFinite(a) && a > 0) return Math.round(a)
+  // 服务还没上报（刚连上）：退回预览账本垫一下，避免显示 0
+  return Math.round(fpsOf(selectedId.value))
+})
 
 function describeSource(p: Profile): string {
   if (p.source.kind === 'desktop') return '整屏桌面'
@@ -1916,6 +2047,27 @@ onBeforeUnmount(() => {
   overflow: auto;
 }
 
+/* 编辑弹窗压在设置弹窗之上（两个不会同时开，但真叠了也是编辑在上）。 */
+.editor-mask {
+  z-index: 60;
+}
+/* 比设置面板窄一点：里面是一列表单，太宽了输入框拉得没边 */
+.editor-sheet {
+  width: min(500px, calc(100vw - 48px));
+}
+/* 标题右边那一行"正在编辑哪一路" */
+.sheet-sub {
+  margin-left: 8px;
+  color: #7c879b;
+  font-size: 12px;
+  font-weight: 400;
+}
+/* 表单进了弹窗：分隔线和左右内边距都由 .sheet-body 给了，别再叠一层 */
+.form.in-modal {
+  border-top: 0;
+  padding: 0;
+}
+
 .row {
   display: flex;
   flex-direction: column;
@@ -2105,7 +2257,12 @@ onBeforeUnmount(() => {
   flex-direction: column;
   background: #0a0e16;
   border-right: 1px solid #1b2231;
-  overflow-y: auto;
+  /* 侧栏自己不滚：滚动交给里面那一层 .plist-scroll。
+     以前整条侧栏一起滚，"当前配置"会被列表顶到看不见的地方；
+     现在它是钉在底部的常驻信息，列表再长也只在自己那层里滚。
+     这里必须写 overflow:hidden，否则 flex 子项的 min-height:0 不生效，
+     滚动条会撑到整个侧栏上。 */
+  overflow: hidden;
 }
 
 .side-head {
@@ -2118,6 +2275,25 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
   color: #616d84;
   border-bottom: 1px solid #141a26;
+  /* 头部不参与收缩，也不跟着列表滚 */
+  flex: 0 0 auto;
+}
+
+/* 头部右边的按钮组。编辑在左、新建在右 —— 顺序在模板里定，这里只管间距。 */
+.head-btns {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 配置列表的滚动层。
+   min-height:0 是 flex 布局里让子元素"可以比内容矮"的关键 —— 少了它，
+   flex 项默认 min-height:auto，被子元素撑开后 overflow 永远不会触发，
+   滚动条会跑到整条侧栏上。 */
+.plist-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .mini {
@@ -2292,7 +2468,16 @@ onBeforeUnmount(() => {
   background: #35d07f;
 }
 
-.editor {
+/* 底部"当前配置"：不收缩、不滚动，永远贴在侧栏最底下 */
+/* 当前配置：高度钉死在窗口高度的 30%，不随内容长短变。
+   内容多时自己内部滚 —— 上面"配置列表"那一层的滚动条是它的，
+   这一块是常驻信息，不该跟着列表一起被滚出去。 */
+.cur {
+  flex: 0 0 30vh;
+  height: 30vh;
+  min-height: 30vh;
+  max-height: 30vh;
+  overflow-y: auto;
   border-top: 1px solid #1b2231;
 }
 

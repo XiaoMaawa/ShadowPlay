@@ -321,12 +321,39 @@ uint32_t Session::RingCapHeight(uint32_t h) {
 // 看不出），但 2000 的面板必须给原图。
 //
 // 界面还没报过尺寸（老版本界面 / 刚启动）时退回旧阈值，行为与以前一致。
-bool Session::PreviewNeedsHalf(uint32_t srcW, uint32_t srcH) const {
-    if (srcW < 2 || srcH < 2) return false;
+//
+// 【迟滞（hysteresis）】砍半决策用两个不同的阈值进出，避免面板宽度在临界点
+// 附近抖动时决策一拍拍翻转、预览帧率跟着 60↔120 乱跳：
+//   * 进入砍半：半宽 >= 面板宽 × 0.9（够用才砍）
+//   * 退出砍半：半宽 <  面板宽 × 0.8（面板真的比半宽大不少才恢复原分辨率）
+// 中间 0.8~0.9 这段"灰色地带"里，维持上一次的决策不动。源 2560 时临界点从
+// 精确的 1422px 扩成 1422~1600px 的一段缓冲带，滚动条/亚像素抖动不再触发翻转。
+bool Session::PreviewNeedsHalf(uint32_t srcW, uint32_t srcH) {
+    if (srcW < 2 || srcH < 2) {
+        lastHalfDecision_ = false;
+        halfDecisionValid_ = false;
+        return false;
+    }
     const uint32_t targetW = previewTargetW_.load(std::memory_order_relaxed);
-    if (targetW == 0) return srcW > kPreviewDownscaleAboveWidth;
+    if (targetW == 0) {
+        // 没报过尺寸：退回旧固定阈值，不参与迟滞（此时没有会抖的输入）。
+        lastHalfDecision_ = srcW > kPreviewDownscaleAboveWidth;
+        halfDecisionValid_ = true;
+        return lastHalfDecision_;
+    }
     const uint32_t halfW = srcW / 2u;
-    return halfW * 10u >= targetW * 9u;
+    // 进入阈值（0.9）与退出阈值（0.8）分开，中间地带维持上次结论。
+    const bool enterHalf = halfW * 10u >= targetW * 9u;   // 半宽 >= 面板宽 × 0.9
+    const bool exitHalf = halfW * 10u < targetW * 8u;     // 半宽 <  面板宽 × 0.8
+    if (!halfDecisionValid_) {
+        lastHalfDecision_ = enterHalf;
+        halfDecisionValid_ = true;
+    } else if (lastHalfDecision_ && exitHalf) {
+        lastHalfDecision_ = false;   // 之前砍半、现在面板真的大了 → 恢复原分辨率
+    } else if (!lastHalfDecision_ && enterHalf) {
+        lastHalfDecision_ = true;    // 之前原分辨率、现在面板够小 → 砍半
+    }
+    return lastHalfDecision_;
 }
 
 // 全分辨率预览的帧率硬上限。
@@ -340,7 +367,7 @@ bool Session::PreviewNeedsHalf(uint32_t srcW, uint32_t srcH) const {
 // 想要更跟手（高刷屏）完全给得起。
 constexpr uint32_t kFullResPreviewMaxFps = 60;
 
-uint32_t Session::EffectivePreviewFps(uint32_t srcW, uint32_t srcH) const {
+uint32_t Session::EffectivePreviewFps(uint32_t srcW, uint32_t srcH) {
     const uint32_t want = previewFps_.load(std::memory_order_relaxed);
     if (PreviewNeedsHalf(srcW, srcH)) return want; // 已经砍半：完全听用户的
     // 0（不限）在全分辨率下同样收到 60：那是调试开关，不该把带宽打满。
