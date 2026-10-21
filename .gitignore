@@ -17,3 +17,6 @@ native/build/
 
 # 早期编译试验目录：里面有 .obj/.exe 残留，不是产品源码
 test/
+
+# 应用保存配置时自己生成的上一版备份，每次设置变更都会变，不进仓库
+profiles.json.bak
