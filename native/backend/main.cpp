@@ -53,6 +53,8 @@
 #include "RingNames.h"
 #include "Session.h"
 #include "StatusFile.h"
+#include "GuardianMode.h"
+#include "TrayIcon.h"
 #include "WindowEnum.h"
 
 #include <windows.h>
@@ -76,6 +78,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace shadow;
 
@@ -94,6 +97,7 @@ using namespace shadow;
 namespace {
 
 std::atomic<bool> g_running{ true };
+HANDLE g_wakeEvent = nullptr;  // RunProfilesMode 建好后再填上，退出时用来立刻唤醒主循环
 std::mutex g_outMutex;
 
 // 睡到指定时刻（分段睡：Sleep 单次超过 ~15ms 在中途被打断时误差会变大）。
@@ -197,6 +201,11 @@ struct Options {
     bool statusOnly = false;
     bool listWindows = false;         // --list-windows：列出可采集的顶层窗口
     bool listMonitors = false;        // --list-monitors：列出可采集的显示器
+    bool guardian = false;            // --guard：跑守护模式（见 GuardianMode.h）
+    // --include-hwnd=N（可重复）：这些 hwnd 无条件进 --list-windows 的结果。
+    // 界面把"服务正在录的 hwnd"传进来，好让窗口下拉里一定有它
+    // （它可能是最小化的，正常枚举会被过滤掉）。
+    std::vector<HWND> includeHwnds;
     std::string profilesPath;         // --profiles：配置文件路径（空 = 单路旧模式）
 };
 
@@ -210,6 +219,8 @@ void PrintUsage() {
         "  --once             打印一次状态后退出\n"
         "  --status           只检查服务是否在运行\n"
         "  --list-windows     列出当前可采集的顶层窗口（NDJSON）后退出\n"
+        "  --include-hwnd N   与 --list-windows 同用：指定的 hwnd 无条件列出\n"
+        "                     （可重复；用于把正在录的最小化窗口带进下拉框）\n"
         "  --list-monitors    列出当前已连接的显示器（NDJSON）后退出\n"
         "  --profiles <path>  读配置并按配置起多路会话（见 DESIGN.md 第 7 节）\n",
         stderr);
@@ -243,10 +254,19 @@ bool ParseCommandLine(int argc, char** argv, Options& opt) {
             opt.listWindows = true;
         } else if (a == "--list-monitors") {
             opt.listMonitors = true;
+        } else if (a == "--include-hwnd") {
+            std::string v;
+            if (!next(v)) return false;
+            const unsigned long long n = std::strtoull(v.c_str(), nullptr, 10);
+            if (n != 0) opt.includeHwnds.push_back(reinterpret_cast<HWND>(static_cast<uintptr_t>(n)));
         } else if (a == "--once") {
             opt.once = true;
         } else if (a == "--status") {
             opt.statusOnly = true;
+        } else if (a == "--guard") {
+            // 守护模式：不碰服务互斥体，只盯着服务、不在了就把它拉起来。
+            // 由服务启动后自己拉起（RunProfilesMode 里的 SpawnGuardian）。
+            opt.guardian = true;
         } else if (a == "--help" || a == "-h") {
             return false;
         }
@@ -470,6 +490,29 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                       std::string(mfOk ? "true" : "false") + "}");
     }
 
+    // ---- 拉起守护进程（双向看门的第一条边）----------------------------------
+    //
+    // 守护是同一个 exe 的 --guard 模式（见 GuardianMode.h）：它盯着这个服务，
+    // 服务没了就重新拉起。这里由**服务自己**把它拉起来 —— 不经过 Electron，
+    // 因为界面关掉之后恰恰是最需要有人看着服务的时刻。
+    // 已经有守护在跑时它自己会立刻退出（守护互斥体），重复拉是安全的。
+    if (SpawnGuardian(opt.profilesPath)) {
+        LogStatusLine("{\"type\":\"guardian_spawned\"}");
+    } else {
+        // 拉不起来不致命：服务照常录，只是崩了没人管。
+        LogError("guardian_spawn_failed", "守护进程没能拉起来（服务照常运行，但崩溃后不会自动重启）。");
+    }
+
+    // ---- 托盘图标（右键菜单里有「退出」）----------------------------------
+    //
+    // 挂在服务进程上，不挂在 Electron：用户要的是「Electron 关掉服务还在」，
+    // 那托盘作为唯一常驻入口也得跟着服务走。见 TrayIcon.h。
+    StartTrayIcon(opt.profilesPath);
+
+    // 服务模式是后台进程：若有控制台窗口（被带控制台方式启动时会有），藏掉，
+    // 让托盘成为唯一的可见界面。DETACHED 启动的本来就没有控制台窗口。
+    if (HWND cw = GetConsoleWindow()) ShowWindow(cw, SW_HIDE);
+
     // ---- 命令通道（stdin，NDJSON 一行一条）--------------------------------
     //
     // 命令有四条：
@@ -532,6 +575,7 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
     // 用 Windows 事件而不是 condition_variable：主循环还得能被 Ctrl+C 打断，
     // 这个事件可以直接塞进 WaitForMultipleObjects 一起等。
     HANDLE wakeEvent = CreateEventA(nullptr, FALSE /* 自动复位 */, FALSE, nullptr);
+    g_wakeEvent = wakeEvent;  // 给 RequestServiceExit 用，退出时立刻唤醒主循环
 
     // 一条命令行的解析（两条通道共用）。传进来时已经去掉了行尾。
     auto handleCommandLine = [&](const std::string& line) {
@@ -541,8 +585,11 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
         // "export" 字样识别，两者字符串形式完全不同，不会互相误伤。
         if (line.find("\"set-preview-fps\"") != std::string::npos) {
             const double fps = FindJsonNumber(line, "fps", 0.0);
-            previewFps.store(fps > 0.0 ? static_cast<uint32_t>(fps + 0.5) : 0u,
-                             std::memory_order_relaxed);
+            // 上限 120（与 MfEncoder::kMaxFps 同一口径）：预览再高也没有更多
+            // 新帧可画，只是让采集线程多搬几次共享环。
+            uint32_t want = fps > 0.0 ? static_cast<uint32_t>(fps + 0.5) : 0u;
+            if (want > MfEncoder::kMaxFps) want = MfEncoder::kMaxFps;
+            previewFps.store(want, std::memory_order_relaxed);
             // 立刻套到所有已存在的会话上，下一拍就生效
             {
                 std::lock_guard<std::mutex> lk(sessionsMutex);
@@ -796,7 +843,27 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
             .count();
     };
 
+    // 守护心跳检查的节拍计数（下面循环里每 100ms 一拍，50 拍 = 5 秒一次）。
+    // 反向看门：守护盯服务，服务也盯守护 —— 它的心跳没了就再拉一个。
+    int guardianCheckTicks = 0;
+
     while (g_running.load(std::memory_order_acquire)) {
+        // ---- 守护进程还活着吗（每 5 秒一次）--------------------------------
+        //
+        // 只读一个 1KB 的 JSON + 一次 OpenProcess，几微秒的事，不影响采集节拍。
+        // 没有这一段的话，"守护自己被杀 / 崩了"就没人补回来，双向看门只剩单向。
+        if (++guardianCheckTicks >= 50) {
+            guardianCheckTicks = 0;
+            if (!GuardianHeartbeatAlive()) {
+                if (SpawnGuardian(opt.profilesPath)) {
+                    LogLine("{\"type\":\"guardian_respawned\"}");
+                } else {
+                    LogError("guardian_respawn_failed",
+                             "守护进程不在了，而且重新拉起失败（服务崩溃后将不会自动重启）。");
+                }
+            }
+        }
+
         // 等一个短节拍，但**有命令就提前醒**（见 wakeEvent 的注释）。
         // 100ms 而不是 1 秒：命令延迟压到半个节拍以内，Ctrl+C 也依然灵敏。
         // 用 WaitForSingleObject 而不是 WaitForMultipleObjects，是因为停止信号
@@ -876,24 +943,26 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                                     "\"配置没有实质变化，保留原会话\"}");
                             continue;
                         }
-                        // ---- 只改了帧率：就地改，别拆会话 ----------------------
+                        // ---- 只改了帧率 / 码率：就地改，别拆会话 ----------------
                         //
-                        // 用户把 144 改成 60（或反过来）时，其它参数一个字没动。
-                        // 拆掉重建会换轮次目录、recordSegments 归零、时间轴出现
-                        // 空洞 —— 界面表现就是「短暂的 no signal」「导出按钮被禁用」
-                        // 「刚切过去点导出报该路未在录制」（m13003）。
+                        // 用户把 144 改成 60（或反过来）、把码率 20 改成 10 时，
+                        // 其它参数一个字没动。拆掉重建会换轮次目录、
+                        // recordSegments 归零、时间轴出现空洞 —— 界面表现就是
+                        // 「短暂的 no signal」「导出按钮被禁用」「刚切过去点导出
+                        // 报该路未在录制」（m13003），以及「改个码率像是重启了
+                        // 一次」（m14071）。
                         //
-                        // ApplyLiveSettings 只改帧率：录制器让编码器收掉当前片、
-                        // 按新帧率开新片，墙钟靠 nextSegStartUnix_ 继续顺延，
-                        // 导出端看到的是一条连续的时间轴。
+                        // ApplyLiveSettings 只改帧率与码率：录制器让编码器收掉
+                        // 当前片、按新参数开新片，墙钟靠 nextSegStartUnix_ 继续
+                        // 顺延，导出端看到的是一条连续的时间轴。
                         if (it != sessions.end() && want &&
-                            (*it)->SameSettingsIgnoringFps(*np)) {
+                            (*it)->SameSettingsIgnoringFpsBitrate(*np)) {
                             const bool applied = (*it)->ApplyLiveSettings(*np);
                             (*it)->SetPreviewFps(previewFps.load(std::memory_order_relaxed));
                             LogLine("{\"type\":\"session_reloaded\",\"id\":\"" + JsonEscape(id) +
                                     "\",\"active\":true,\"applied\":" +
                                     (applied ? "true" : "false") +
-                                    ",\"detail\":\"只改了帧率，已就地生效（不重建会话）\"}");
+                                    ",\"detail\":\"只改了帧率/码率，已就地生效（不重建会话）\"}");
                             if (applied) continue;
                         }
                         // 配置确实变了（或者要停用）。旧的摘出来，锁外收尾。
@@ -1138,20 +1207,26 @@ std::string BuildStatusJson(const std::string& session) {
            JsonEscape(session) + "\"}";
 }
 
-std::string BuildWindowsJson() {
-    const auto windows = EnumerateWindows();
+std::string BuildWindowsJson(const std::vector<HWND>& forceInclude = {}) {
+    const auto windows = EnumerateWindows(forceInclude);
     std::string out = "{\"type\":\"windows\",\"count\":" + std::to_string(windows.size()) + "}\n";
     for (const auto& w : windows) {
         char buf[1024];
         std::snprintf(buf, sizeof(buf),
-                      "{\"hwnd\":%llu,\"title\":\"%s\",\"class\":\"%s\","
+                      "{\"hwnd\":%u,\"title\":\"%s\",\"class\":\"%s\","
                       "\"process\":\"%s\",\"pid\":%u,"
                       "\"left\":%d,\"top\":%d,\"width\":%d,\"height\":%d,"
-                      "\"foreground\":%s}",
-                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(w.hwnd)),
+                      "\"foreground\":%s,\"minimized\":%s}",
+                      // hwnd 一律按**无符号 32 位**输出：HWND 本身就是 32 位句柄，
+                      // 按 64 位输出会被符号扩展成 1.8e19 那种值，JS 的 Number
+                      // 超过 2^53 就不精确了 —— 界面拿它存进配置（match.hwnd）
+                      // 再发回来，两边对不上，"换成同一个程序的另一个窗口"就失效。
+                      static_cast<unsigned>(static_cast<uint32_t>(
+                          reinterpret_cast<uintptr_t>(w.hwnd))),
                       JsonEscape(w.title).c_str(), JsonEscape(w.className).c_str(),
                       JsonEscape(w.processName).c_str(), w.pid, w.left, w.top, w.width,
-                      w.height, w.foreground ? "true" : "false");
+                      w.height, w.foreground ? "true" : "false",
+                      w.minimized ? "true" : "false");
         out += buf;
         out += '\n';
     }
@@ -1221,7 +1296,7 @@ int ServiceMainImpl(int argc, char** argv) {
 
     // ---- --list-windows：列出可采集的顶层窗口 --------------------------
     if (opt.listWindows) {
-        std::printf("%s\n", BuildWindowsJson().c_str());
+        std::printf("%s\n", BuildWindowsJson(opt.includeHwnds).c_str());
         return 0;
     }
 
@@ -1233,6 +1308,14 @@ int ServiceMainImpl(int argc, char** argv) {
     if (opt.listMonitors) {
         std::printf("%s\n", BuildMonitorsJson().c_str());
         return 0;
+    }
+
+    // ---- --guard：守护模式 ------------------------------------------------
+    // 必须排在获取服务互斥体**之前**：守护的职责是"服务没了就拉起它"，它自己
+    // 绝不能持有那个互斥体 —— 否则服务死了互斥体也不销毁，守护永远看到
+    // "服务还活着"，一次都不会重启。
+    if (opt.guardian) {
+        return RunGuardianMode(opt.profilesPath);
     }
 
     // ---- 服务互斥体 ------------------------------------------------------
@@ -1569,6 +1652,14 @@ int ServiceMain(int argc, char** argv) {
         LogError("service_crashed", "服务内部异常（非 std::exception）");
         return 1;
     }
+}
+
+void RequestServiceExit() {
+    // 写停机哨兵：守护下一轮巡检看到它就自己退出、且不再拉服务。
+    WriteShutdownSentinel();
+    // 置退出标志并立刻唤醒主循环（不必等 100ms 节拍）。
+    g_running.store(false, std::memory_order_release);
+    if (g_wakeEvent) SetEvent(g_wakeEvent);
 }
 
 void RequestServiceStop() {

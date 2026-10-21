@@ -22,6 +22,13 @@ export interface SessionLive {
   detail: string
   enabled: boolean
   attached: boolean
+  /**
+   * 窗口源**此刻挂在哪个句柄上**（0 = 桌面源 / 还没匹到）。
+   *
+   * 界面拿它来回答"这一路到底在录哪个窗口"：标题会变（浏览器换个页面就变），
+   * 句柄在同一次运行里是稳定的，所以句柄比标题可靠得多。
+   */
+  hwnd?: number
   matchedTitle: string
   width: number
   height: number
@@ -44,6 +51,28 @@ export interface SessionLive {
   recordSegments: number
   recordBytes: number
   recordFrames: number
+
+  /**
+   * 编码器**实际**在用的帧率 / 码率（和配置值分开）。
+   *
+   * 【为什么要分两套】硬件编码器有「分辨率 × 帧率」的吞吐上限（2560x1440 只到
+   * 172fps），配 240 会被自动降到 165；码率以前还会被像素公式覆盖掉用户配的值。
+   * 界面只显示配置值的话，用户会以为「我配的 240 帧正在录」（m13697 / m14071）。
+   *
+   * 老版本服务不报这四个字段，所以都可能是 undefined —— 显示层要判空。
+   */
+  requestedFps?: number
+  effectiveFps?: number
+  requestedBitrateMbps?: number
+  effectiveBitrateMbps?: number
+
+  /**
+   * 「立刻切片」的完成计数（服务端 Session::FlushRecording 成功一次 +1）。
+   *
+   * 点导出前必须让服务把正在写的那一片收尾落盘，否则含"点按钮那一刻"的那片
+   * 导不出来（m12714）。命令管道是单向的，这个数就是那条回执。
+   */
+  flushSeq?: number
 
   exportRunning: boolean
   exportOk: boolean
@@ -78,10 +107,24 @@ export interface ServiceLiveSnapshot {
   runningProfilesPath?: string | null
   /** 两者不是同一份：界面上显示的分片/录制状态属于**另一个**服务的目录 */
   profilesMismatch?: boolean
+  /** 守护进程（服务崩了由它拉起来，见 app/guardian.cjs） */
+  guardian?: GuardianSnapshot
+}
+
+export interface GuardianSnapshot {
+  /** 心跳新鲜且它记的 pid 还活着 */
+  alive: boolean
+  pid: number | null
+  /** 守护已经把服务重新拉起来过几次 */
+  restarts: number
+  /** 最近一次拉起失败的原因（成功过就是空串） */
+  lastError: string
+  lastRestartAt: string | null
 }
 
 export interface ExportEvent {
   type: string
+  /** 这条事件属于哪一路配置（导出队列按 id 分开记状态就靠它） */
   id?: string
   name?: string
   running?: boolean
@@ -97,6 +140,25 @@ export interface ExportEvent {
   elapsedMs?: number
   jobId?: number
   code?: number
+  /** export_queue 事件专用：整份队列快照 */
+  items?: ExportQueueItem[]
+  queuedCount?: number
+}
+
+/** 队列里的一条（主进程 exportQueueSnapshot 的形状） */
+export interface ExportQueueItem {
+  id: string
+  name?: string
+  state: 'queued' | 'running' | string
+  phase?: string
+}
+
+/** 某一路的导出状态（键是配置 id） */
+export interface ExportJobState {
+  id: string
+  name: string
+  state: 'queued' | 'running'
+  phase: string
 }
 
 const api = () => (window as unknown as { shadowPreview?: Record<string, unknown> }).shadowPreview
@@ -116,13 +178,15 @@ const live = shallowRef<ServiceLiveSnapshot>({
 const lastExport = ref<ExportEvent | null>(null)
 
 /**
- * 正在导出时的进度（null = 没有导出在跑）。
+ * 每一路自己的导出状态（键是配置 id，没有键 = 这一路空闲）。
  *
- * 界面**不**再靠服务会话里的 exportRunning 判断了：导出现在跑在界面进程自己
- * 里（见 app/main.cjs 的 service:export），服务根本不知道这件事。进度由主进程
- * 每 400ms 广播一条 export_status 送过来。
+ * 【为什么必须按 id 存】以前是一个全局的 exportBusy：A 路在导的时候，B 路的
+ * 导出按钮也跟着灰掉 —— 用户切到 B 路想导出，看到按钮是灰的，以为坏了。
+ * 导出现在是队列串行的，但"排队"这件事对用户是**不可见**的：谁的活在跑、
+ * 谁还排在后面，按钮一律显示"导出中…"（见 App.vue 的 exportButtonText）。
+ * 队列只影响按钮的禁用 —— 已经点了的那一路不能重复入队。
  */
-const exportBusy = ref<{ phase: string; outPath: string } | null>(null)
+const exportStates = ref<Record<string, ExportJobState>>({})
 
 /** 服务进程退出过（预览会跟着断，界面要提示重启） */
 const serviceExited = ref<number | null>(null)
@@ -147,6 +211,13 @@ async function pull() {
       wantedProfilesPath?: string | null
       runningProfilesPath?: string | null
       profilesMismatch?: boolean
+      guardian?: {
+        alive?: boolean
+        pid?: number | null
+        restarts?: number
+        lastError?: string
+        lastRestartAt?: string | null
+      }
     }
     const sessions = Array.isArray(res?.sessions) ? res.sessions : []
     live.value = {
@@ -163,6 +234,13 @@ async function pull() {
       wantedProfilesPath: res?.wantedProfilesPath ?? null,
       runningProfilesPath: res?.runningProfilesPath ?? null,
       profilesMismatch: res?.profilesMismatch === true,
+      guardian: {
+        alive: res?.guardian?.alive === true,
+        pid: res?.guardian?.pid ?? null,
+        restarts: Number(res?.guardian?.restarts ?? 0),
+        lastError: String(res?.guardian?.lastError ?? ''),
+        lastRestartAt: res?.guardian?.lastRestartAt ?? null,
+      },
     }
   } catch {
     // 主进程还没准备好 / 窗口正在关：保持上一份快照，别把界面抖成空的
@@ -185,20 +263,52 @@ export function startServiceBus(pollMs = 1000) {
   if (p && typeof p.onServiceEvent === 'function') {
     unlisten = (p.onServiceEvent as (cb: (e: ExportEvent) => void) => () => void)((evt) => {
       if (!evt) return
-      // 导出现在有两路事件：
-      //   * export_result —— 服务自己跑的那条命令通道（仍然保留兼容）
-      //   * export_status —— 界面进程里插件跑导出时，主进程每 400ms 广播一次
+
+      // ---- 导出队列 ----
+      //
+      // 事件有两类：
+      //   * export_queue  —— 队列整份快照（入队 / 出队 / 完成时各播一次）；
+      //   * export_status —— 某一路的进度（带 id），以及它的收尾结果。
+      // 状态按配置 id 分开存，界面据此决定"哪一路的导出按钮该灰"。
+      if (evt.type === 'export_queue' && Array.isArray(evt.items)) {
+        const next: Record<string, ExportJobState> = {}
+        for (const it of evt.items) {
+          if (!it?.id) continue
+          next[it.id] = {
+            id: it.id,
+            name: String(it.name ?? ''),
+            state: it.state === 'running' ? 'running' : 'queued',
+            phase: String(it.phase ?? ''),
+          }
+        }
+        exportStates.value = next
+      }
+
+      const isResult = evt.type === 'export_result' || evt.type === 'export_status'
+      if (isResult && evt.id) {
+        const id = evt.id
+        if (evt.running) {
+          exportStates.value = {
+            ...exportStates.value,
+            [id]: {
+              id,
+              name: String(evt.name ?? ''),
+              state: 'running',
+              phase: String(evt.phase ?? ''),
+            },
+          }
+        } else {
+          const next = { ...exportStates.value }
+          delete next[id]
+          exportStates.value = next
+        }
+      }
       // 只有"收尾了"（running=false 且 ok/failed 有一个为真）才算完成通知，
       // 否则会弹一堆"导出中"的 toast。
-      const isResult = evt.type === 'export_result' || evt.type === 'export_status'
       if (isResult && !evt.running && (evt.ok || evt.failed)) {
         lastExport.value = evt
       }
-      if (isResult && evt.running) {
-        exportBusy.value = { phase: evt.phase ?? '', outPath: evt.outPath ?? '' }
-      } else if (isResult) {
-        exportBusy.value = null
-      }
+
       if (evt.type === 'service_exit') {
         serviceExited.value = Number(evt.code ?? -1)
         live.value = { ...live.value, sessions: [], updatedAt: Date.now() }
@@ -238,7 +348,7 @@ export function useServiceBus() {
   return {
     live: readonly(live),
     lastExport: readonly(lastExport),
-    exportBusy: readonly(exportBusy),
+    exportStates: readonly(exportStates),
     serviceExited: readonly(serviceExited),
     refresh: pull,
   }

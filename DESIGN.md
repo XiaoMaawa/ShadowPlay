@@ -386,14 +386,42 @@ MP4 sink 会静默丢帧（实测 180 帧只剩 150，`avg_frame_rate` 变成 50
 开了之后变成 `nvEncMFTH264x.dll`，CPU 降到 3~4 核，GPU 的 VideoEncode
 引擎吃到 40% 左右。
 
-**已知遗留**：每切一个分片 SinkWriter 都不会把内部的编码 MFT、转换器、
-文件句柄全回收。句柄增长与「建拆 SinkWriter 的次数」成正比 —— 2 秒一片时
-每秒 +10 个（跑 3 分钟 974→2472），10 秒一片降到每秒 +2~3。线程数不涨
-（65~70 波动）、内存也稳（200~230MB），所以是句柄泄漏不是资源失控。
-试过用 `MF_SINK_WRITER_D3D_MANAGER` 交一份常驻 D3D11 设备，但 SinkWriter
-一旦拿到 manager 就要求输入是 D3D 纹理，喂系统内存 RGB32 会得到
-`MF_E_UNSUPPORTED_D3D_TYPE 0xC00D6D76`（而且前 70 多帧照常写盘，之后才
-永久失败，极具欺骗性）。根治要把整条通路改成全程留在 GPU 上，属于独立改造。
+**已知遗留（已量化，判定为可接受）**：每切一个分片 SinkWriter 都不会把内部的
+编码 MFT、转换器、文件句柄全回收。句柄增长与「建拆 SinkWriter 的次数」成正比
+—— 2 秒一片时每秒 +10 个（跑 3 分钟 974→2472），10 秒一片降到每秒 +2~3。
+线程数不涨（65~70 波动）、内存也稳（200~230MB）。
+
+**定性结论（探针实测，见下）**：漏的是**内核句柄**，不是 GDI/USER 句柄。
+GDI 10000 / USER 10000 是硬上限，撞上会直接画不出界面；内核句柄上限在千万级，
+按 2 秒一片算每小时 +1.8 万，要连续跑几十小时才可能成为问题。而回放缓冲只留
+20 秒、录制本身是有界运行，所以这属于「已知、已量化、可接受」，不阻塞交付。
+
+探针数据（1280x720@60、每片 60 帧、写 8 片，`GetProcessHandleCount` +
+`GetGuiResources`）：
+
+| 场景 | 每片句柄增量 | 等 600ms 后 | GDI / USER |
+|---|---|---|---|
+| 硬件编码（NVENC） | +9.2 ~ +11 | **不掉** | 0→4 / 1→4 |
+| 软件编码（mfh264enc） | **+2** | 被回收 | 不变 |
+
+→ 泄漏源确定是 **NVENC 的硬件 MFT 释放路径**，不是容器 muxer，也不是我们的
+样本池（样本池在同一探针里是常驻复用的）。
+
+已试过、都不行的路子：
+
+1. **`MF_SINK_WRITER_D3D_MANAGER` + `MFCreateDXGIDeviceManager`**：能复用设备，
+   但 SinkWriter 一旦拿到 manager 就要求输入是 D3D 纹理，喂系统内存 NV12 会得到
+   `MF_E_UNSUPPORTED_D3D_TYPE 0xC00D6D76`。最坑的是**前 70 多帧照常写盘**，
+   之后 `WriteSample` 才永久失败 —— 极具欺骗性。根治要把整条通路改成全程留在
+   GPU 上（BGRA 采集 → D3D 纹理 → NVENC 直接吃纹理），属于独立改造。
+2. **`writer->Flush(stream)` 后再 Finalize**：句柄增量不变。
+3. **`GetServiceForStream` 取编码 MFT 显式 Release**：SDK 里**根本没有**
+   `MF_SINK_SERVICE_ENCODER_MFT` 这个常量（`mfreadwrite.h` / SDK 全量搜索都没有），
+   这条路走不通。
+4. **延迟回收**：Finalize 后再等 3 秒，句柄数一动不动 → 不是"回收慢"，是真没还。
+
+**不要为了修这个换回软件编码**：软编 1440p@108 是 6.8 个核、整机 34% CPU，
+而句柄泄漏是可接受的量级 —— 这个交换不值得。
 
 导出（`native/backend/Exporter.{h,cpp}`）：`IMFSourceReader` 读各分片的
 H.264 压缩样本 → `IMFSinkWriter` 的 `SetInputMediaType` 传原生类型即
@@ -473,7 +501,110 @@ encAttrs->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed, 20);  // 0=最快 100=�
 修法：取各片 `file_size / 实际时长` 得源码率，上限 = 源码率 × 2
 （留重编码的重新量化余量）。实测 60MB → **15MB**，画质不变。
 
-#### 9.2.4 桌面采集只拷变化区域（实测收益为 0，但代码保留）
+#### 9.2.4 输入样本必须轮转一个池，不能复用同一个 IMFSample
+
+这是「240fps 录出来卡成 PPT」的**唯一根因**，也是本类最隐蔽的坑。
+
+`MfEncoder` 原来只复用**一个** `IMFSample`：每帧把 NV12 写进同一块内存、
+改时间戳、`WriteSample`。低帧率完全正常（60fps 实测 240/240 帧全落盘），
+帧率上去以后问题出现 —— SinkWriter 还没把上一帧下发完，我们就把下一帧
+写进了**同一块内存**。`WriteSample` 照样返回 `S_OK`（所以我们自己的
+`framesInSegment_` 计数也是对的），帧却被**静默丢弃**。
+
+探针 `native/probe_sw_drop.cpp` 的对照数据（2560x1440，4 秒）：
+
+| 场景 | 提交 | 落盘 |
+|---|---|---|
+| 165fps 复用单样本 | 660 | 207 帧（31%） |
+| 165fps 每帧新建 | 660 | 660 帧（100%） |
+| 144fps 复用单样本 | 576 | 130 帧（23%） |
+| 144fps 每帧新建 | 576 | 576 帧（100%） |
+| 60fps 复用单样本 | 240 | 240 帧（100%） |
+
+症状就是主人报的那样：帧数少、`avg_frame_rate` 变成 `51810/329` 这种
+怪分数（PTS 有空洞）、画面几秒才动一下。
+
+修法：轮转一个**够深**的池。池深必须大于「编码器在途帧数」—— 这个值在
+「分片刚开、首帧还没出编码队列」的那一刻最高，所以按最坏情况取整片开头。
+实测池深标定：
+
+| 池深 | 90fps | 120fps | 144fps | 165fps |
+|---|---|---|---|---|
+| 8 | 100% | 100% | 96%（每片少 8~17 帧） | 100% |
+| 16 | 100% | 100% | 96%（272/288） | 100% |
+| **24** | **100%** | **100%** | **100%** | **100%** |
+
+池深按帧率缩放（`EnsureSample()` 里 `depth = fps_ / 6`，夹在 [8, 24]）：
+30fps 只要 8 份（1440p 44MB），144fps 以上取满 24 份（132MB）。
+
+**注意**：`MF_SINK_WRITER_DISABLE_THROTTLING` 不是元凶（它是为了让
+`WriteSample` 不按墙钟节流而必须设的），去掉它会让写阻塞、喂帧线程被
+卡住，反而拖垮采集节拍。
+
+#### 9.2.4.1 投帧的拷贝必须在锁外做
+
+`SegmentRecorder::Feed()` 原来整段 `memcpy` 都在 `slotMu_` 里面。1440p 一帧
+14.7MB、实测约 1.5ms，而喂帧线程取帧要的正是这把锁 —— 等于每次投帧都把它
+堵住 1.5ms。165fps 每帧预算只有 6.06ms，一堵就吃掉四分之一，喂帧线程于是
+总"晚到"、槽里永远是上一拍那帧，只能补重复帧。
+
+修法：`Feed()` 先拷进**采集线程私有的** `writeBuf_`（只有一个生产者，不需要
+保护），再在锁里 `slot_.swap(writeBuf_)`，锁只护住那个 O(1) 的交换。配合
+`MfEncoder::Write()` 直接转进样本缓冲（不经 `nv12Buf_` 中转）以及色度平面
+向量化，60~144fps 的重复帧比例从 30%+ 降到 5~9%。
+
+#### 9.2.4.2 「编码器接受」不等于「喂得满」——吞吐看门狗
+
+硬件编码器对「分辨率 × 帧率」有两个完全不同的门槛：
+
+- **接受门槛**：`SetInputMediaType` 不报 `0xC00D36B4` 就算过。1440p 是 172fps。
+- **喂满门槛**：真的按 1/fps 的节拍喂，能一帧不丢地编码出去的帧率。
+
+两者**不是一回事**。实测 2560x1440：144fps 时 `WriteSample` 只要 0.03ms（负载
+0.3%），165fps 时跳到 **2.25ms（负载 35%~47%）**；加上转换后每帧总成本 6.09ms，
+而 165fps 的预算只有 6.06ms —— 差 0.03ms，喂帧线程就**每一拍都欠一帧**，
+`need` 恒等于 2，每拍写 1 帧真实 + 1 帧重复，真实画面只剩 50%。144fps 同样
+条件下真实画面 91%。
+
+所以「降档到 165」并不够，得降到你真喂得满的那一档。用户原话
+（m15459/m15478）：「那录制切片的时候能否保证不卡顿的最大帧率去录制切片，
+而不是无脑的240fps」「我可以理解降帧率，但是最好不要丢帧」。
+
+`SegmentRecorder::FeederLoop()` 里有一个**吞吐看门狗**：
+
+- 每 1.5 秒汇总一次本窗口写了多少帧、其中多少是重复帧；
+- 重复帧占比 > 40%、且**连续两窗**都超阈值就降一档（165→144→120→90→60）；
+- 只降不升 —— 升回去会来回抖，且每次重开 SinkWriter 要 300~400ms；
+- 降到 60 就不再降（再低就不像回放了）。
+
+「连续两窗」是必须的：拖窗口、开程序、GPU 被别的进程抢一下都会造成一两秒的
+重复帧尖峰，只看单窗会把好端端的 144 一路降到 60。
+
+降档走 `encoder_->SetFps()`，会收掉当前片按新帧率开新片，墙钟靠
+`nextSegStartUnix_` 继续顺延，导出端看到的仍是一条连续时间轴。
+
+实测（2560x1440，各 16 秒，按 `index.csv` 里每片的**真实时长**核对帧数）：
+
+| 配置 | 实际 | 每片落盘 | 真实画面占比 | 丢帧 |
+|---|---|---|---|---|
+| 60 | 60 | 120/120 | 93% | 无 |
+| 90 | 90 | 180/180 | 93% | 无 |
+| 120 | 120 | 240/240 | 91% | 无 |
+
+> **144 / 165 两行已删掉**：帧率上限砍到 120 之后这两档不再可选（见 9.6.1）。
+> 当时 144 是 89%、165 是 79%（含降档过渡）—— 越往上越差，正是「120 以上
+> 全部删除」的依据。看门狗的降档阶梯也同步缩成 `120 → 90 → 60`。
+
+配套的两个计数（`RecorderStats::repeatFrames` / `captureDropped`）必须一起看：
+
+- `repeatFrames` —— 时间轴靠重复帧顶上，帧数不少但画面卡；
+- `captureDropped` —— 采集到的帧被待喂槽顶掉，是降帧率的固有代价。
+
+> **核对帧数时一定要按 `index.csv` 的 `结束秒 - 起始秒` 算期望帧数**，
+> 不能按「帧率 × 分片秒数」。降档瞬间会切出 0.35 秒、0.61 秒这种过渡片，
+> 用固定 2 秒去比会把 100% 误判成 91.8%（踩过）。
+
+#### 9.2.5 桌面采集只拷变化区域（试过，收益为 0，**代码已整段删除**）
 
 `IDXGIOutputDuplication::GetFrameDirtyRects()` 能拿到本帧变化过的矩形，
 `CopySubresourceRegion` 只拷这些块，staging 未覆盖的区域保留上一帧内容
@@ -482,8 +613,13 @@ encAttrs->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed, 20);  // 0=最快 100=�
 
 **实测无效**：`capture` 模式 GPU_3d 仍 18.7%。原因是桌面上的光标一直在闪、
 局部窗口在刷新，dirty 区域占比经常超过一半（代码里超过一半就回退全屏拷，
-因为分块调用的固定开销会吃掉收益）。代码保留着 —— 全屏播视频/全屏游戏时
-它能省下来，只是日常桌面场景用不上。
+因为分块调用的固定开销会吃掉收益）。
+
+**而且有风险**：DXGI 在窗口移动时把变化报告成 `MoveRects`，只处理
+`DirtyRects` 会让被移动的区域内容错位。既然收益是 0，就不该留这个风险 ——
+**整段已删除**，`ScreenCapture::Capture()` 现在是最朴素的
+`CopyResource(staging_, tex)`，源文件里只留下一段说明性注释（见
+`native/backend/ScreenCapture.cpp:571-581`）。
 
 ### 9.3 分片的时间戳：必须记**墙钟**
 
@@ -692,6 +828,14 @@ SinkWriter 只由那个线程碰，从命令线程直接 `Finalize` 会和正在
 `app/main.cjs` 把这一行存进 `live.lastExportPlan` 并写进验收报告的
 `report.exportPlan`，报告自己就带着"为什么补了遮罩"。
 
+**同名不同命的一对字段**：导出状态里「用了几片」有两个名字 ——
+`segmentCount`（插件 `ExportStatusToJs` 报的）和 `segments`（服务经 stdout 发
+`export_result` 时用的）。`app/main.cjs` 的三处消费点（自检报告赋值、
+`export_status` 事件转发、`waitForExportResult`）必须**两边都认**，
+`report.exportSegments = res.segments ?? res.segmentCount ?? 0`。
+漏一边的后果很闷：成片明明是 11 片拼的，报告里 `exportSegments: 0`，
+看着像"导出没读到任何分片"。
+
 ### 9.5 改窗口尺寸不能重开录制器
 
 用户的原话：「如果窗口大小经过调整，会出现服务从头开始录」。
@@ -865,6 +1009,27 @@ SinkWriter 只由那个线程碰，从命令线程直接 `Finalize` 会和正在
 
 #### 9.6.1 帧率超过硬件上限：录制端降档，导出端按**源帧率**铺时间轴
 
+**（2026-10 更新：帧率上限已砍到 120fps）** 主人拍板「直接把 120 以上的帧率
+全部删除，不包括 120fps」。现在 `MfEncoder::kMaxFps = 120`，前端下拉
+`FPS_CHOICES = [5,15,30,60,90,120]`，`Profiles.cpp` 加载时把超过 120 的手写值
+夹回来。理由是 120 以上每一档都实测负收益：
+
+| 档位 | 实测 |
+|---|---|
+| 240 | 1440p 物理上限 172fps，**从来录不到**；以前只能降档到 165 |
+| 165 | 每帧成本 6.09ms（转换 3.24 + `WriteSample` 2.25）顶破 6.06ms 预算 → 每拍欠一帧，真实画面只剩 **50%** |
+| 144 | 真实画面 89~91%，接近可用但已是黄昏档 |
+| **120 及以下** | 真实画面 **89~93%**、落盘 **100%**、PTS 零空洞 —— 稳定区间 |
+
+实测（配置写 `fps: 240`、单路 2560x1440@8Mbps、18 秒）：`targetFps=120`、
+`effectiveFps=120`、`repeatFrames=141/1920`（真实画面 92.7%）、
+`captureDropped=145/1920`、`run.json {fps:120, requestedFps:120}`。
+降档阶梯也跟着缩成 `{120, 90, 60, 30}`（两处：`StartWithFpsFallback` 与 `SetFps`）。
+
+**为什么还留着降档逻辑**：上限夹到 120 之后 1440p / 1080p 基本不会再被拒，
+但 4K（3840x2160 上限 165）之外更小的分辨率、或者别的显卡，仍可能拒绝某个
+帧率。降档是兜底，不是常规路径。
+
 用户原话 (m11559)：「如果帧率设的太高，导出的视频卡成ppt的，不能按照尽可能
 高的帧率去录制的吗」。
 
@@ -884,7 +1049,7 @@ SinkWriter 只由那个线程碰，从命令线程直接 `Finalize` 会和正在
 `000000.mp4` 只有 0 字节 —— 用户看到的就是「录出来卡成 PPT」。
 
 修法 `MfEncoder::StartWithFpsFallback()`：阶梯
-`{240, 165, 144, 120, 90, 60, 30}`，被拒就**在 OpenSegment 外层重开 writer**
+`{120, 90, 60, 30}`，被拒就**在 OpenSegment 外层重开 writer**
 （输出流上挂着旧的 `MF_MT_FRAME_RATE`，同一个 writer 里改不掉），降到编码器
 接受的最高档继续录。只有 `status_.detail` 含 `MF_E_INVALIDMEDIATYPE` /
 `0xC00D36B4` 才降档（权限、磁盘满降帧率没用）。`run.json` 写 `fps`（实际）+
@@ -904,6 +1069,45 @@ SinkWriter 只由那个线程碰，从命令线程直接 `Finalize` 会和正在
 
 **教训**：这个钳制第一版只写在重编码分支里，而「所有分片尺寸一致 + 没有 NO
 SIGNAL」时走的是**直拷**分支 —— 所以钳制形同不存在，白改一次。两条路必须同时改。
+
+#### 9.6.3 喂帧节拍必须跟编码器的实际帧率走，不能跟配置值
+
+用户原话 (m13579)：「就算你录不到240fps，你有个120fps我都没话说了，但是我
+看的画面不到10fps，这有点夸张了」。
+
+**症状（修前，配 240 帧实际降到 165 帧）**：每个分片 329 帧内容正常、片内
+`distinct=317~329`，但**片与片之间解码内容完全相同**（13 片里 10 片逐位置
+MD5 全同），重复间隔直方图 top1=329×665 —— 相邻分片就是同一画面再放一遍。
+20 秒成片只覆盖 13.8 秒真实画面，看起来比 5fps 还卡。
+
+**根因**：`SegmentRecorder` 的 `fps_` 在构造时存的是**配置值 240**；喂帧线程
+按 240 灌帧。但 `MfEncoder::StartWithFpsFallback` 把编码器降到 165 并按 165
+打时间戳、每 `165 × segmentSeconds` 帧切一片。两边节拍错位 1.45 倍：
+
+- 每片 330 帧只用 330/240 = 1.375 秒墙钟就灌满，编码器却把它标成 2 秒内容
+  → **编码器时间轴比真实墙钟快 1.45 倍，画面被慢放 1.45 倍**；
+- `index.csv` 的 `nextSegStartUnix_` 也按 frames/165 顺延，同样快 1.45 倍
+  → 时间戳上"还没发生"的下一段，内容上只好重复上一段。
+
+实测（`%TEMP%\shadow-play\freeze-f240`）：14 秒墙钟落了 12 片（24 秒时间轴），
+`recordFrames` 只有 1979（=141fps）。
+
+**修法**：`SegmentRecorder::Start()` 起完编码器后
+`fps_.store(encoder_->EffectiveFps())`，让喂帧线程和编码器用**同一个**节拍。
+`SetFps()` 热改路径本来就这么做（`SegmentRecorder.cpp:885`），只有 `Start()`
+漏了。`run.json` 的 `requestedFps` 因此改用 `encoder_->RequestedFps()`
+（`fps_` 被覆盖后就再也读不到配置值了，`MfEncoder` 必须自己记一份）。
+
+**修后实测**（`scripts/tmp-f240-check.mjs 240 16`，已删）：16 秒录制 6 片、
+墙钟间隔严格 2000ms 零断档、`run.json {fps:165, requestedFps:240}`、
+detail=「录制中（硬件编码器最高接受 165 帧，已从配置的 240 帧降下来）」；
+分片 `distinct=329/329`（全是真画面）、**跨片逐位置相同 = 0/329**；抽帧
+3.56MB/3.57MB 真实桌面内容。回归 `test-recording.mjs 20` / `test-export.mjs 30`
+双通过。
+
+**附带说明**：status 里的 `actualFps` 是采集循环每秒的圈数（配 240 就报 240），
+**不是真实编码帧率**；真实节拍看 `recordFrames` 增速（本机 16 秒 1944 帧
+≈121fps，受采集端限制，属正常）。
 
 #### 9.6.2 混合帧率：成片必须是恒定帧率，两条路都要管
 
@@ -977,10 +1181,206 @@ exports/desktop-01_Replay_2026.10.16_18-03-12.mp4
 配置变更时新建；同一路录制器在窗口尺寸变化时不再重开，见 9.5；
 帧率变了则照旧重开（时间轴基准变了），导出端按 9.6 的办法对齐。）
 
+#### 9.7.1 为什么会有 `1/ 2/ 3/` 这么多轮次目录
+
+用户在资源管理器里翻 `records/1/segments/` 时看到 `1`、`2`、`3` 三个目录，
+会以为程序在重复建目录、浪费磁盘。**不是**，规则只有一条：
+
+> **一路配置每「重开一次录制器」，就往下分配一个新轮次号**，从 `1` 开始递增。
+
+重开录制器的触发条件只有四种（`SegmentRecorder::Start`）：
+
+1. **服务进程重启**（每次启动都是全新的轮次 1，同时回收旧轮次）。
+2. **配置变更**（改了源、帧率、码率、回放时长、分片时长 —— 见
+   `Profile::SameSettingsIgnoringFpsBitrate` 那三级判定）。
+3. **窗口源的尺寸变化**（WGC 内容尺寸变了 → `Session::EnsureRecorder` 换
+   录制器；见 9.5 的尺寸跟随）。
+4. **编解码器协商失败后的降档重开**（见 9.2.6 的帧率阶梯）。
+
+旧轮次**不会一直堆着**：每次开新轮次时回收旧目录，只留
+`keepRuns = max(2, keep/4)` 个（`keep = ceil(回放秒数/分片秒数)`）。
+回放 20 秒 / 分片 2 秒时 `keep = 10` → 留 2 个旧轮次。所以磁盘上最多看到
+3 个目录（当前 + 2 个旧的），多余的会被删掉。
+
+**导出只读最新那一轮**吗？不是。`Exporter::ListSegments` 会**递归**扫
+`segments/` 下所有轮次目录，每片的名字前面拼上 `<轮次>__` 去重，再按
+`index.csv` 里的墙钟起点统一排序（见 9.5.1）。这是「跨轮次凑满 20 秒」
+能成立的原因 —— 轮次换了但时间轴是连续的。
+
 ### 9.8 暂不做音频
 
 只出视频轨。ffmpeg 命令行先不加 `-f dshow` 之类，后续要加是在
 编码线程里再挂一个 WASAPI loopback 捕获。
+
+### 9.9 GPU 占用的实测拆分（哪个数能降、哪个不能）
+
+用户报过「electron 占 15% GPU、shadow-capture 占 50%」，问能不能压下来。
+用 `\GPU Engine(*)\Utilization Percentage` 按 pid + 引擎类型拆开实测
+（三路配置：桌面 240fps / 窗口 30fps / 一路匹配不到），**结论是各有归因，
+大部分已经是必要开销**：
+
+| 进程 | 引擎 | 占用 | 归因 |
+|---|---|---|---|
+| `shadow-capture.exe` | videoencode | 19~27% | NVENC 真的在编码 1440p，这是它的本职工作 |
+| `shadow-capture.exe` | 3d | 13~19% | `CopyResource(staging, tex)` 全屏拷贝 + BGRA→NV12 的 GPU 侧读写 |
+| `shadow-capture.exe` | copy | 5~7% | 共享内存上传 |
+| `electron` gpu-process | 3d | 11~21% | 把 1440p 纹理合成到可见窗口 |
+| `dwm.exe` | 3d | ~18% | 系统合成器，跟本程序无关 |
+
+两条**实测出来的关键事实**（避免以后重复试错）：
+
+1. **窗口最小化后 electron 的 3d 从 21% 掉到 0.2%**。说明那 21% 完全来自
+   「把画面合成到一块可见的窗口」这一步，不是纹理上传、不是 rAF 空转。
+   用户想看预览就得付这个钱；不想付就最小化。**没有代码层面的旋钮。**
+2. **`previewFps` 确实影响 electron 的 3d**，但只在低档有效，超过 60 就饱和：
+
+   | previewFps | 不限 | 15 | 30 | 60 | 144 | 240 |
+   |---|---|---|---|---|---|---|
+   | electron 3d | 20.9~23.5% | **8.8%** | **11.1%** | 13.8~15.9% | 21.0% | 21.0% |
+   | 服务端实际发布 | 315~372/s | 51/s | 93/s | 169/s | — | — |
+
+   144 和 240 都是 21% 是因为**采集端天花板约 140fps**（见 9.2），预览再高也
+   没有更多新帧可画。想要省 GPU 就把预览帧率设成 30 或 15（设置页可调，见
+   `set-preview-fps` 命令）。**默认值就是 60**（`app/main.cjs` 的
+   `DEFAULT_SETTINGS.previewMaxFps = 60`，存在 `%TEMP%\shadow-play\app`
+   根下的 `settings.json`；注意这个文件名在 `temp-clean.cjs` 的
+   `KEEP_ROOT_FILES` 白名单里，否则每次启动都会被清掉、表现成"设置不保存"）。
+
+2.1 **预览不是"越不限越好"——`previewFps=0` 反而拖累录制**（实测同一份配置、
+    240 配置降到 120 档后各观察 20 秒）：
+
+    | previewFps | 服务端发布 | 采集实际 fps | 每拍耗时 | 真实画面占比 |
+    |---|---|---|---|---|
+    | 0（不限） | 111.6/s | 111.0 | 4.98 + 1.98 = 6.96ms | 82.0% |
+    | 60 | 57.4/s | **120.0** | 4.14 + 1.73 = 5.87ms | **86.3%** |
+
+    机制：`Ring::Publish` 是**在采集线程里做的**（见 `Session.cpp` 的
+    `previewPublished` 累加点），不限就等于让采集线程把每一帧都往共享环里
+    搬一次；搬到 111/s 时每拍多花 0.84ms，正好把 120fps 的 8.33ms 预算顶破，
+    采集节拍掉到 111fps，喂帧端于是只能补重复帧。
+    → **"不限"只该当调试开关，不是省事的最优档。** 60 是更划算的默认值。
+
+3. **试过并回退的**：桌面采集做 DirtyRects 局部拷贝 —— 实测 GPU_3d **零收益**
+   （光标闪烁让 dirty 区域恒过半屏），而且窗口移动时 `MoveRects` 会错位，
+   已整段删除，回到全屏 `CopyResource`。
+
+顺带修掉的一处真实浪费：`frameRenderer.draw()` 原来每帧对 `u_tex`、`u_scale`
+各调一次 `getUniformLocation`。这是**同步的 JS↔GL 往返**，144Hz 预览下
+就是 288 次/秒压在渲染主线程上，而主线程同时还要做纹理上传。改成构造时
+查一次、字段缓存（`uTexLoc` / `uScaleLoc`），行为不变。
+
+### 9.10 「没有界面时状态永远停在 waiting」——状态该由采集健康度决定
+
+这一条是**排查 `npm run probe` 一直失败时顺手挖出来的真 bug**，比它表面看起来重要。
+
+**症状**：服务单独跑（不启动 Electron）时，状态文件里每一路的 `state` 恒为
+`waiting`，`detail` 却是「整屏（显示器 0）」，`recordFrames` 一路在涨、分片
+一张张落盘 —— 也就是**录得完全正常，只是对外宣称自己在等**。
+
+**根因**：`native/backend/Session.cpp` 的采集循环里，`status_.state = Live`
+只写在两个分支之一：
+
+```cpp
+if (ring_.WaitForConsumer(0)) {          // 有界面连上来
+    ...
+    if (lastFrameOk) status_.state = SessionState::Live;
+} else {                                  // 没有界面
+    waitingSkip = true;                   // ← 原来这里什么都不写
+}
+```
+
+而 `WaitForConsumer(0)` 为假正是**常驻录制的常态**（服务独立跑、用户没开界面）。
+于是「服务在正常录」和「服务在等界面」被混成了一件事。
+
+**为什么危险**：`state` 是自检、验收脚本、界面遮罩共同的判据。本鱼自己就
+至少被它误导过三次 —— `scripts/test-budget.mjs` 的「采样前必须等每一路进入
+稳定状态」、`test-reload.mjs` 里专门写的 `waitStable()`、以及
+`test-pipe.mjs` 输出里那行 `"state":"waiting"`，都是围着这个假状态打的补丁。
+
+**修法**：`else` 分支里补上同一条判据 ——
+
+```cpp
+} else {
+    waitingSkip = true;
+    if (lastFrameOk) {
+        std::lock_guard<std::mutex> lk(mu_);
+        status_.state = SessionState::Live;
+        status_.consumerPid = 0;
+    }
+}
+```
+
+**规矩**（本文件 9.2 顶上那段注释早就立过，这里是它的一次复盘）：
+`state` 只能由**采集链路通不通**决定，跟有没有人看无关。消费者在不在只影响
+要不要 `Publish`（`FrameRing::Publish()` 在 `consumerPid == 0` 时直接返回），
+不影响这一路是否在正常录制。
+
+实测：同一个 profile（单路 desktop 1440p@144、无界面）修前 `state=waiting`、
+修后 `state=live` + `detail="整屏（显示器 0）"` + `consumerPid=0`，
+`recordFrames=2592`、`repeatFrames=208`（8%）、`captureDropped=199`（7.7%），
+录制行为一个字节都没变。
+
+#### 9.10.1 上面那个修法**还不够** —— 还有个「先起服务、后开界面」的窗口
+
+上面那一版把 `if (lastFrameOk) status_.state = Live` 补进了 `else` 分支，
+但**两个分支都在 `if (!connected)` 里面**：
+
+```cpp
+if (!connected) {
+    if (ring_.WaitForConsumer(0)) { ... if (lastFrameOk) state = Live; }
+    else { waitingSkip = true; if (lastFrameOk) state = Live; }
+} else if (loopStart - lastConsumerCheck >= 500ms) {
+    // 只更新 consumerPid，不碰 state
+}
+```
+
+于是状态的写入被绑在了「**这一次**进入循环时有没有消费者」上，而
+`lastFrameOk` 是第一拍才算出来的结果、第一拍必然是 `false`。两个条件一叠加
+就出现一个**永久**卡死的窗口：
+
+1. 服务先起来（没有界面）→ 一直走 `else`，第一拍 `lastFrameOk` 还是
+   `false`，写不成 Live；
+2. 界面随后连上来 → `WaitForConsumer(0)` 成功、`connected` 置真，
+   **那两个分支从此再也不进**；
+3. `status_.state` 永远停在循环开始前写下的 `Waiting`。
+
+实测现场（`npm start` 之后 20 秒的状态文件）：
+
+```
+p-desk   state=waiting  consumerPid=13140  actualFps=131  recordFrames=5509
+p-win    state=waiting  consumerPid=13140  recordFrames=…
+p-missing state=disabled
+```
+
+`consumerPid` 非零说明消费者明明在、`recordFrames` 在涨说明录制明明正常 ——
+只有这一个字段在撒谎。
+
+**修法**：把「采集健康就是 Live」从分支里**提出来，每拍都判一次**，
+紧跟 `lastFrameOk = frameAction;` 之后：
+
+```cpp
+if (frameAction) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (status_.state == SessionState::Waiting ||
+        status_.state == SessionState::Starting) {
+        status_.state = SessionState::Live;
+    }
+}
+```
+
+**只覆盖 `Waiting` / `Starting`**，这是这条修法的关键约束：`Reconnecting`
+（正在重建采集）、`Failed`（等窗口回来）、`Disabled`（被禁用）、`AccessLost`
+都是别人刚写下的、比"采集这一拍出了帧"更具体的结论，这里不许冲掉它们 ——
+否则就重演 9.2 顶上那条「NO SIGNAL 撤不掉」的老账（重建期间状态被一拍一拍
+刷回 Live，界面遮罩永远盖不上）。
+
+实测（回环验证，三种启动顺序都试）：
+
+| 场景 | 修前 | 修后 |
+|---|---|---|
+| `npm start`（服务 + 界面同时起） | 全程 `waiting` | `p-desk` / `p-win` 都 `live` |
+| 服务单独跑、无界面 | 第一版修好，第二版退化成 `waiting` | `t=3s..15s` 全程 `live`、`consumerPid=0`、`recordFrames` 29→395 |
+| 界面后连上 | 卡在 `waiting` | 保持 `live` |
 
 ---
 
@@ -993,7 +1393,7 @@ exports/desktop-01_Replay_2026.10.16_18-03-12.mp4
 | WebGL context 数量上限（通常 16） | 配置多了预览黑屏 | 只给可见的配置分配 context，LRU 复用 |
 | WGC 对受保护窗口出黑帧 | 录到黑屏 | 上报 `source_black`，界面提示 |
 | 机器缺 H.264 编码器（Media Foundation） | 录不了 | `MfAcquire()` 自检时探测，失败就在状态里报 `建分片写入器失败`，预览仍可用 |
-| 每切一片 SinkWriter 漏句柄 | 跑久了句柄数持续上涨（2 秒一片约 +10/秒） | 已量化，非线程/内存泄漏；根治需全 GPU 通路（见 9.2 已知遗留） |
+| 每切一片 SinkWriter 漏句柄 | 跑久了句柄数持续上涨（2 秒一片约 +10/秒）；**漏的是内核句柄，GDI/USER 不涨** | 已量化并判定可接受：内核句柄上限千万级，2 秒一片每小时 +1.8 万；GDI/USER 各 10000 硬上限不涨就没有崩溃风险。四条修法都试过（D3D manager / Flush / GetServiceForStream / 延迟回收）均无效，根治需全 GPU 通路（见 9.2 已知遗留） |
 | 导出时"没有样本就 `Finalize()`" | `0xC00D4A44` = `MF_E_SINK_NO_SAMPLES_PROCESSED` | 导出前先确认 `totalFrames > 0`；补 NO SIGNAL 后天然不会空（见 9.4） |
 | 槽位轮转瞬间分片是 0 字节 | 复制分片报「字节数不对（期望 N，实际 0）」导致整次导出失败 | 复制重试 3 次，仍失败就跳过那一项继续导出，摘要里说明少了几片 |
 | 窗口刚变宽时 WGC 的 `ContentSize` 比已绘制的区域大 | 若只按 `ContentSize` 取内容，右侧会带一条未绘制区 | 变大走"立刻切一片"路径（新片按精确尺寸开）；拖小走 `WritePadded` 1:1 贴左上角补黑，不会把未绘制区当成画面内容；导出端再按 `index.csv` 第五/六列裁真实内容尺寸（9.5.2/9.5.3） |

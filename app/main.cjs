@@ -17,8 +17,22 @@
 
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron')
 const { spawn, spawnSync } = require('node:child_process')
-const { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } = require('node:fs')
+const net = require('node:net')
+const { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } =
+  require('node:fs')
 const path = require('node:path')
+
+// 控制台 UTF-8：中文 Windows 默认按 GBK(936) 解我们的 UTF-8 日志，于是所有
+// 中文 console.log 都变成「宸叉竻鐞…」。launch.mjs 启动时已经 chcp 过一次，
+// 但本文件是 Electron 主进程，单独启动（如直接 `electron .`）时要自己保命。
+// chcp 改的是控制台对象的代码页（不是某个进程），对后续输出立即生效。
+if (process.platform === 'win32') {
+  try {
+    spawnSync('cmd', ['/c', 'chcp', '65001'], { stdio: 'ignore', windowsHide: true })
+  } catch {
+    /* 切不了也不影响功能，只是日志仍是乱码 */
+  }
+}
 
 const { SERVICE_SESSION_ID } = require('./service-const.cjs')
 const { probe } = require('./probe-core.cjs')
@@ -65,7 +79,10 @@ const ARTIFACT_DIR = path.join(PROJECT_ROOT, 'native', 'build', 'artifacts')
 // 目录"。
 const EXPORT_DIR = path.join(PROJECT_ROOT, 'export')
 
-const { TEMP, TEMP_ROOT, ensureServiceExe, sweepStaleRoots, markOwner } = require('./temp-const.cjs')
+const { TEMP, TEMP_ROOT, sweepStaleRoots, markOwner } = require('./temp-const.cjs')
+// 守护进程由采集服务自己拉起（--guard 模式），这里只读它的心跳：界面顶栏
+// 显示"守护在岗/未运行"，不去管它的生死。详见 native/backend/GuardianMode.h。
+const { guardianSnapshot } = require('./guardian.cjs')
 const { cleanOnStartup } = require('./temp-clean.cjs')
 
 // 先扫一遍 %TEMP%/shadow-play/ 下面的**旧实例**：每个实例的根目录里有一份
@@ -124,26 +141,24 @@ markOwner(TEMP_ROOT, 'app')
 const log = (...a) => console.log('[main]', ...a)
 const logErr = (...a) => console.error('[main]', ...a)
 
-// 实际要跑的那份采集服务 exe。
+// 实际要跑的那份采集服务 exe：**就是编译产物本身**，native/build/shadow-capture.exe。
 //
-// 不是直接用 native/build 下那个原件：Windows 的文件完整性级别是继承来的，
-// 仓库目录若带 Low 标签（DSH 沙箱、同步盘会打），原件也带，跑起来会被系统
-// 拒绝 WGC 抓屏、也写不进 %TEMP% 里的录制目录。ensureServiceExe 会把它复制到
-// 临时根再跑（带缓存，只在源文件变化时复制）。详见 app/temp-const.cjs。
+// 【为什么不复制到 %TEMP% 再跑 —— 那条路踩过两次，已经废掉】
+// 以前这里走 ensureServiceExe()：把 exe 拷一份到 %TEMP%/shadow-play/app/bin/ 再
+// 启动，理由是"仓库目录可能带低完整性标签，从那里起的进程会被 WGC 拒绝"。
+// 实际代价远大于收益：
 //
-// 【服务已经在跑时一定不要碰副本】ensureServiceExe 换副本的流程是"先删旧的
-// 再拷新的"，而正在运行的服务就是那**同一个文件**：删掉它虽然不会立刻弄死
-// 已经在跑的进程，但紧接着 main.cjs 自己那份 ready 判定会拿一个刚被换过、
-// 还没来得及被新服务接管的文件去起进程 —— 实测表现是界面起来了、服务没了。
-// 而 npm start 正是 launch.mjs 先起服务、再起界面的，每次都踩这一下。
-// 所以活着的时候直接复用现有副本（它本来就在跑，内容一定是对的）。
-const SERVICE_EXE = serviceAlive
-  ? path.join(TEMP_ROOT, 'bin', path.basename(BACKEND_PATH))
-  : ensureServiceExe({
-      srcExe: BACKEND_PATH,
-      tempRoot: TEMP_ROOT,
-      log: (m) => console.log('[main]', m),
-    })
+//   1. 副本是**第二个真实存在的可执行文件**，于是"服务在用哪一份"成了新的
+//      状态。界面启动清理把 bin/ 删掉之后，SERVICE_EXE 永久指向一个不存在的
+//      路径：探测不到 → 自动启动 → 还是那个不存在的路径 → 起不来。表现就是
+//      界面一直「正在连接…」，任务管理器里也没有采集服务。
+//   2. 服务已经在跑时，副本**不能刷新**（换文件会弄死正在跑的进程），于是
+//      重新编译出来的 exe 在老服务活着时永远用不上，"改了没生效"的排查成本
+//      全压在这上面。
+//
+// 只跑一份编译产物，上面两类问题一起消失：路径恒定、永远不会"指向不存在
+// 的文件"、重编译后重启服务就一定生效。
+const SERVICE_EXE = BACKEND_PATH
 
 // 必须在任何 app.* 调用之前设置 userData：
 //   1. 默认位置（%APPDATA%）在受限终端/沙箱下可能写不进去，
@@ -214,6 +229,13 @@ function serviceRunningFast() {
 // ---------------------------------------------------------------------------
 const SETTINGS_FILE = path.join(TEMP.root, 'settings.json')
 
+// 帧率上限：录制侧与预览侧共用 120（后端 `MfEncoder::kMaxFps` 同值）。
+//
+// 以前这里是 240 —— 那时候还想着「240Hz 显示器 + 240 帧录制」。实测之后
+// 这个想法站不住：1440p 的硬件编码器物理上限只有 172fps，165 那档的每帧
+// 成本已经顶破帧预算、真实画面只剩一半。主人拍板「120 以上的帧率全删」。
+const MAX_FPS = 120
+
 const DEFAULT_SETTINGS = {
   // 预览画面最大帧率。0 = 不限（跟随采集帧率）。
   //
@@ -242,9 +264,9 @@ function loadSettings() {
   const out = { ...DEFAULT_SETTINGS }
   if (raw && typeof raw === 'object') {
     const fps = Number(raw.previewMaxFps)
-    // 夹到 0..240：0 表示不限，负数/NaN/离谱的大数都当没填。
-    // 上限 240 是采集端能跑到的天花板（240Hz 显示器），再高只会白耗带宽。
-    if (Number.isFinite(fps)) out.previewMaxFps = Math.max(0, Math.min(240, Math.round(fps)))
+    // 夹到 0..MAX_FPS：0 表示不限，负数/NaN/离谱的大数都当没填。
+    // 上限跟录制侧一致（120）—— 预览再高也没有更多新帧可画。
+    if (Number.isFinite(fps)) out.previewMaxFps = Math.max(0, Math.min(MAX_FPS, Math.round(fps)))
   }
   return out
 }
@@ -255,7 +277,7 @@ function saveSettings(patch) {
   if (patch && typeof patch === 'object') {
     if (patch.previewMaxFps !== undefined) {
       const fps = Number(patch.previewMaxFps)
-      if (Number.isFinite(fps)) next.previewMaxFps = Math.max(0, Math.min(240, Math.round(fps)))
+      if (Number.isFinite(fps)) next.previewMaxFps = Math.max(0, Math.min(MAX_FPS, Math.round(fps)))
     }
   }
   try {
@@ -292,6 +314,22 @@ function statusFilePath() {
   return path.join(TEMP.root, 'status', 'status-v1.json')
 }
 
+/**
+ * 某个 pid 现在还活着吗。
+ *
+ * `process.kill(pid, 0)` 不投递信号，只做存在性/权限检查：进程不存在抛
+ * ESRCH，存在但没权限抛 EPERM（那也是活着）。
+ */
+function pidAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return Boolean(e) && e.code === 'EPERM'
+  }
+}
+
 /** 读一份状态文件。读不到 / 解析失败 / 太旧，都返回 null（当"没有镜像"处理）。 */
 function readStatusFile() {
   const file = statusFilePath()
@@ -302,6 +340,13 @@ function readStatusFile() {
     const ageMs = Date.now() - st.mtimeMs
     if (ageMs > 8000) return { file, ageMs, mtimeMs: st.mtimeMs, stale: true, doc: null }
     const doc = JSON.parse(readFileSync(file, 'utf8'))
+    // 【光看 mtime 不够】服务被杀掉之后文件还是刚写的、mtime 依然"新鲜"，
+    // 于是 serviceRunningFast() 会误判"服务还在跑"、进而跳过自动拉起 ——
+    // 表现就是"服务死了但界面一直说在跑、预览和录制都没有画面"。
+    // 再核一下文件里记的 pid 是否还活着，才算数。
+    if (!pidAlive(Number(doc && doc.pid))) {
+      return { file, ageMs, mtimeMs: st.mtimeMs, stale: true, doc: null }
+    }
     return { file, ageMs, mtimeMs: st.mtimeMs, stale: false, doc }
   } catch {
     return { file, ageMs: null, mtimeMs: 0, stale: false, doc: null }
@@ -398,6 +443,10 @@ function launchService() {
   if (!existsSync(SERVICE_EXE)) {
     return { ok: false, error: `找不到采集服务：${SERVICE_EXE}\n请执行 npm run build:native` }
   }
+  // 启动前清掉可能残留的停机哨兵（上次干净退出留下的），免得它挡住本次启动。
+  try {
+    rmSync(path.join(TEMP_ROOT, 'status', 'shutdown-requested'), { force: true })
+  } catch {}
   if (serviceRunning() === true) {
     // 系统里已经有采集服务，复用它 —— 但**要说清楚是不是同一份配置**。
     //
@@ -441,8 +490,17 @@ function launchService() {
   const file = profilesPath()
   serviceChild = spawn(SERVICE_EXE, ['--profiles', file], {
     cwd: PROJECT_ROOT,
-    // stdin 留着给导出命令用，stdout 读状态，stderr 只记日志。
-    stdio: ['pipe', 'pipe', 'pipe'],
+    // 【stdin 必须是 ignore，不能是 pipe】
+    //
+    // 服务是"关掉界面也要继续录"的常驻进程。可它的 stdin 一旦是界面给的管道，
+    // 界面进程没了、管道就断 —— 服务那边读到 EOF，直接把自己退了。实测：
+    // 界面 spawn 的服务 pid 33616，界面一关，进程列表里立刻没有
+    // shadow-capture.exe，用户看到的就是"后台服务不启动了"。
+    //
+    // 命令通道不依赖它：sendServiceCommand() 主通道是命名管道
+    // （\\.\pipe\ShadowPlay.Cmd.v1，谁起的服务都能连），stdin 只是老版本的兜底。
+    // 用 ignore 换来的是"界面生死与服务无关"。
+    stdio: ['ignore', 'pipe', 'pipe'],
     // detached：服务必须在界面退出后继续常驻（用户要求：Electron 退出，
     // 服务不能退）。Windows 上 libuv 会在 detached 时带上
     // CREATE_BREAKAWAY_FROM_JOB —— 没有它，Electron（Chromium）把自己的
@@ -451,8 +509,9 @@ function launchService() {
     // 脱离那个作业对象，界面生死与它无关。
     detached: true,
     windowsHide: true,
+    // 托盘「打开主界面」要用它找到 node.exe（见 native/backend/TrayIcon.cpp）。
+    env: { ...process.env, SHADOW_NODE_EXE: process.execPath },
   })
-
   const out = makeLineSplitter(ingestServiceLine)
   serviceChild.stdout.on('data', (d) => out(d.toString('utf8')))
   serviceChild.stderr.on('data', (d) => {
@@ -634,8 +693,38 @@ function pipeSend(cmd) {
 const PROFILE_SOURCE_KINDS = new Set(['desktop', 'monitor', 'window'])
 const MATCH_FIELDS = new Set(['process', 'title', 'class'])
 const MATCH_MODES = new Set(['exact', 'contains', 'prefix', 'regex'])
+// 匹配方式（四个显式选项）：应用程序永远是必要条件，其余字段是叠加条件（AND）。
+// 和 native/backend/Profiles.h 的 MatchRule、frontend 的 MATCH_RULE_OPTIONS
+// 必须是同一套字符串，三处任何一处写错都会让"界面选了 A、服务按 B 跑"。
+const MATCH_RULES = new Set(['process', 'title+process', 'class+process', 'title+class+process'])
+const MATCH_RULE_FIELDS = {
+  process: ['process'],
+  'title+process': ['title', 'process'],
+  'class+process': ['class', 'process'],
+  'title+class+process': ['title', 'class', 'process'],
+}
 // 「同时命中多个窗口时挑哪个」的候选值已经不在界面上了（固定 largest），
 // 这里不再保留 MATCH_PICKS —— 留着一个没人用的集合只会让人以为还能配置。
+
+/**
+ * 老配置没有 rule 键时推断一档。
+ *
+ * 【三处必须一致】native/backend/Profiles.cpp 的 WindowMatch::Normalize、
+ * frontend/src/App.vue 的 deriveMatchRule、以及这里。任何一处不一致，用户就会
+ * 遇到"界面显示按名字+应用程序、服务却按只匹配应用程序在跑"这种鬼故事。
+ */
+function deriveMatchRule(m) {
+  const given = String(m?.rule ?? '').trim()
+  if (MATCH_RULES.has(given)) return given
+  const order = Array.isArray(m?.byOrder) && m.byOrder.length ? m.byOrder : [String(m?.by ?? 'title')]
+  const primary = String(order[0] ?? 'title')
+  if (primary === 'process') return 'process'
+  if (primary === 'class') return 'class+process'
+  if (String(m?.title ?? '').trim()) return 'title+process'
+  if (String(m?.className ?? '').trim()) return 'class+process'
+  return 'process'
+}
+
 
 function profilesPath() {
   // --gui-export 默认拿仓库里那份 profiles.json：界面上"看得见的配置"必须和
@@ -681,7 +770,9 @@ function normalizeProfiles(payload) {
         wgc: p?.source?.wgc !== false,
       },
       video: {
-        fps: Math.round(clampNum(p?.video?.fps, 1, 240, 60)),
+        // 上限跟录制侧一致（120）；老配置里手写的 240 在这里就被夹回来，
+        // 不用等服务端 MfEncoder::kMaxFps 兜底（那样界面显示的还是 240）。
+        fps: Math.round(clampNum(p?.video?.fps, 1, MAX_FPS, 60)),
         bitrateMbps: Math.round(clampNum(p?.video?.bitrateMbps, 1, 200, 20)),
         replaySeconds: Math.round(clampNum(p?.video?.replaySeconds, 5, 3600, 120)),
         segmentSeconds: Math.round(clampNum(p?.video?.segmentSeconds, 1, 60, 2)),
@@ -694,17 +785,15 @@ function normalizeProfiles(payload) {
       createdAt: String(p?.createdAt || new Date().toISOString()),
     }
     if (kind === 'window') {
-      // 匹配优先级的默认：标题 > 窗口类名 > 进程 exe。
-      // 理由：标题最精确（同一程序开两个窗口只有标题能分开），但会随文档变；
-      // 类名稳定但一个 exe 的多个窗口常同类；exe 名最稳也最粗。
-      // 用户在界面上拖动可以改这个顺序。
-      const order = Array.isArray(p?.match?.byOrder)
-        ? p.match.byOrder.filter((v) => MATCH_FIELDS.has(v))
-        : []
-      const byOrder = order.length ? [...new Set(order)] : ['title', 'class', 'process']
+      // 匹配方式：从界面下拉来的一档（四个取值之一），老配置按首选字段推断。
+      //
+      // 以前这里写的是"标题 › 类名 › exe"三档降级顺序，那个模型会让标题一
+      // 变就降到类名、进而录到同类的另一个窗口，已经整个换掉了。
+      const rule = deriveMatchRule(p?.match)
       entry.match = {
-        by: pick(p?.match?.by, MATCH_FIELDS, byOrder[0] ?? 'title'),
-        byOrder,
+        rule,
+        // by 只为"不认识 rule 的老服务"留个能读的键
+        by: pick(p?.match?.by, MATCH_FIELDS, MATCH_RULE_FIELDS[rule][0]),
         mode: pick(p?.match?.mode, MATCH_MODES, 'contains'),
         pattern: String(p?.match?.pattern ?? ''),
         // 同时命中多个窗口时一律取面积最大的那个 —— 界面上已经没有这个选项，
@@ -713,11 +802,17 @@ function normalizeProfiles(payload) {
         pollMs: Math.round(clampNum(p?.match?.pollMs, 100, 60000, 1000)),
         // 只匹配可见窗口：开关已从界面删掉，固定 true（最小化/隐藏的窗口不录）。
         requireVisible: true,
-        // 用户从下拉里挑窗口时顺手记下的三份指纹，重排优先级时用来重填 pattern。
-        // 只是给界面的备忘，C++ 侧不读（它只认 byOrder + pattern）。
+        // 用户从下拉里挑窗口时记下的三份指纹。C++ 侧按 rule 决定用其中哪几份，
+        // 全部 AND —— 少一份就匹配不上，这一路保持未采集。
         title: String(p?.match?.title ?? ''),
         className: String(p?.match?.className ?? ''),
         process: String(p?.match?.process ?? ''),
+        // 挑中的那个窗口（偏好，不参与条件比较）。必须透传：丢掉它的话，每次
+        // 保存都会把"用户选的是同一个程序的哪个窗口"抹掉，只匹配应用程序时
+        // 又退回"永远录面积最大的那个"。
+        // 一律存无符号 32 位（和 C++ 侧 BuildWindowsJson 的输出、AsU32 的读取
+        // 范围一致）：这个范围内 JS 的 Number 是精确的，不会在 JSON 里丢精度。
+        hwnd: Math.min(4294967295, Math.max(0, Math.trunc(Number(p?.match?.hwnd ?? 0)) || 0)),
       }
     }
     return entry
@@ -792,16 +887,316 @@ function loadAddon() {
   return addonForExport
 }
 
-// 把插件侧的导出状态镜像到 liveExport，让 service:live 立刻能看到 running/ok，
-// 不必等下一轮轮询（轮询周期 1 秒，用户点了导出却一秒内看不到"导出中"很怪）。
-let liveExport = null
-function mirrorExportStatus() {
+// ---------------------------------------------------------------------------
+// 导出队列
+//
+// 【为什么要有队列】
+//
+// 插件里那个 Exporter 是**单例**：上一轮还在跑时 exportStart 直接回
+// "上一轮导出还没结束"。以前界面只有一个全局的 exportBusy，A 路在导的时候
+// B 路的按钮也跟着灰掉 —— 用户点了没反应，还以为坏了。
+//
+// 现在改成：每一路点导出只是**入队**，主进程串行地把队列里的活一个个干完；
+// 界面按 profile id 各记一份状态，谁的活在跑谁自己灰自己的按钮，互不牵连。
+//
+// 为什么串行而不是并发：Exporter 是重 IO + Media Foundation 的重活，同时跑
+// 两个只会互相拖慢，而且插件根本不支持（单例）。
+// ---------------------------------------------------------------------------
+/** 等待中的导出任务（不含正在跑的那个）。 */
+const exportQueue = []
+/** 正在跑的导出任务（null = 空闲）。 */
+let exportRunningJob = null
+
+/** 读一次插件侧的导出状态（失败不抛，返回 null）。 */
+function readExportStatus() {
   try {
-    const st = loadAddon().exportStatus?.()
-    if (!st) return
-    liveExport = { ...st, at: Date.now() }
+    return loadAddon().exportStatus?.() ?? null
   } catch (err) {
     logErr('读取导出状态失败：', err.message)
+    return null
+  }
+}
+
+/** 队列当前的样子（界面按 id 各取一份自己的状态）。 */
+function exportQueueSnapshot() {
+  const items = []
+  if (exportRunningJob) {
+    items.push({
+      id: exportRunningJob.id,
+      name: exportRunningJob.name,
+      state: 'running',
+      phase: exportRunningJob.phase || '导出中',
+    })
+  }
+  for (const j of exportQueue) {
+    // 排队的那几项也报"导出中"：队列顺序是内部实现，界面不展示"排队中"
+    // （用户点了导出就该看到导出中，而不是"排第 3 位"）。
+    items.push({ id: j.id, name: j.name, state: 'queued', phase: '导出中' })
+  }
+  return items
+}
+
+/** 广播一条事件给所有窗口，同时记进主进程的事件历史（自检要用）。 */
+function broadcastServiceEvent(payload) {
+  recordExportEvent(payload)
+  for (const w of BrowserWindow.getAllWindows()) {
+    try {
+      w.webContents.send('service:event', payload)
+    } catch {
+      /* 窗口正在关 */
+    }
+  }
+}
+
+/** 队列有任何变化就整份播一次：界面据此决定每个导出按钮的禁用。 */
+function broadcastExportQueue() {
+  const items = exportQueueSnapshot()
+  broadcastServiceEvent({
+    type: 'export_queue',
+    items,
+    runningId: exportRunningJob?.id ?? null,
+    queuedCount: exportQueue.length,
+    at: Date.now(),
+  })
+}
+
+/**
+ * 播一次导出进度/结果。`st` 是插件 exportStatus() 的原始对象（可以只给部分字段）。
+ *
+ * 为什么要带 `id`：队列里可能排着好几路，界面必须知道这条进度属于**哪一路**，
+ * 否则又回到"一个全局导出中把所有人一起灰掉"的老毛病。
+ */
+function broadcastExportStatus(job, st) {
+  if (job && st && st.phase) job.phase = st.phase
+  broadcastServiceEvent({
+    type: 'export_status',
+    id: job.id,
+    name: job.name,
+    running: st?.running === true,
+    ok: st?.ok === true,
+    failed: st?.failed === true,
+    phase: st?.phase ?? '',
+    outPath: st?.outPath ?? '',
+    detail: st?.detail ?? '',
+    // 两个名字都写出去：`segmentCount` 是插件那边的原始字段名（ExportStatusToJs
+    // 报的就是它），`segments` 是服务经 stdout 发 export_result 时用的名字。
+    segmentCount: st?.segmentCount ?? 0,
+    segments: st?.segments ?? st?.segmentCount ?? 0,
+    durationSeconds: st?.durationSeconds ?? 0,
+    bytes: st?.bytes ?? 0,
+    elapsedMs: st?.elapsedMs ?? 0,
+    jobId: st?.jobId ?? 0,
+    plan: st?.plan ?? '',
+    queuedCount: exportQueue.length,
+    at: Date.now(),
+  })
+}
+
+/**
+ * 跑一次导出任务：收尾分片 → exportStart → 等收尾。
+ *
+ * 这一段原来就是 `service:export` 的主体。改成任务形式之后唯一的区别是：
+ * 结果不再 `return` 给 IPC 调用方（那时用户点一次就同步等结果），而是按
+ * profile id 广播 `export_status` —— 队列里排着好几路，每路的结果只能分开通知。
+ */
+async function runExportJob(job) {
+  const id = job.id
+  const failJob = (detail) => {
+    broadcastExportStatus(job, {
+      running: false,
+      ok: false,
+      failed: true,
+      phase: '失败',
+      detail,
+      outPath: '',
+    })
+    logErr(`[export] ${id} 失败：${detail}`)
+  }
+
+  const doc = loadProfiles()
+  const profile = (doc.profiles ?? []).find((p) => p.id === id)
+  if (!profile) {
+    failJob(`配置里没有 id = ${id} 这一路。`)
+    return
+  }
+
+  // 分片目录：优先用服务在状态文件里报的 recordDir（那是它真正在写的目录）。
+  const m = readStatusFile()
+  const liveSession = Array.isArray(m.doc?.items) ? m.doc.items.find((s) => s.id === id) : null
+  const recordDir = liveSession?.recordDir || ''
+  if (!recordDir) {
+    failJob(
+      serviceChild || m.doc
+        ? '这一路还没有开始录制，没有可导出的分片。'
+        : '采集服务没有在运行，也没有可导出的分片。',
+    )
+    return
+  }
+
+  // 回放时长：界面点导出时带过来的那个（用户当时看到的值），没有再退回配置。
+  const maxSeconds =
+    job.seconds > 0 ? Math.round(job.seconds) : Number(profile.video?.replaySeconds) || 0
+  // 再展开一次：doc.exportDir 在 normalizeProfiles 里已经展开过，但导出接口
+  // 也可能从别的地方（旧配置、手工调用）拿到带占位符的串，兜一层不吃亏。
+  const exportDir = expandEnvPath(doc.exportDir) || EXPORT_DIR
+  const prefix = profile.name || profile.id || ''
+
+  let addon
+  try {
+    addon = loadAddon()
+  } catch (err) {
+    failJob(`加载导出模块失败：${err.message}`)
+    return
+  }
+  if (typeof addon.exportStart !== 'function') {
+    failJob('导出模块里没有 exportStart，请重新执行 npm run build:native。')
+    return
+  }
+
+  try {
+    // 【第一步：让服务把正在写的那一片收尾落盘】
+    //
+    // 这一步不能省。分片是按固定片长切的，点导出的那一刻总有一片正在写：
+    // 它没 Finalize、index.csv 里也没有它，导出端只能读到最后一片**已完成**
+    // 的分片 —— 于是"点按钮之前那 1~2 秒"永远导不出来。用户报的就是这个
+    // （m12714：「请你回放导出的视频一直到点击按钮的那一刻才停止，我看现在
+    // 导出的视频都是点击前一秒或两秒就停止了」）。
+    //
+    // 【为什么必须发命令，而不是在这里直接切】导出走的是插件
+    // （addon.exportStart，在 Electron 主进程里跑），服务完全不知道有这回事，
+    // 所以 Session::ExportNow 里那句 FlushSegment() 从来没被执行过。只有
+    // 服务自己知道"这一路现在写到哪一片"，切片的动作只能它来做。
+    //
+    // 失败不影响导出：服务没起 / 这一路没在录 / 等超时，都只是"没切成"，
+    // 导出端照旧拿已完成的分片，最多还是丢那一小段（和以前一样）。
+    //
+    // 【发完必须等它真的切完，否则前面这些全白做】
+    //
+    // 命令管道是单向的（`PIPE_ACCESS_INBOUND`），服务没法回话；`pipeSend`
+    // 写完就返回 ok。第一版就是"发完直接往下走"，实测（test-export 的
+    // export_plan）里 `segs` 仍然只到 flush 之前的那一片 —— 导出端在服务
+    // 还没开始 Finalize 时就把目录扫完了，那一片照样读不到。
+    //
+    // 回执走状态文件里的 `flushSeq`（Session::FlushRecording 成功一次 +1）：
+    // 它变了才说明"点按钮那一刻"的分片真的落盘了。比让主进程去猜
+    // index.csv 路径、数行数、比 mtime 都稳 —— 那几种在槽位复用和轮次
+    // 目录切换时都会误判。
+    broadcastExportStatus(job, { running: true, phase: '收尾分片' })
+    if (serviceChild || serviceRunningFast()) {
+      const before = readStatusFile()?.doc?.items?.find((s) => s.id === id)?.flushSeq ?? 0
+      const flushed = await pipeSend({ cmd: 'flush', id })
+      if (!flushed?.ok) {
+        logErr(`[export] 收尾分片失败（${flushed?.error ?? '未知'}），照旧导出已完成的分片。`)
+      } else {
+        // 最多等 3 秒：FlushSegment 内部超时就是 2 秒（编码器彻底卡住时），
+        // 再留 1 秒给状态文件的写盘节拍。
+        const flushDeadline = Date.now() + 3000
+        let seen = before
+        while (Date.now() < flushDeadline) {
+          const now = readStatusFile()?.doc?.items?.find((s) => s.id === id)?.flushSeq ?? 0
+          if (now !== before) {
+            seen = now
+            break
+          }
+          await new Promise((r) => setTimeout(r, 40))
+        }
+        if (seen === before) {
+          logErr('[export] 等了 3 秒也没看到 flush 完成（服务可能没在录这一路），照旧导出已完成的分片。')
+        } else {
+          log(`[export] 分片已收尾（flushSeq ${before} → ${seen}），开始导出。`)
+        }
+      }
+    }
+
+    // Exporter 要的是"分片所在目录"，服务报的 recordDir 是配置目录，
+    // 分片在它下面的 segments/ 里（见 SegmentRecorder.h）。
+    const segmentsDir = path.join(recordDir, 'segments')
+
+    // **把这一路当前的帧率一起传下去**。
+    //
+    // 分片里存的是"录的那一刻的帧率"。用户把某一路从 60fps 改成 240fps 之后，
+    // 已经录好的那批分片仍是 60fps；不传帧率的话 Exporter 只会 `-c copy` 直拼，
+    // 导出来的回放就是 60fps —— 用户看到的是"我明明改了，导出来还是老样子"。
+    //
+    // 传了之后 Exporter 会按目标帧率重采样：目标更低就抽帧，更高就插帧补齐，
+    // 时间轴始终按墙钟对齐，不会变快变慢。0/缺省表示保持源帧率。
+    const wantFps = Math.round(Number(profile.video?.fps) || 0)
+    // 单片标称时长：导出要靠它判"最后一片写完了没"。不传就按 2 秒，而配置里
+    // 这个值能改 —— 改大了会把完整的 2 秒片误判成半片丢掉，成品就短一截。
+    const segSecs = Math.round(Number(profile.video?.segmentSeconds) || 0) || 2
+    const res = addon.exportStart(segmentsDir, exportDir, prefix, maxSeconds, wantFps, segSecs)
+    if (!res?.ok) {
+      failJob(res?.error ?? '导出没能开始。')
+      return
+    }
+    log(`[export] ${id} 开跑：${segmentsDir} → ${exportDir}（${maxSeconds} 秒 / ${wantFps}fps）`)
+
+    // 【第二步：等它收尾】
+    //
+    // 导出跑在插件的后台线程里，进度只能靠 exportStatus() 轮询。这里顺手把
+    // 进度按 400ms 一次广播给界面（和以前那条全局轮询同样的节奏，区别是这次
+    // 带上了 profile id）。
+    //
+    // 超时给到 15 分钟：正常 20 秒成片不到一分钟，这个上限只是防"永远等下去"。
+    const deadline = Date.now() + 15 * 60 * 1000
+    let st = null
+    let lastEmit = 0
+    while (Date.now() < deadline) {
+      st = readExportStatus()
+      if (!st) {
+        failJob('读不到导出状态（导出模块里没有 exportStatus）。')
+        return
+      }
+      if (st.running !== true) break
+      if (Date.now() - lastEmit > 400) {
+        lastEmit = Date.now()
+        broadcastExportStatus(job, st)
+      }
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    if (!st || st.running === true) {
+      failJob('导出超时（15 分钟还没结束）。')
+      return
+    }
+    broadcastExportStatus(job, st)
+    if (st.ok) {
+      const mb = ((st.bytes ?? 0) / 1024 / 1024).toFixed(1)
+      log(`[export] ${id} 完成：${st.outPath}（${(st.durationSeconds ?? 0).toFixed(1)} 秒 / ${mb} MB）`)
+    } else {
+      logErr(`[export] ${id} 失败：${st.detail ?? '原因不明'}`)
+    }
+  } catch (err) {
+    failJob(`发起导出失败：${err.message}`)
+  }
+}
+
+/** 队列推进：空闲且有人排队就取一个跑，跑完自动接下一个。 */
+async function pumpExportQueue() {
+  if (exportRunningJob || exportQueue.length === 0) return
+  const job = exportQueue.shift()
+  job.phase = '准备'
+  exportRunningJob = job
+  broadcastExportQueue()
+  try {
+    await runExportJob(job)
+  } catch (err) {
+    logErr(`[export] ${job.id} 抛错：`, err?.message ?? String(err))
+    broadcastExportStatus(job, {
+      running: false,
+      ok: false,
+      failed: true,
+      phase: '失败',
+      detail: `导出出错：${err?.message ?? err}`,
+      outPath: '',
+    })
+  } finally {
+    exportRunningJob = null
+    broadcastExportQueue()
+    // 下一轮放到下一个事件循环里跑：让广播先送到界面，也避免 finally 里
+    // 直接 await 形成一条很长的调用链。
+    if (exportQueue.length > 0) {
+      setTimeout(() => void pumpExportQueue(), 80).unref?.()
+    }
   }
 }
 
@@ -876,12 +1271,41 @@ function stopService() {
  * 带 --list-windows 跑完就退；它只枚举窗口、不建环，不会和常驻实例抢资源。
  */
 function listWindows() {
-  if (!existsSync(SERVICE_EXE)) {
-    return { ok: false, error: `找不到采集服务：${SERVICE_EXE}`, items: [] }
+  // 用的就是常驻服务那一个 exe（不再有"临时副本"这回事，见 SERVICE_EXE 那段
+  // 注释）。起一个带 --list-windows 的临时实例跑完就退，它只枚举窗口、不建环，
+  // 不会和常驻实例抢资源；因为是同一个文件，刚编译出来的新参数（--include-hwnd
+  // 之类）立即生效，不存在"副本没刷新所以用不上"的情况。
+  const exe = SERVICE_EXE
+  if (!existsSync(exe)) {
+    return { ok: false, error: `找不到采集服务：${exe}`, items: [] }
   }
+  // 服务正在录的窗口要无条件进列表。
+  //
+  // 枚举为了不列垃圾窗口，排掉了最小化 / 小于 64x64 的窗口。可窗口被最小化
+  // 之后服务**仍然握着那个 hwnd 继续录**，于是下拉里没有它，"按当前正在录制
+  // 的窗口自动选中"就落空了。把这些 hwnd 交给枚举进程强制收录，下拉里就
+  // 一定找得到（最小化/尺寸过小的过滤对它们不生效）。
+  // 镜像每秒才刷一次，刚启动时还是空的 —— 那就自己读一遍状态文件，
+  // 否则第一次打开编辑面板会漏掉正在录的窗口。
+  let sessions = Array.isArray(live.mirrorSessions) ? live.mirrorSessions : []
+  if (!sessions.length) {
+    try {
+      const m = readStatusFile()
+      if (Array.isArray(m.doc?.items)) sessions = m.doc.items
+    } catch {
+      /* 读不到就算了，退化成"不强制收录" */
+    }
+  }
+  const includeHwnds = []
+  for (const s of sessions) {
+    const h = Number(s?.hwnd ?? 0)
+    if (Number.isFinite(h) && h > 0) includeHwnds.push(h)
+  }
+  const args = ['--list-windows']
+  for (const h of includeHwnds) args.push('--include-hwnd', String(h))
   try {
     const { execFileSync } = require('node:child_process')
-    const out = execFileSync(SERVICE_EXE, ['--list-windows'], {
+    const out = execFileSync(exe, args, {
       cwd: PROJECT_ROOT,
       encoding: 'utf8',
       windowsHide: true,
@@ -1073,6 +1497,194 @@ function createWindow() {
 }
 
 // ---------------------------------------------------------------------------
+// 反向通知管道：采集服务 → 界面（\\.\pipe\ShadowPlay.Gui.v1）
+//
+// 【谁当服务端】**界面**。服务可能是界面拉起的，也可能是用户自己
+// `npm run service` 起的，它发通知时不该去猜界面的 pid / 进程名（按名字杀进程
+// 会误伤，按窗口标题找不可靠）。让界面守着一条管道，服务退出时连上写一句话，
+// 界面自己走 app.quit() 正常关窗口。界面没开着时服务连不上，直接跳过
+// （见 native/backend/TrayIcon.cpp 的 NotifyGuiQuit）。
+//
+// 现在只有一条命令：托盘「退出」时请界面一起退出。
+// ---------------------------------------------------------------------------
+const GUI_PIPE_NAME = '\\\\.\\pipe\\ShadowPlay.Gui.v1'
+let guiPipeServer = null
+/** 兜底标记的巡检定时器（主进程自己盯，见 startGuiPipe）。 */
+let guiQuitTimer = null
+
+// 兜底通道的标记文件（写入方见 native/backend/GuiNotify.cpp）。
+//
+// 为什么还要文件：命名管道的访问检查跟着**进程完整性级别**走。服务要是被
+// 「以管理员身份运行」，它去连普通权限界面建的管道会吃 ERROR_ACCESS_DENIED，
+// 界面明明开着却收不到通知。标记文件没有这个问题，代价只是最多慢 1 秒。
+const GUI_QUIT_MARKER = path.join(TEMP_ROOT, 'status', 'gui-quit-requested')
+
+// 界面启动时刻：只认这之后写的标记，避免上次运行留下的残留把新界面关掉。
+const GUI_STARTED_AT = Date.now()
+
+// ---------------------------------------------------------------------------
+// 界面进程号（%TEMP%\shadow-play\app\gui.pid）
+//
+// 【谁在看它】采集服务的托盘（native/backend/TrayIcon.cpp 的 RequestOpenGui）。
+// 托盘点一下要判断三种状态：界面在跑 / 界面正在启动 / 界面没开该拉一个。
+// "在跑"靠反向通知管道就能判；但"正在启动"和"刚被用户关掉"在管道上看是
+// 一模一样的（都连不上）—— 只靠时间窗口判断的话，用户在窗口里开完就叉掉、
+// 再点托盘，会被当成"还在启动"而忽略。
+//
+// 所以这里落一个 pid 文件：写着界面主进程的 pid。托盘 OpenProcess 一下就知道
+// 那个进程还在不在 —— 叉掉了（正常退出或被强杀）pid 立刻失效，下次点击就能
+// 重新拉起；还在启动途中（管道还没建好）pid 是活的，就老实等它。
+//
+// launch.mjs 在 spawn 完 electron 会**先写一份**（省掉"进程刚起还没跑到这里"
+// 的空窗），界面自己启动时再写一次（同值），退出时删掉。
+// ---------------------------------------------------------------------------
+const GUI_PID_FILE = path.join(TEMP_ROOT, 'gui.pid')
+
+function writeGuiPid() {
+  try {
+    writeFileSync(GUI_PID_FILE, String(process.pid), 'utf8')
+  } catch {
+    /* 写不了不影响界面本身，最多是老服务重启后第一次点托盘要等管道 */
+  }
+}
+
+function removeGuiPid() {
+  try {
+    // 只删自己写的：万一同时有另一份界面（单实例锁理论上不允许），别帮它清掉。
+    if (readFileSync(GUI_PID_FILE, 'utf8').trim() === String(process.pid)) {
+      rmSync(GUI_PID_FILE, { force: true })
+    }
+  } catch {
+    /* 文件本来就不在 */
+  }
+}
+
+/**
+ * 检查（并消费）服务留下的退出标记。由主进程的定时器每 800ms 看一眼 ——
+ * 不依赖页面在轮询 service:live（页面没加载出来、渲染进程崩了也得能退）。
+ */
+function consumeGuiQuitMarker() {
+  let st = null
+  try {
+    st = statSync(GUI_QUIT_MARKER)
+  } catch {
+    return /* 文件不存在 = 常态 */
+  }
+  const stale = st.mtimeMs + 3000 < GUI_STARTED_AT
+  try {
+    rmSync(GUI_QUIT_MARKER, { force: true })
+  } catch {
+    /* 删不掉也无所谓，窗口马上要关了 */
+  }
+  if (stale) return
+  log('[gui-pipe] 服务请求退出，界面一起关')
+  shutdownFromService()
+}
+
+/**
+ * 起管道。只在正常界面模式调用（--selftest / --gui-export 那些验收模式不需要）。
+ */
+function startGuiPipe() {
+  if (guiPipeServer) return
+  // 记下自己的 pid：托盘靠它区分"还在启动"和"已经被关掉"（见 GUI_PID_FILE）。
+  writeGuiPid()
+  // 先把可能残留的退出标记清掉：这一次是新界面，不该被上一次的退出请求带走。
+  try {
+    rmSync(GUI_QUIT_MARKER, { force: true })
+  } catch {
+    /* 没有就更好 */
+  }
+  try {
+    guiPipeServer = net.createServer((sock) => {
+      // 只有服务主动说话时才会进来（托盘点了「打开主界面」或退出），
+      // 记一行方便排查"点了没反应"到底是没连上还是没处理。
+      log('[gui-pipe] 收到连接')
+      sock.setEncoding('utf8')
+      let buf = ''
+      sock.on('data', (chunk) => {
+        buf += chunk
+        // 按行切，只处理完整的行；剩下的等下一块（NDJSON，和命令通道一个风格）。
+        for (;;) {
+          const nl = buf.indexOf('\n')
+          if (nl < 0) break
+          const line = buf.slice(0, nl).trim()
+          buf = buf.slice(nl + 1)
+          if (!line) continue
+          let msg = null
+          try {
+            msg = JSON.parse(line)
+          } catch {
+            continue
+          }
+          if (msg && msg.cmd === 'quit') {
+            log('[gui-pipe] 采集服务正在退出，界面一起关')
+            shutdownFromService()
+          } else if (msg && msg.cmd === 'show') {
+            // 托盘左键 / 「打开主界面」：界面已经开着，只需要把窗口弄到眼前。
+            // 以前托盘每次点击都重新拉一个启动进程，连点就弹满屏黑框 —— 现在
+            // 托盘先在这条管道上问一句，连得通就只发这条 show（见
+            // native/backend/TrayIcon.cpp 的 RequestOpenGui）。
+            log('[gui-pipe] 托盘请求显示窗口')
+            showMainWindow()
+          }
+        }
+      })
+      // 对端写完就关，socket 上的 EPIPE 是正常结束，不要当错误。
+      sock.on('error', () => {})
+      sock.setTimeout(3000, () => sock.destroy())
+    })
+    guiPipeServer.on('error', (err) => {
+      // 单实例锁已经保证只有一个界面，这里出错基本就是管道被占用或权限问题。
+      // 不能崩：界面照常可用，只是托盘「退出」时关不掉它。
+      log('[gui-pipe] 管道不可用：' + err.message)
+    })
+    guiPipeServer.listen(GUI_PIPE_NAME, () =>
+      log('[gui-pipe] 已监听（服务退出时用它关界面）'),
+    )
+
+    // 兜底标记由**主进程**自己盯，不依赖页面在轮询 service:live：
+    // 页面没加载出来、渲染进程崩了的时候，退出通知照样得生效。
+    if (!guiQuitTimer) guiQuitTimer = setInterval(consumeGuiQuitMarker, 800)
+  } catch (err) {
+    log('[gui-pipe] 启动失败：' + err.message)
+  }
+}
+
+/**
+ * 把主窗口弄到用户眼前（恢复最小化 → 显示 → 聚焦）。
+ *
+ * 托盘「打开主界面」和第二个实例启动都走这里：窗口已经在的时候不该再新建任何
+ * 进程，只要把这一份叫出来。setAlwaysOnTop 那一下是为了绕开 Windows 的
+ * 前台锁 —— 后台进程调 focus() 经常只是任务栏闪一下，窗口并不会真的升上来。
+ */
+function showMainWindow() {
+  const w = mainWindow
+  if (!w || w.isDestroyed()) return
+  try {
+    if (w.isMinimized()) w.restore()
+    if (!w.isVisible()) w.show()
+    w.setAlwaysOnTop(true)
+    w.focus()
+    w.setAlwaysOnTop(false)
+  } catch {
+    /* 窗口正在关，忽略 */
+  }
+}
+
+/** 服务请求退出：走正常退出路径（close → window-all-closed → app.quit）。 */
+function shutdownFromService() {
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.close()
+      return
+    }
+  } catch {
+    /* 窗口已经在关了，直接退 */
+  }
+  app.quit()
+}
+
+// ---------------------------------------------------------------------------
 // 状态文件轮询
 //
 // 为什么不是"起了服务才轮询"：这条通道存在的意义恰恰是**服务不是本进程起的**
@@ -1112,62 +1724,20 @@ function startStatusMirrorPoll() {
 }
 
 // ---------------------------------------------------------------------------
-// 导出状态轮询（把插件那份状态捎给界面）
+// 导出进度不再由一条常开的定时器广播
 //
-// 导出**不经过服务**了（见 service:export 的注释），所以导出的进度不会再出现在
-// 服务的会话状态里 —— 它只活在插件这个进程的内存里。这条轮询就是把它捞出来
-// 广播给界面，否则用户点了导出之后界面永远停在"未导出"。
-//
-// 只在真的有导出跑过之后才广播：插件是懒加载的，没导过之前不该逼着主进程
-// require 一个 .node（那会在日志里留下一行多余的东西）。
+// 以前这里有一个 startExportStatusPoll()：每 400ms 读一次插件状态并广播。
+// 现在导出是**队列**驱动的（见上面的 runExportJob / pumpExportQueue），
+// 进度在任务自己等待收尾的那段时间里按同样 400ms 的节奏播，好处是：
+//   * 每条进度天然带着 profile id，界面能按路各记一份状态；
+//   * 没有导出在跑时一个定时器都不用开着。
 // ---------------------------------------------------------------------------
-function startExportStatusPoll() {
-  setInterval(() => {
-    let st = liveExport?.running ? liveExport : null
-    if (liveExport) {
-      mirrorExportStatus()
-      st = liveExport
-    }
-    if (!st) return
-    const payload = {
-      type: 'export_status',
-      running: st.running === true,
-      ok: st.ok === true,
-      failed: st.failed === true,
-      phase: st.phase ?? '',
-      outPath: st.outPath ?? '',
-      detail: st.detail ?? '',
-      segmentCount: st.segmentCount ?? 0,
-      durationSeconds: st.durationSeconds ?? 0,
-      bytes: st.bytes ?? 0,
-      elapsedMs: st.elapsedMs ?? 0,
-      jobId: st.jobId ?? 0,
-      // 导出计划诊断行（哪个片、哪一段补了 NO SIGNAL）。
-      // 插件 exportStatus() 带着它；没有就是空串。
-      plan: st.plan ?? '',
-      updatedAt: Date.now(),
-    }
-    for (const w of BrowserWindow.getAllWindows()) {
-      try {
-        w.webContents.send('service:event', payload)
-      } catch {
-        /* 窗口正在关 */
-      }
-    }
-    // 也存进主进程的事件历史：自检（--gui-export）就是靠它等导出收尾的。
-    // 上面那条 send 只到渲染进程，主进程自己看不见。
-    recordExportEvent(payload)
-    // 这一轮已经收尾了，别每秒钟重复播同一条完成事件。
-    if (!payload.running) liveExport = null
-  }, 400).unref?.()
-}
 
 // ---------------------------------------------------------------------------
 // IPC
 // ---------------------------------------------------------------------------
 function registerIpc() {
   startStatusMirrorPoll()
-  startExportStatusPoll()
 
   // 页面每 500ms 主动推一笔渲染统计过来（见 app/preload.cjs 的 reportStats）。
   // 主进程只记录，绝不反过来用 executeJavaScript 去"拉" —— 拉一次要 2.5 秒，
@@ -1187,6 +1757,9 @@ function registerIpc() {
       path: BACKEND_PATH,
       session: SERVICE_SESSION_ID,
       launcherPid: serviceChild?.pid ?? null,
+      // 守护进程的状态一并带出去：界面上要能看出"服务有人在看着"，
+      // 而不是服务崩了之后一片安静。
+      guardian: guardianSnapshot(),
       versions: {
         electron: process.versions.electron,
         chrome: process.versions.chrome,
@@ -1198,9 +1771,90 @@ function registerIpc() {
 
   ipcMain.handle('service:launch', () => launchService())
 
+  // 重启采集服务（设置页按钮）。
+  //
+  // 就是"停掉再拉起"。为什么现在可以有这个按钮：以前服务一停，正在录的
+  // 所有分路全断、回放缓冲清空，所以当时的结论是"任何功能都不许重启服务"。
+  // 现在两件事变了 ——
+  //   * 分片是**滚动覆盖**地写在磁盘上的，服务停掉只是不再往后写，已经落盘
+  //     的那几分钟照样能导出；
+  //   * 有守护进程（shadow-capture --guard，由服务自己拉起）兜底：真要是这里
+  //     拉不起来，守护几秒内也会把它拉回来。
+  // 所以"重启"从一个危险操作变成了"改完 C++ 想让新 exe 生效时点一下"。
+  ipcMain.handle('service:restart', async () => {
+    stopService()
+    // 等旧进程把互斥体放了。它是内核对象，进程一退出就没了，但也给它
+    // 一点收尾时间（编码器 Finalize 分片）；等不到也照样往下走 ——
+    // launchService() 自己会判断"还在跑就复用"，不会叠出第二个。
+    for (let i = 0; i < 20; i++) {
+      if (serviceRunning() !== true) break
+      await new Promise((r) => setTimeout(r, 200))
+    }
+    const started = launchService()
+    if (!started.ok) return { ok: false, error: started.error ?? '重启失败。' }
+    // 新服务还没收到本机的预览帧率设置，补一次下发（它只认命令行和配置文件）。
+    void pushSettingsToService()
+    return { ok: true, pid: started.pid ?? null, alreadyRunning: started.alreadyRunning === true }
+  })
+
   ipcMain.handle('service:reveal', () => {
     shell.showItemInFolder(BACKEND_PATH)
     return true
+  })
+
+  // 停止整套（服务 + 守护）。
+  //
+  // 关键：先立「停机哨兵」，再循环杀。守护每 2 秒巡检一次，若不立哨兵，杀服务的
+  // 瞬间它就把服务拉起来 —— 「停止」永远停不干净。立了哨兵后，守护下一轮要么
+  // 直接退出、要么看到哨兵不再拉起；循环里反复按 PID + 按名字补刀，直到都没了。
+  // 托盘图标的「退出」走的是原生侧的同一条逻辑。
+  ipcMain.handle('service:stop', async () => {
+    const { execFileSync, spawnSync } = require('node:child_process')
+    // 1) 立哨兵
+    try {
+      writeFileSync(path.join(TEMP_ROOT, 'status', 'shutdown-requested'), '', 'utf8')
+    } catch {}
+    // 2) 循环杀：服务 PID + 守护 PID，再按名字兜底
+    const deadline = Date.now() + 15000
+    let everKilled = false
+    const guardPid = (() => {
+      try {
+        const doc = JSON.parse(readFileSync(path.join(TEMP_ROOT, 'status', 'guardian-v1.json'), 'utf8'))
+        const p = Number(doc?.pid)
+        return Number.isFinite(p) && p > 0 ? p : null
+      } catch {
+        return null
+      }
+    })()
+    const pids = new Set([serviceChild?.pid, guardPid].filter((p) => p))
+    while (Date.now() < deadline) {
+      for (const p of pids) {
+        try {
+          execFileSync('taskkill', ['/PID', String(p), '/F'], { stdio: 'ignore', windowsHide: true })
+          everKilled = true
+        } catch {}
+      }
+      try {
+        const byName = spawnSync('taskkill', ['/IM', 'shadow-capture.exe', '/F'], {
+          stdio: 'ignore',
+          windowsHide: true,
+        })
+        if (byName.status === 0) everKilled = true
+      } catch {}
+      // 都清干净了就收工
+      const r = spawnSync('tasklist', ['/FI', 'IMAGENAME eq shadow-capture.exe'], {
+        encoding: 'utf8',
+        windowsHide: true,
+      })
+      if (!/shadow-capture\.exe/i.test(r.stdout || '')) break
+      await new Promise((r) => setTimeout(r, 800))
+    }
+    // 3) 停机完成，清掉哨兵，方便下次启动
+    try {
+      rmSync(path.join(TEMP_ROOT, 'status', 'shutdown-requested'), { force: true })
+    } catch {}
+    const stillRunning = serviceRunning() === true
+    return { ok: !stillRunning, everKilled, stillRunning }
   })
 
   // 问服务要当前配置列表（preload 拿它决定要映射几个环）。
@@ -1395,8 +2049,6 @@ function registerIpc() {
     return { ok: true, path: file, restarted: false, reloaded, failed }
   })
 
-  ipcMain.handle('service:stop', () => stopService())
-
   // -------------------------------------------------------------------------
   // 设置页
   //
@@ -1476,6 +2128,9 @@ function registerIpc() {
       wantedProfilesPath: wantedProfiles,
       runningProfilesPath: runningProfiles,
       profilesMismatch,
+      // 守护进程的状态（界面顶栏显示"守护在岗"，服务崩了能被自动拉回）。
+      // 心跳是守护每秒级写的，读一次文件很便宜，不额外起进程。
+      guardian: guardianSnapshot(),
     }
   })
   // -------------------------------------------------------------------------
@@ -1491,7 +2146,25 @@ function registerIpc() {
   //
   // 导出目录/前缀从哪来：分片目录是服务分配的（不是配置里写的字段），
   // 所以从状态镜像的 recordDir 取；拿不到就退回配置的 recordRoot + 惯例目录名。
-  ipcMain.handle('service:export', async (_evt, req) => {
+  // -------------------------------------------------------------------------
+  // 导出：**直接调 C++**（native/build/shadow_ring.node 的 exportStart/exportStatus）
+  //
+  // 为什么不再走服务的 stdin 命令通道：
+  //   Exporter 只吃几个纯字符串参数（分片目录 / 导出目录 / 前缀 / 秒数），分片
+  //   是磁盘上已经写好的 .mp4 文件，任何进程都能读 —— 导出这件事跟"谁在录"
+  //   没有关系。原先放在服务里、靠 stdin 送命令，唯一原因是界面够不着 exe 里的
+  //   类；代价是**界面复用用户自己起的服务时没有那个 stdin**，导出永远回
+  //   "没有命令通道"。
+  //   编进插件之后，服务是谁起的、在不在跑，都不影响导出。
+  //
+  // 导出目录/前缀从哪来：分片目录是服务分配的（不是配置里写的字段），
+  // 所以从状态镜像的 recordDir 取；拿不到就退回配置的 recordRoot + 惯例目录名。
+  //
+  // 【点导出 = 入队】真正的执行在 runExportJob 里，队列串行推进（见上面
+  // 导出队列那一段）。所以这里的返回值只表示"排上了没有、前面还有几个"，
+  // 进度和结果全部走 export_status 事件，并且带着 profile id。
+  // -------------------------------------------------------------------------
+  ipcMain.handle('service:export', (_evt, req) => {
     const id = String(req?.id ?? '')
     if (!id) return { ok: false, error: '没有指定要导出哪一路配置。' }
 
@@ -1499,115 +2172,83 @@ function registerIpc() {
     const profile = (doc.profiles ?? []).find((p) => p.id === id)
     if (!profile) return { ok: false, error: `配置里没有 id = ${id} 这一路。` }
 
-    // 分片目录：优先用服务在状态文件里报的 recordDir（那是它真正在写的目录）。
-    const m = readStatusFile()
-    const live = Array.isArray(m.doc?.items) ? m.doc.items.find((s) => s.id === id) : null
-    const recordDir = live?.recordDir || ''
-    if (!recordDir) {
-      return {
-        ok: false,
-        error: serviceChild || m.doc
-          ? '这一路还没有开始录制，没有可导出的分片。'
-          : '采集服务没有在运行，也没有可导出的分片。',
-      }
-    }
-
     const seconds = Number(req?.seconds)
-    const maxSeconds =
-      Number.isFinite(seconds) && seconds > 0
-        ? Math.round(seconds)
-        : Number(profile.video?.replaySeconds) || 0
-    // 再展开一次：doc.exportDir 在 normalizeDoc 里已经展开过，但导出接口
-    // 也可能从别的地方（旧配置、手工调用）拿到带占位符的串，兜一层不吃亏。
-    const exportDir = expandEnvPath(doc.exportDir) || EXPORT_DIR
-    const prefix = profile.name || profile.id || ''
-
-    let addon
-    try {
-      addon = loadAddon()
-    } catch (err) {
-      return { ok: false, error: `加载导出模块失败：${err.message}` }
-    }
-    if (typeof addon.exportStart !== 'function') {
-      return { ok: false, error: '导出模块里没有 exportStart，请重新执行 npm run build:native。' }
+    const job = {
+      id,
+      name: profile.name || profile.id || id,
+      seconds: Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds) : 0,
+      queuedAt: Date.now(),
     }
 
+    // 同一路连点两下：不重复排队，告诉界面"已经在导出里了"就行。
+    // 这不是错误 —— 按钮上写着"导出中"，本来也不会去点。
+    if (exportRunningJob?.id === id || exportQueue.some((x) => x.id === id)) {
+      return { ok: true, queued: true, alreadyQueued: true, ahead: 0 }
+    }
+
+    exportQueue.push(job)
+    const ahead = exportQueue.length - 1 + (exportRunningJob ? 1 : 0)
+    broadcastExportQueue()
+    void pumpExportQueue()
+    return { ok: true, queued: true, ahead, position: ahead + 1 }
+  })
+
+  // -------------------------------------------------------------------------
+  // 删除一路配置
+  //
+  // 写盘 + 让服务把这一路的会话停掉（发 reload：服务读盘后发现这个 id 已经
+  // 不在了，会把它那条 Session 停掉并回收，其它路一个字节都不动 —— 见
+  // native/backend/main.cpp 的 reload 分支）。
+  //
+  // 为什么不在这里删录像目录：那是用户的素材，删配置不该顺手删录像。要清理
+  // 由用户自己动手（或者等回放窗口自然滚动覆盖掉）。
+  // -------------------------------------------------------------------------
+  ipcMain.handle('service:delete-profile', async (_evt, payload) => {
+    const id = String(payload?.id ?? '')
+    if (!id) return { ok: false, error: '缺少配置 id。' }
+
+    const file = profilesPath()
+    const current = loadProfiles()
+    if (current.error) return { ok: false, error: `读不到现有配置：${current.error}` }
+    const list = Array.isArray(current.profiles) ? current.profiles.slice() : []
+    const idx = list.findIndex((p) => String(p?.id ?? '') === id)
+    if (idx < 0) return { ok: false, error: `磁盘上没有 id = ${id} 这一路配置。` }
+
+    const [removed] = list.splice(idx, 1)
+    const doc = {
+      ...current,
+      recordRoot: current.recordRoot,
+      exportDir: current.exportDir,
+      profiles: list,
+    }
     try {
-      // 【第一步：让服务把正在写的那一片收尾落盘】
-      //
-      // 这一步不能省。分片是按固定片长切的，点导出的那一刻总有一片正在写：
-      // 它没 Finalize、index.csv 里也没有它，导出端只能读到最后一片**已完成**
-      // 的分片 —— 于是"点按钮之前那 1~2 秒"永远导不出来。用户报的就是这个
-      // （m12714：「请你回放导出的视频一直到点击按钮的那一刻才停止，我看现在
-      // 导出的视频都是点击前一秒或两秒就停止了」）。
-      //
-      // 【为什么必须发命令，而不是在这里直接切】导出走的是插件
-      // （addon.exportStart，在 Electron 主进程里跑），服务完全不知道有这回事，
-      // 所以 Session::ExportNow 里那句 FlushSegment() 从来没被执行过。只有
-      // 服务自己知道"这一路现在写到哪一片"，切片的动作只能它来做。
-      //
-      // 失败不影响导出：服务没起 / 这一路没在录 / 等超时，都只是"没切成"，
-      // 导出端照旧拿已完成的分片，最多还是丢那一小段（和以前一样）。
-      //
-      // 【发完必须等它真的切完，否则前面这些全白做】
-      //
-      // 命令管道是单向的（`PIPE_ACCESS_INBOUND`），服务没法回话；`pipeSend`
-      // 写完就返回 ok。第一版就是"发完直接往下走"，实测（test-export 的
-      // export_plan）里 `segs` 仍然只到 flush 之前的那一片 —— 导出端在服务
-      // 还没开始 Finalize 时就把目录扫完了，那一片照样读不到。
-      //
-      // 回执走状态文件里的 `flushSeq`（Session::FlushRecording 成功一次 +1）：
-      // 它变了才说明"点按钮那一刻"的分片真的落盘了。比让主进程去猜
-      // index.csv 路径、数行数、比 mtime 都稳 —— 那几种在槽位复用和轮次
-      // 目录切换时都会误判。
-      if (serviceChild || serviceRunningFast()) {
-        const before = readStatusFile()?.doc?.items?.find((s) => s.id === id)?.flushSeq ?? 0
-        const flushed = await pipeSend({ cmd: 'flush', id })
-        if (!flushed?.ok) {
-          logErr(`[export] 收尾分片失败（${flushed?.error ?? '未知'}），照旧导出已完成的分片。`)
-        } else {
-          // 最多等 3 秒：FlushSegment 内部超时就是 2 秒（编码器彻底卡住时），
-          // 再留 1 秒给状态文件的写盘节拍。
-          const flushDeadline = Date.now() + 3000
-          let seen = before
-          while (Date.now() < flushDeadline) {
-            const now = readStatusFile()?.doc?.items?.find((s) => s.id === id)?.flushSeq ?? 0
-            if (now !== before) {
-              seen = now
-              break
-            }
-            await new Promise((r) => setTimeout(r, 40))
-          }
-          if (seen === before) {
-            logErr('[export] 等了 3 秒也没看到 flush 完成（服务可能没在录这一路），照旧导出已完成的分片。')
-          } else {
-            log(`[export] 分片已收尾（flushSeq ${before} → ${seen}），开始导出。`)
-          }
-        }
+      mkdirSync(path.dirname(file), { recursive: true })
+      try {
+        if (existsSync(file)) copyFileSync(file, `${file}.bak`)
+      } catch {
+        /* 备份失败不该挡住删除本身 */
       }
-
-      // Exporter 要的是"分片所在目录"，服务报的 recordDir 是配置目录，
-      // 分片在它下面的 segments/ 里（见 SegmentRecorder.h）。
-      const segmentsDir = path.join(recordDir, 'segments')
-
-      // **把这一路当前的帧率一起传下去**。
-      //
-      // 分片里存的是"录的那一刻的帧率"。用户把某一路从 60fps 改成 240fps 之后，
-      // 已经录好的那批分片仍是 60fps；不传帧率的话 Exporter 只会 `-c copy` 直拼，
-      // 导出来的回放就是 60fps —— 用户看到的是"我明明改了，导出来还是老样子"。
-      //
-      // 传了之后 Exporter 会按目标帧率重采样：目标更低就抽帧，更高就插帧补齐，
-      // 时间轴始终按墙钟对齐，不会变快变慢。0/缺省表示保持源帧率。
-      const wantFps = Math.round(Number(profile.video?.fps) || 0)
-      // 单片标称时长：导出要靠它判"最后一片写完了没"。不传就按 2 秒，而配置里
-      // 这个值能改 —— 改大了会把完整的 2 秒片误判成半片丢掉，成品就短一截。
-      const segSecs = Math.round(Number(profile.video?.segmentSeconds) || 0) || 2
-      const res = addon.exportStart(segmentsDir, exportDir, prefix, maxSeconds, wantFps, segSecs)
-      if (!res?.ok) return { ok: false, error: res?.error ?? '导出没能开始。' }
-      mirrorExportStatus() // 让 service:live 立刻能看到 running
-      return { ok: true, jobId: res.jobId ?? 0, exportDir, segmentsDir, targetFps: wantFps }
+      writeFileSync(file, JSON.stringify(doc, null, 2), 'utf8')
+      lastGoodProfiles = doc
     } catch (err) {
-      return { ok: false, error: `发起导出失败：${err.message}` }
+      return { ok: false, error: `写入配置失败：${err.message}` }
+    }
+
+    // 服务在跑就让它把这一路停掉。发不出去也照样算删除成功（配置已经不在
+    // 磁盘上了，下次重启服务自然就不会再起它）。
+    let stopped = false
+    if (serviceRunningFast()) {
+      const r = await sendServiceCommand({ cmd: 'reload', id })
+      stopped = !!r.ok
+      if (!stopped) log(`[profile] 删除 ${id} 已写盘，但 reload 没送到服务：${r.error ?? '未知'}`)
+    }
+    log(`[profile] 已删除配置 ${id}（剩余 ${list.length} 路）`)
+    return {
+      ok: true,
+      id,
+      name: removed?.name ?? id,
+      remaining: list.length,
+      stopped,
     }
   })
 
@@ -1623,11 +2264,82 @@ function registerIpc() {
 // ---------------------------------------------------------------------------
 function runProbe() {
   const report = { steps: [], ok: false, at: new Date().toISOString() }
+
+  // 【被测会话 id 怎么定】
+  //
+  // 老写法写死 SERVICE_SESSION_ID（`shadowplay-service-v1`），那只是**单路模式**
+  // 的固定环名。现在服务默认跑多会话模式（`--profiles`），每一路配置各自建一个
+  // 环，名字是配置 id（`p-desk` / `p-win` …），根本没有 `shadowplay-service-v1`
+  // 这个环 —— 于是 `npm run probe` 永远报「无法打开共享内存帧环，采集服务可能
+  // 没有启动」，而服务其实活得好好的（本鱼踩过）。
+  //
+  // 现在的优先级：
+  //   1. `--session <id>` 显式指定（对照实验用）；
+  //   2. 状态文件里第一路**在录制/已连接**的配置 id（多会话模式的真实环名）；
+  //   3. 退回 SERVICE_SESSION_ID（真正的单路模式，或服务没跑时给出准确报错）。
+  let sessionId = SERVICE_SESSION_ID
+  let sessionSource = 'fixed-default'
+  const argIdx = process.argv.indexOf('--session')
+  if (argIdx >= 0) {
+    const v = process.argv[argIdx + 1]
+    if (v && !v.startsWith('-')) {
+      sessionId = v
+      sessionSource = 'argv'
+    }
+  }
+  if (sessionSource !== 'argv') {
+    const pickFromStatus = () => {
+      const items = readStatusFile()?.doc?.items
+      if (!Array.isArray(items)) return null
+      // 优先挑真的在出画面的那一路。状态文件里 items 的顺序不固定，
+      // 所以不靠"第一条"碰运气。
+      const usable = items.filter(
+        (it) => it && typeof it.id === 'string' && it.id && it.state !== 'disabled',
+      )
+      return (
+        usable.find((it) => it.state === 'live') ??
+        usable.find((it) => it.state === 'waiting') ??
+        usable[0] ??
+        null
+      )
+    }
+
+    // 启动清理（`cleanOnStartup`）在 main.cjs 顶部就把 status/ 整棵删掉了，
+    // 而服务要等最多一秒才写出下一份。自检如果正好踩在这个空窗上，就只能退回
+    // 固定 id —— 那是单路模式的名字，多会话模式下压根没有这个环。
+    // 所以这里短暂轮询等它出现，最多 2.5 秒（服务每秒写一次，够赶上两轮）。
+    let best = pickFromStatus()
+    if (!best) {
+      const deadline = Date.now() + 2500
+      while (!best && Date.now() < deadline) {
+        // 同步小睡：runProbe() 是启动期的自检，整条路径都是同步的，
+        // 这里不能 await（函数不是 async，改了会连带动 applyProbe 那条）。
+        const until = Date.now() + 120
+        while (Date.now() < until) {
+          /* 空转等状态文件刷新 */
+        }
+        best = pickFromStatus()
+      }
+    }
+    if (best) {
+      sessionId = best.id
+      sessionSource = 'status-file'
+    }
+  }
+  report.session = sessionId
+  report.sessionSource = sessionSource
+
   try {
-    const result = probe(SERVICE_SESSION_ID, 8000)
+    const result = probe(sessionId, 8000)
     report.steps.push({ name: 'ring', ...result })
     report.ok = result.ok
-    if (!result.ok) report.error = result.error
+    if (!result.ok) {
+      report.error =
+        sessionSource === 'status-file'
+          ? result.error
+          : `${result.error}（用的是固定会话 id「${sessionId}」；` +
+            `如果服务跑在多会话模式下，环名是各路配置的 id，用 --session <id> 指定，或先让服务写出一份状态文件）`
+    }
   } catch (err) {
     report.error = err.message
   }
@@ -1997,7 +2709,12 @@ async function runGuiExport(waitSeconds) {
   const outPath = String(res.outPath ?? '')
   report.outPath = outPath
   report.exportBytes = res.bytes ?? 0
-  report.exportSegments = res.segments ?? 0
+  // 【两个字段名都要认】界面点导出走的是**插件**（`bridge/shadow_ring.cc` 的
+  // `ExportStatusToJs`），它报的是 `segmentCount`；而服务自己经 stdout 发的
+  // `export_result` 用的是 `segments`。以前这里只读 `segments`，于是自检报告
+  // 里 `exportSegments` 恒为 0 —— 而成片明明是 11 个分片拼的，看上去像"导出
+  // 没读到任何分片"。两边都认，报告才和实际一致。
+  report.exportSegments = res.segments ?? res.segmentCount ?? 0
   report.exportDurationSeconds = res.durationSeconds ?? 0
   report.exportProfile = id
   // 计划诊断行：报告里带着"为什么补了 NO SIGNAL"，以后不必再靠猜。
@@ -2123,10 +2840,8 @@ if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.focus()
-    }
+    // 已经有界面在跑：只把这一份叫到前台（不新建窗口、不重启）。
+    showMainWindow()
   })
 
   app.whenReady().then(async () => {
@@ -2175,7 +2890,15 @@ if (!app.requestSingleInstanceLock()) {
       }
     }
 
+    // 守护进程**不在这里拉起**：它是采集服务自己 spawn 的（shadow-capture
+    // --guard，见 native/backend/GuardianMode.h）—— 服务拉守护、守护盯服务，
+    // 两条边都在服务端，关掉界面之后照样成立。界面不再显示它的状态（那是服务
+    // 端的实现细节），只是仍然依赖它把崩溃的服务拉回来。
     createWindow()
+
+    // 守着反向通知管道：服务托盘「退出」时通过它请界面一起退出。
+    // 必须在 createWindow 之后起 —— 服务连上来就是要关窗口，窗口得先在。
+    startGuiPipe()
 
     // 界面一开就把设置推给在跑的服务，**不管服务是谁起的**。
     //
@@ -2196,4 +2919,9 @@ if (!app.requestSingleInstanceLock()) {
     // 停服走界面里的「停止采集服务」或 npm run service:stop。
     app.quit()
   })
+
+  // 退出时摘掉自己的 pid 文件：托盘下次点击才知道"界面已经不在了，该拉一个"。
+  // 放在 will-quit 而不是 window-all-closed —— app.quit() 之后还有收尾流程，
+  // 这里删掉也只是让托盘的判断早一点点，不影响界面继续退出。
+  app.on('will-quit', removeGuiPid)
 }

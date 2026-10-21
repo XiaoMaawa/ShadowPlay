@@ -44,6 +44,9 @@ import { projectRoot, tempRoot } from './electron-path.mjs'
 
 const BACKEND = path.join(projectRoot, 'native', 'build', 'shadow-capture.exe')
 const PID_FILE = path.join(tempRoot, 'service.pid')
+// 停机哨兵：状态目录下的这个文件一旦存在，服务和守护都该退出且不再互拉。
+// 见 native/backend/GuardianMode.h 的 ShutdownRequested 说明。
+const SHUTDOWN_SENTINEL = path.join(tempRoot, 'status', 'shutdown-requested')
 const cmd = (process.argv[2] ?? 'status').toLowerCase()
 // `npm run service -- --fps 120` 里的 --fps 120 会落到 argv[3..]
 let extraArgs = process.argv.slice(3)
@@ -156,6 +159,77 @@ function killService() {
   return { ok: false, notFound: !status().running, text }
 }
 
+/** 读守护进程 PID（心跳文件里记的）。 */
+function readGuardianPid() {
+  try {
+    const f = path.join(tempRoot, 'status', 'guardian-v1.json')
+    const doc = JSON.parse(readFileSync(f, 'utf8'))
+    const p = Number(doc?.pid)
+    return Number.isFinite(p) && p > 0 ? p : null
+  } catch {
+    return null
+  }
+}
+
+/** 立停机哨兵：让守护别再把服务拉起来。 */
+function writeShutdownSentinel() {
+  try {
+    writeFileSync(SHUTDOWN_SENTINEL, '', 'utf8')
+  } catch {
+    // 写不下也不致命，下面按 PID 强杀兜底
+  }
+}
+
+/** 清掉停机哨兵（启动前调用，免得残留的哨兵挡住本次启动）。 */
+function clearShutdownSentinel() {
+  try {
+    rmSync(SHUTDOWN_SENTINEL, { force: true })
+  } catch {
+    /* 没有就忽略 */
+  }
+}
+
+/**
+ * 干净地停掉**整套**（服务 + 守护）。
+ *
+ * 关键：先立哨兵，再循环杀。守护每 2 秒巡检一次，若不立哨兵，杀服务的瞬间
+ * 守护就会把它拉起来，于是"停止"永远停不干净。立了哨兵后，守护下一轮要么直接
+ * 退出、要么看到哨兵不再拉起；循环里反复按 PID + 按名字补刀，直到都没了。
+ *
+ * @returns {boolean} 是否成功停掉
+ */
+function stopAll() {
+  writeShutdownSentinel()
+
+  const deadline = Date.now() + 15000
+  let everKilled = false
+  while (Date.now() < deadline) {
+    const pids = new Set([readServicePid(), readGuardianPid()].filter((p) => p))
+    for (const p of pids) {
+      spawnSync('taskkill', ['/PID', String(p), '/F'], { stdio: 'ignore', windowsHide: true })
+      everKilled = true
+    }
+    // 名字兜底：万一心跳/pid 文件滞后，把同名的都清掉（单实例互斥体保证只有一套）。
+    const byName = spawnSync('taskkill', ['/IM', 'shadow-capture.exe', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    if (byName.status === 0) everKilled = true
+
+    // 都清干净了就收工
+    const r = spawnSync('tasklist', ['/FI', 'IMAGENAME eq shadow-capture.exe'], {
+      encoding: 'utf8',
+      windowsHide: true,
+    })
+    if (!/shadow-capture\.exe/i.test(r.stdout || '')) break
+    spawnSync('ping', ['-n', '2', '127.0.0.1'], { stdio: 'ignore', windowsHide: true })
+  }
+
+  // 停机完成，清掉哨兵，方便下次启动。
+  clearShutdownSentinel()
+  return everKilled || !status().running
+}
+
 /** 等服务真的起来（最多 timeoutMs）。 */
 function waitForService(timeoutMs) {
   const deadline = Date.now() + timeoutMs
@@ -185,6 +259,8 @@ function startDetached() {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
+    // 托盘「打开主界面」要靠它找到 node.exe（见 native/backend/TrayIcon.cpp）。
+    env: { ...process.env, SHADOW_NODE_EXE: process.execPath },
   })
   child.unref()
   const pid = Number(child.pid) || null
@@ -211,6 +287,9 @@ switch (cmd) {
       console.log('（若要让它按新配置重来：npm run service:stop 后再启动）')
       process.exit(0)
     }
+
+    // 启动时清掉可能残留的停机哨兵，免得它挡住本次启动。
+    clearShutdownSentinel()
 
     if (extraArgs.includes('--fg')) {
       // 前台跑，日志直接打在终端里，方便排查（--fg 是本地开关，不传给服务）。
@@ -243,18 +322,16 @@ switch (cmd) {
   }
 
   case 'stop': {
-    const r = killService()
-    if (r.ok) {
-      console.log('已停止采集服务。')
-      process.exit(0)
-    }
-    if (r.notFound) {
-      console.log('没有找到正在运行的采集服务。')
+    // 干净停掉整套（服务 + 守护）。见 stopAll 的说明：先立哨兵再循环杀，
+    // 否则守护会把刚被杀的服务又拉起来，永远停不干净。
+    const ok = stopAll()
+    if (ok) {
+      console.log('已停止采集服务（含守护进程）。')
       process.exit(0)
     }
     console.error(
-      `停止失败：${r.text || '未知原因'}\n` +
-        '可以在任务管理器里结束 shadow-capture.exe。',
+      '停止失败：仍有 shadow-capture.exe 在运行。\n' +
+        '可以在任务管理器里结束它，或稍后重试。',
     )
     process.exit(1)
     break

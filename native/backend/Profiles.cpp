@@ -463,6 +463,122 @@ const char* ToString(MatchPick p) {
     return "largest";
 }
 
+const char* ToString(MatchRule r) {
+    switch (r) {
+        case MatchRule::ProcessOnly:       return "process";
+        case MatchRule::TitleProcess:      return "title+process";
+        case MatchRule::ClassProcess:      return "class+process";
+        case MatchRule::TitleClassProcess: return "title+class+process";
+    }
+    return "title+process";
+}
+
+bool ParseMatchRule(const std::string& s, MatchRule& out) {
+    const std::string v = ToLower(s);
+    // 容忍空格和加号、以及中文界面可能写出来的写法
+    std::string k;
+    for (char c : v) {
+        if (c == ' ' || c == '\\t') continue;
+        k.push_back(c);
+    }
+    if (k == "process" || k == "app" || k == "exe" || k == "processonly") {
+        out = MatchRule::ProcessOnly;
+        return true;
+    }
+    if (k == "title+process" || k == "titleprocess" || k == "name+process" || k == "titleandprocess") {
+        out = MatchRule::TitleProcess;
+        return true;
+    }
+    if (k == "class+process" || k == "classprocess" || k == "classname+process") {
+        out = MatchRule::ClassProcess;
+        return true;
+    }
+    if (k == "title+class+process" || k == "titleclassprocess" || k == "title+classname+process" ||
+        k == "title+class+app") {
+        out = MatchRule::TitleClassProcess;
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// WindowMatch::Normalize / Describe
+// ---------------------------------------------------------------------------
+
+void WindowMatch::Normalize() {
+    // 1) 老配置只写了 pattern（装的其实是标题），把它落到对应字段的指纹里。
+    const bool anyField = !titlePattern.empty() || !classPattern.empty() || !processPattern.empty();
+    if (!anyField && !pattern.empty()) {
+        switch (field) {
+            case MatchField::Class:   classPattern = pattern;   break;
+            case MatchField::Process: processPattern = pattern; break;
+            case MatchField::Title:
+            default:                  titlePattern = pattern;   break;
+        }
+    }
+
+    // 2) 配置里没写 rule：按用户当初排的优先级推断一个。
+    //
+    // 【推断原则】尊重"首选字段"：老界面里排第一位的就是用户最看重的那个。
+    //   · 首选 process            → 只匹配应用程序
+    //   · 首选 class              → 类名 + 应用程序
+    //   · 首选 title（老默认）    → 名字 + 应用程序
+    // 有标题指纹时**不再**把类名塞进来：老配置里的 className 大多只是当年的
+    // 中间降级项（Chrome_WidgetWin_1 这种满机都是），带上它只会让新模型更严、
+    // 更容易匹配不到。
+    if (!ruleGiven) {
+        const MatchField primary = fields.empty() ? field : fields.front();
+        switch (primary) {
+            case MatchField::Process: rule = MatchRule::ProcessOnly;       break;
+            case MatchField::Class:   rule = MatchRule::ClassProcess;      break;
+            case MatchField::Title:
+            default:
+                if (!titlePattern.empty()) {
+                    rule = MatchRule::TitleProcess;
+                } else if (!classPattern.empty()) {
+                    rule = MatchRule::ClassProcess;
+                } else {
+                    rule = MatchRule::ProcessOnly;
+                }
+                break;
+        }
+        ruleGiven = true;
+    }
+}
+
+std::string WindowMatch::Describe() const {
+    const auto nameOf = [](MatchField f) -> const char* {
+        switch (f) {
+            case MatchField::Process: return "应用程序";
+            case MatchField::Class:   return "类名";
+            case MatchField::Title:
+            default:                  return "名字";
+        }
+    };
+    const auto modeOf = [this]() -> const char* {
+        switch (mode) {
+            case MatchMode::Exact:    return "等于";
+            case MatchMode::Prefix:   return "开头是";
+            case MatchMode::Regex:    return "匹配正则";
+            case MatchMode::Contains:
+            default:                  return "包含";
+        }
+    };
+
+    std::string out;
+    for (MatchField f : RequiredFields()) {
+        std::string pat = FieldPattern(f);
+        if (pat.empty()) pat = "（空）";
+        if (!out.empty()) out += " + ";
+        out += nameOf(f);
+        out += modeOf();
+        out += "「";
+        out += pat;
+        out += "」";
+    }
+    return out;
+}
+
 bool ParseSourceKind(const std::string& s, SourceKind& out) {
     const std::string v = ToLower(s);
     if (v == "desktop" || v == "screen" || v == "all") {
@@ -587,7 +703,12 @@ bool Profile::SameSettings(const Profile& o) const {
         if (match.titlePattern != o.match.titlePattern) return false;
         if (match.classPattern != o.match.classPattern) return false;
         if (match.processPattern != o.match.processPattern) return false;
-        // 优先级顺序是用户拖出来的，改了顺序就换了匹配语义
+        // 匹配方式（四个选项）直接决定"要不要换源"，改了必须重建会话
+        if (match.rule != o.match.rule) return false;
+        // 用户挑过的窗口：改了它就必须重建会话，否则"换成同程序的另一个窗口"
+        // 这一保存不会生效（新偏好只写进了文件，运行中的会话还在录旧窗口）。
+        if (match.preferredHwnd != o.match.preferredHwnd) return false;
+        // 老模型的优先级顺序：只在迁移时用得到，但仍在文件里，比一下无害
         if (match.fields != o.match.fields) return false;
     }
 
@@ -604,6 +725,19 @@ bool Profile::SameSettingsIgnoringFps(const Profile& o) const {
     Profile b = o;
     a.video.fps = 0.0;
     b.video.fps = 0.0;
+    return a.SameSettings(b);
+}
+
+bool Profile::SameSettingsIgnoringFpsBitrate(const Profile& o) const {
+    // 与 SameSettingsIgnoringFps 同一套实现思路：复制一份、把能就地改的字段
+    // （帧率、码率）抹平再交给 SameSettings。将来 SameSettings 加了新字段，
+    // 这里自动跟着比，不会漏。
+    Profile a = *this;
+    Profile b = o;
+    a.video.fps = 0.0;
+    b.video.fps = 0.0;
+    a.video.bitrateMbps = 0;
+    b.video.bitrateMbps = 0;
     return a.SameSettings(b);
 }
 
@@ -693,6 +827,15 @@ bool ProfileStore::Load(const std::string& path, ProfileDoc& out, std::string& o
                 // 兜底：0 会让分片永远不轮转，必须给个下限
                 if (p.video.segmentSeconds == 0) p.video.segmentSeconds = 2;
                 if (p.video.replaySeconds == 0) p.video.replaySeconds = 120;
+                // 【帧率上限 120，超过的一律夹回来】硬件编码器在 2560x1440 上
+                // 物理上限是 172fps（探针实测），而 165fps 那一档的每帧成本
+                // 6.09ms 已经顶破 6.06ms 的预算，喂帧端只能补重复帧 —— 真实
+                // 画面只剩一半。与其"配 240 自动降到 165 再被看门狗降到 144"
+                // 绕这么一圈，不如从一开始就不给超过 120 的档位：120 及以下
+                // 实测真实画面 89~93%、落盘 100%，是稳定区间。
+                // 手改过 json 的老配置也在这里被夹，不会带着 240 继续跑。
+                if (p.video.fps > 120.0) p.video.fps = 120.0;
+                if (p.video.fps < 1.0) p.video.fps = 1.0;
             }
 
             // --- match ---
@@ -707,18 +850,31 @@ bool ProfileStore::Load(const std::string& path, ProfileDoc& out, std::string& o
                 if (ParseMatchPick(Str(m, "pick"), pk)) wm.pick = pk;
                 wm.pattern = Str(m, "pattern");
                 // 各字段自己的指纹。界面从窗口下拉里选源时会把三份都写进来，
-                // 优先级降级时各用各的（见 WindowMatch::PatternFor）。
+                // 匹配时按 rule 组合使用（见 WindowMatch::RequiredFields）。
                 wm.titlePattern = Str(m, "title");
                 wm.classPattern = Str(m, "className");
                 wm.processPattern = Str(m, "process");
-                // 老配置只写了 pattern，就把那一个值当成 title 的指纹 ——
-                // 以前 behavior 就是这样（pattern 装的本来就是标题）。
-                if (wm.titlePattern.empty()) wm.titlePattern = wm.pattern;
+                // 【老配置的 pattern 交给 Normalize 落到字段里】
+                // 以前这里无条件写 `titlePattern = pattern`，等于假设 pattern 装的
+                // 一定是标题。可老配置里 `by` 完全可能是 "process" 或 "class"，
+                // 那样就会把 exe 名塞进标题字段，新模型按 AND 一匹就永远匹不上
+                // （而且报的是"名称不匹配"，指向完全错误的方向）。
+                // Normalize 会看 `by` 决定落进哪个字段。
                 wm.pollMs = Num(m, "pollMs", wm.pollMs);
                 if (wm.pollMs < 100) wm.pollMs = 100; // 别让前端写出 0 导致忙轮询
                 wm.requireVisible = Flag(m, "requireVisible", true);
-                // 有序字段列表（界面拖动排的优先级）。缺省就留空 —— 匹配时
-                // 退回只用 "by" 那一个字段，老配置照样能用。
+                // 用户挑过的窗口（偏好，不参与条件比较）。负数/0 都当没挑过。
+                {
+                    const double hw = Num(m, "hwnd", 0);
+                    wm.preferredHwnd = hw > 0 ? static_cast<uint64_t>(hw) : 0;
+                }
+                // 匹配方式（四个显式选项）。没写就是老配置，交给 Normalize 推断。
+                MatchRule mr = wm.rule;
+                if (ParseMatchRule(Str(m, "rule"), mr)) {
+                    wm.rule = mr;
+                    wm.ruleGiven = true;
+                }
+                // 老模型的 byOrder 只留着给 Normalize 推断"首选字段"，不再参与匹配。
                 const Json* byOrder = m->Get("byOrder");
                 if (byOrder && byOrder->IsArray()) {
                     for (size_t k = 0; k < byOrder->Size(); ++k) {
@@ -734,6 +890,8 @@ bool ProfileStore::Load(const std::string& path, ProfileDoc& out, std::string& o
                         if (!dup) wm.fields.push_back(ff);
                     }
                 }
+                // 老配置在这里补成新模型（推断 rule、把 pattern 落到字段指纹）。
+                wm.Normalize();
                 p.match = wm;
                 p.hasMatch = true;
             }
@@ -806,7 +964,8 @@ bool ProfileStore::Save(const std::string& path, const ProfileDoc& doc, std::str
             << ", \"scaleWidth\": " << p.video.scaleWidth
             << ", \"scaleHeight\": " << p.video.scaleHeight << "}";
         if (p.hasMatch) {
-            out << ",\n      \"match\": {\"by\": \"" << ToString(p.match.field)
+            out << ",\n      \"match\": {\"rule\": \"" << ToString(p.match.rule)
+                << "\", \"by\": \"" << ToString(p.match.field)
                 << "\", \"byOrder\": [";
             // 有序优先级：界面拖动排的，第一个最优先。空列表就不写出来
             // （老版本服务不认识这个键，写空数组反而会让它以为用户清空了）。
@@ -825,6 +984,7 @@ bool ProfileStore::Save(const std::string& path, const ProfileDoc& doc, std::str
                 << "\", \"className\": \"" << JsonEscape(p.match.classPattern)
                 << "\", \"process\": \"" << JsonEscape(p.match.processPattern)
                 << "\", \"pollMs\": " << p.match.pollMs
+                << ", \"hwnd\": " << p.match.preferredHwnd
                 << ", \"requireVisible\": " << (p.match.requireVisible ? "true" : "false")
                 << "}\n";
         } else {

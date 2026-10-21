@@ -1028,6 +1028,15 @@ bool WindowCapture::TargetAliveLocked() const {
     if (!hwnd_) return false;
     const HWND h = static_cast<HWND>(hwnd_);
     if (!::IsWindow(h)) return false;
+    // 【关掉窗口 ≠ 销毁窗口】
+    //
+    // Chromium 系（浏览器 / Electron 客户端）关窗口常常只是 ShowWindow(SW_HIDE)：
+    // 句柄一直有效、pid 也没变，但合成器不再投帧。只判 IsWindow 的话这里会
+    // 永远返回"活着"，上层就一直重发最后一帧、状态永远 live —— 用户看到的是
+    // "窗口都关了，画面定在那不动，也不弹 NO SIGNAL"。
+    //
+    // 最小化不受影响：IsWindowVisible 对最小化窗口仍然为真。
+    if (!::IsWindowVisible(h)) return false;
     // 句柄还活着，但可能早就是别人的窗口了（HWND 会复用）。
     // 只比 pid 不比较线程：explorer.exe 的窗口会被不同 UI 线程创建。
     if (hwndPid_ != 0) {

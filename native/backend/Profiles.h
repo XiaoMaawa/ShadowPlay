@@ -48,6 +48,30 @@ enum class MatchPick {
     Oldest,     // 创建最早的
 };
 
+// 匹配方式 —— 界面上的四个选项，**应用程序（exe）永远是必要条件**。
+//
+// 【为什么把"优先级降级"整个换掉】
+// 老模型是「标题 → 类名 → exe 逐级降级，第一个能匹到的字段说了算」。它的致
+// 命问题是会**悄悄换源**：用户录的是 B 站客户端的某个视频页，标题一变（切回
+// 首页、换个视频），标题就永远匹不上了，于是降级到类名；而 Chrome_WidgetWin_1
+// 这种类名满机都是（WorkBuddy、各种 Electron 应用都用它），`pick:largest`
+// 会挑中面积最大的那个 —— 用户看到的正是「标题明明完全对不上，为什么录到了
+// 别的窗口」。用户原话：「如果匹配不到，不要随便选择一个窗口啊，优先匹配改掉」。
+//
+// 新模型只有四个显式选项，每个都必须先满足应用程序，再叠加其它条件（全部
+// AND，任意一条不满足就**不匹配**、这一路保持未采集）：
+//   · 只匹配应用程序          —— 同一程序的哪个窗口都行
+//   · 名字 + 应用程序        —— 同一个程序里按标题区分是哪一窗口
+//   · 类名 + 应用程序        —— 同一程序里再按窗口类名收窄
+//   · 名字 + 类名 + 应用程序  —— 最严格
+// 没有"降级"，也就没有"标题对不上却录了别的窗口"这条路。
+enum class MatchRule {
+    ProcessOnly,       // 只匹配应用程序
+    TitleProcess,      // 匹配名字和应用程序
+    ClassProcess,      // 匹配类名和应用程序
+    TitleClassProcess, // 匹配名字、类名和应用程序
+};
+
 struct WindowMatch {
     MatchField field = MatchField::Title;
     MatchMode  mode = MatchMode::Contains;
@@ -73,16 +97,37 @@ struct WindowMatch {
     std::string classPattern;
     std::string processPattern;
 
-    // 有序的匹配字段：界面让用户拖动排优先级，第一个是最优先的。
+    // 有序的匹配字段：老模型的产物（界面让你拖动排优先级），**只用于迁移**。
     //
-    // 为什么要"有序"而不是单一字段：用户从下拉里选了一个窗口，界面会同时
-    // 拿到它的标题、类名、exe 名。同一个程序开两个窗口时标题才是唯一区分，
-    // 但标题会随文档变（"未命名 - 记事本" → "a.txt - 记事本"）；类名稳定
-    // 但一个 exe 的多个窗口往往同类；exe 名最稳但最粗。按用户排的顺序逐个
-    // 试，第一个能匹配到的字段说了算，就同时具备了"精确"和"能跟上变化"。
-    //
-    // 空 = 老配置，退回只用 field 一个字段（向后兼容）。
+    // 老服务按 fields 逐级降级，正是"标题对不上却录了别的窗口"的根源（见
+    // MatchRule 的说明）。现在真正决定匹配的是 rule；fields 只在读老配置时
+    // 用来推断"用户当初把哪个字段放第一位"，推断完就不再参与匹配。
     std::vector<MatchField> fields;
+
+    // 匹配方式（界面下拉里那四个选项）。默认为「名字 + 应用程序」——
+    // 同一程序开多个窗口时，只有标题能把它们分开，这是最常用的那一档。
+    MatchRule rule = MatchRule::TitleProcess;
+
+    // 用户在窗口下拉里**明确挑过**的那个窗口（hwnd，0 = 没挑过 / 未知）。
+    //
+    // 【为什么需要它】「只匹配应用程序」这一档里，同一个程序的多个窗口全都
+    // 满足规则，按 pick:largest 永远只会挑面积最大的那一个 —— 于是用户在下拉
+    // 里换成同一个程序的另一个窗口时，配置里的指纹（exe）一个字都没变，服务
+    // 根本没理由换源，看起来就是"下拉能点，但切不过去"。
+    //
+    // 这个字段是**偏好**，不是条件：它只在"已经满足 rule 的候选窗口"里挑，
+    // 绝不因为它而放宽匹配（否则又变成乱录别的窗口）。挑过的窗口关掉了，
+    // 就自然退回 pick 逻辑 —— 这正是「只匹配应用程序」该有的行为。
+    //
+    // 用 hwnd 当偏好是安全的：hwnd 会被系统复用，但复用出来的窗口必须先满足
+    // rule 才会被考虑，等于是"同一个程序的另一个窗口"，那本来就该录。
+    uint64_t preferredHwnd = 0;
+
+    // 配置文件里是否明确写了 "rule"。
+    //
+    // false = 老配置（或代码里临时构造的），此时按 fields/by 和已有的字段
+    // 指纹**推断**一个 rule（见 Normalize），推断是纯函数，重复调用结果一致。
+    bool ruleGiven = false;
 
     bool Valid() const { return !pattern.empty() || !titlePattern.empty() || !classPattern.empty() || !processPattern.empty(); }
 
@@ -102,7 +147,59 @@ struct WindowMatch {
         return pattern;
     }
 
-    // 实际参与匹配的字段序列（fields 为空时退回 {field}）。
+    // 某个字段**自己那份**指纹（不退回 pattern）。
+    //
+    // 匹配时用这个而不是 PatternFor：退回 pattern 会让"类名"拿标题去比，
+    // 那是老降级链里的隐形 bug。缺指纹就是缺，交给 Complete() 判不匹配。
+    const std::string& FieldPattern(MatchField f) const {
+        switch (f) {
+            case MatchField::Title:
+                return titlePattern;
+            case MatchField::Class:
+                return classPattern;
+            case MatchField::Process:
+                return processPattern;
+        }
+        return pattern;
+    }
+
+    // 这个 rule 要求**同时满足**哪些字段（全部 AND）。
+    std::vector<MatchField> RequiredFields() const {
+        switch (rule) {
+            case MatchRule::ProcessOnly:
+                return {MatchField::Process};
+            case MatchRule::ClassProcess:
+                return {MatchField::Class, MatchField::Process};
+            case MatchRule::TitleClassProcess:
+                return {MatchField::Title, MatchField::Class, MatchField::Process};
+            case MatchRule::TitleProcess:
+            default:
+                return {MatchField::Title, MatchField::Process};
+        }
+    }
+
+    // 必填字段里**真正有指纹**的那几个。
+    //
+    // 为什么要跳过空指纹而不是"缺一个就整体不匹配"：老配置可能只记了标题
+    // （当年没有 exe 指纹），要求它必须有 exe 等于把这个配置永久判死。但跳过
+    // 只针对"用户根本没填"的字段 —— 填了却没匹上，就是彻底不匹配，绝不降级。
+    std::vector<MatchField> ActiveFields() const {
+        std::vector<MatchField> out;
+        for (MatchField f : RequiredFields()) {
+            if (!FieldPattern(f).empty()) out.push_back(f);
+        }
+        return out;
+    }
+
+    // 把老配置补成新模型（就地修正，幂等）。Load 解析完会调一次，
+    // MatchWindows 入口也会调一次，保证代码里临时构造的规则同样成立。
+    void Normalize();
+
+    // 给人看的规则描述，例如「名字包含「xxx」+ 应用程序「chrome.exe」」。
+    // 匹配不到时直接写进这一路的状态说明，用户一眼知道差在哪。
+    std::string Describe() const;
+
+    // 实际参与匹配的字段序列（老模型遗留，只有迁移逻辑还用得到）。
     std::vector<MatchField> FieldOrder() const {
         if (!fields.empty()) return fields;
         return {field};
@@ -200,6 +297,19 @@ struct Profile {
     // 界面表现就是「短暂的 no signal」「导出按钮被禁用」「该路未在录制」
     // （m13003）。
     bool SameSettingsIgnoringFps(const Profile& other) const;
+
+    // 同上，但连**码率**（video.bitrateMbps）一起忽略。
+    //
+    // 【为什么需要】码率和帧率一样能就地改：同样写在 SinkWriter 的输出流上，
+    // 同样靠「收掉当前片、按新参数开新片」实现，不换轮次目录、不归零分片
+    // 序号、时间轴继续顺延（见 MfEncoder::SetBitrate）。
+    //
+    // 以前只有 SameSettingsIgnoringFps 这一级，改码率就落进「拆掉重建」分支：
+    // 用户只是把码率 20 改成 10，界面却走了和重启一样的路径 —— 新轮次目录、
+    // recordSegments 归零（导出按钮变灰）、时间轴空洞被补成 NO SIGNAL。
+    // 用户的原话（m14071）：「有关编辑的东西一保存立刻落地，像配置改帧率，
+    // 改码率什么的」。
+    bool SameSettingsIgnoringFpsBitrate(const Profile& other) const;
 };
 
 // ---------------------------------------------------------------------------
@@ -234,12 +344,14 @@ const char* ToString(SourceKind k);
 const char* ToString(MatchField f);
 const char* ToString(MatchMode m);
 const char* ToString(MatchPick p);
+const char* ToString(MatchRule r);
 
 // 解析失败时返回 false，out 保持原值
 bool ParseSourceKind(const std::string& s, SourceKind& out);
 bool ParseMatchField(const std::string& s, MatchField& out);
 bool ParseMatchMode(const std::string& s, MatchMode& out);
 bool ParseMatchPick(const std::string& s, MatchPick& out);
+bool ParseMatchRule(const std::string& s, MatchRule& out);
 
 // 把 id 洗成合法的会话名（只含 [A-Za-z0-9._-]，首字符是字母）。
 // 全部字符都不合法时返回 "s" + 原串的哈希，保证非空且稳定。

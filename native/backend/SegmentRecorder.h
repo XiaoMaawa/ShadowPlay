@@ -87,6 +87,43 @@ struct RecorderStats {
     uint64_t droppedFrames = 0;    // 因为采不到/尺寸不符丢掉的帧
     uint32_t segmentsOnDisk = 0;   // 当前目录里的分片数
     uint64_t diskBytes = 0;        // 分片目录总字节数
+    // 码率（Mbps）。requested 是配置值（0 = 没配、走估算），effective 是编码器
+    // 真正在用的值。两个都报出来，界面才能确认「我配的 5 Mbps 真的落地了」，
+    // 而不是像以前那样被 SetFps/ResizeTo 偷偷换成估算值（m14071）。
+    uint32_t requestedBitrateMbps = 0;
+    uint32_t effectiveBitrateMbps = 0;
+    // 帧率同上：requested 是配置值，effective 是编码器被硬件吞吐上限降档后的值。
+    uint32_t requestedFps = 0;
+    uint32_t effectiveFps = 0;
+
+    // ---- 「到底丢没丢帧」的两个计数 --------------------------------------
+    //
+    // 用户的要求（m15478）：「我可以理解降帧率，但是最好不要丢帧」。
+    // 「丢帧」其实有两种，表现完全不同，必须分开数才说得清：
+    //
+    //   repeatFrames  编码时间轴上的重复帧。时间轴必须严格等于 fps × 真实
+    //                 时长，喂帧线程落后时只能拿"上一帧"补足；补出来的这些
+    //                 就是重复帧 —— 帧数一个不少，但画面停住了几拍，观感
+    //                 是"卡"。这个数除以 framesIn 就是重复率，0 表示每一
+    //                 拍都是新画面。
+    //
+    //   captureDropped 采集到、但没进编码器的帧。采集比编码快时（240 帧
+    //                 采集 vs 165 帧编码），待喂槽只有一格、新帧覆盖旧的，
+    //                 被覆盖掉的那张就永远没编码 —— 这是"降帧率"必然的
+    //                 代价，但它不破坏时间轴，只是运动细节少了。
+    //
+    // 两者都为 0 才叫真的"既不卡、也不变速"。
+    uint64_t repeatFrames = 0;
+    uint64_t captureDropped = 0;
+
+    // 采集端一共投进来多少帧（Feed 成功次数）。
+    //
+    // 【为什么必须单独数】repeatFrames / framesIn 只能说明"编码时间轴上有多少
+    // 拍是重复的"，但重复的成因有两种，修法完全不同：
+    //   * 采集端本来就没给到那么多帧（采集循环跑不到配置帧率）→ 要高的是采集；
+    //   * 采集端给了，但喂帧线程取不到（节拍相位错开）→ 要改的是取槽逻辑。
+    // 有了 captureFrames 一比就清楚：captureFrames 远小于 framesIn 就是前者。
+    uint64_t captureFrames = 0;
 };
 
 /**
@@ -157,7 +194,34 @@ public:
      */
     bool SetFps(uint32_t fps, uint32_t timeoutMs = 3000);
 
+    /**
+     * 就地改码率（不重建录制器、不换轮次目录、分片序号继续递增）。
+     *
+     * 与 SetFps 完全同一套机制（序号 + 条件变量），只是改的是码率：
+     * 喂帧线程在两帧之间调 encoder_->SetBitrate()，编码器收尾当前片、按新
+     * 码率开新片，时间轴靠 nextSegStartUnix_ 继续顺延。
+     *
+     * 【为什么需要】码率原来只写在 MfEncoder::Start() 的入参里，改它只能靠
+     * reload 把整路 Session 拆掉重建（新轮次目录、recordSegments 归零、导出
+     * 按钮变灰）。用户的原话（m14071）：「有关编辑的东西一保存立刻落地，像
+     * 配置改帧率，改码率什么的」。
+     *
+     * 返回 true = 已经按新码率工作（或码率本来就没变）；false = 没在录 / 超时。
+     */
+    bool SetBitrate(uint32_t bitrateMbps, uint32_t timeoutMs = 3000);
     bool Running() const;
+
+    /**
+     * 编码器**当前真正在用的**帧率（已经被硬件吞吐上限降档过的值）。
+     *
+     * 没在录、或还没起编码器时返回 0。
+     *
+     * 【为什么要暴露它】采集节拍必须夹到这个值上，否则采集比编码快的那部分
+     * 帧全被待喂槽顶掉（实测 240 采集 / 165 编码，22 秒丢掉 2727 帧）。
+     * 用户的要求是「可以降帧率，但最好不要丢帧」（m15478）。
+     * 见 Session.cpp 采集循环里 wantFps 的夹取。
+     */
+    uint32_t CurrentFps() const;
 
     /** 取状态快照（会顺手扫一遍分片目录，别用太高的频率调）。 */
     RecorderStats Stats() const;
@@ -183,6 +247,14 @@ private:
     void StartFeeder();
     // 把槽里的帧送进编码器。返回 false 表示编码器坏了。
     bool EncodeFrame(const std::vector<uint8_t>& frame);
+
+    // 补一帧"和上一帧一样"的画面：让编码器复用样本缓冲里已有的 NV12，
+    // 只换时间戳再 WriteSample 一次。返回 false 表示编码器坏了。
+    //
+    // 为什么单独一个函数而不是 EncodeFrame(nullptr)：两个函数的统计口径不同
+    // （补帧不算 bytesIn，因为没有新的像素进来），而且调用点彼此独立、
+    // 混在一起读代码的人容易误以为补帧也会拷像素。
+    bool EncodeRepeat();
 
     std::string dir_;
     std::string segmentsDir_;   // <dir>/segments —— 分片根目录，下面按轮次分子目录
@@ -212,10 +284,37 @@ private:
     std::mutex slotMu_;
     std::condition_variable slotCv_;
     std::vector<uint8_t> slot_;      // 当前待喂帧（紧凑排布，stride = width*4）
+
+    // 采集线程的私有暂存区（Feed() 先拷到这里，再在锁里 O(1) 换给 slot_）。
+    //
+    // 【为什么要有它】原来 Feed() 整段 memcpy 都在 slotMu_ 里面，1440p 一帧
+    // 14.7MB、实测约 1.5ms；而喂帧线程取帧要的正是这把锁，等于每次投帧都把
+    // 它堵住 1.5ms。165fps 每帧预算只有 6.06ms，一堵就吃掉四分之一，喂帧
+    // 线程于是总"晚到"、槽里永远是上一拍那帧，只能补重复帧 —— 实测
+    // repeatFrames 占到一半，真实画面只剩 50%。
+    //
+    // 只有一个生产者（Session 的采集线程按路各一个），所以这块缓冲不需要
+    // 额外保护：换出去之后 slot_ 里是刚写满的那块，writeBuf_ 里是上一拍的
+    // 旧槽（下次 resize/写会被直接覆盖），两边不重叠。
+    std::vector<uint8_t> writeBuf_;
     bool slotFull_ = false;
     bool feedStop_ = false;          // 通知喂帧线程收工
     uint64_t slotSeq_ = 0;           // 投进来的序号，用来判断有没有取到新的
     uint64_t slotTakenSeq_ = 0;      // 喂帧线程已经取走的序号
+
+    // 采集端投进来、但被"槽只有一格"顶掉的总帧数（见 RecorderStats::captureDropped）。
+    // 只在 Feed() 覆盖一个**尚未被取走**的槽时累加 —— 那才是真的丢了内容；
+    // 槽已被取走再投新帧是正常节奏，不算丢。
+    //
+    // 【为什么是 atomic 而不是普通 uint64_t】Stats() 是 const 成员、拿不到
+    // slotMu_（const 方法里不能锁非 mutable 的 mutex），而为了读一个统计数字去
+    // 把 slotMu_ 改成 mutable 会引入一条新的锁顺序（mu_ → slotMu_），
+    // 喂帧线程那边是 slotMu_ → mu_，容易死锁。计数只增不改，用原子最省事。
+    std::atomic<uint64_t> slotOverwritten_{0};
+
+    // 采集端投进来的总帧数（Feed 成功次数），只为把「采集端到底给了多少帧」
+    // 报出来，跟 captureDropped 一起判成因。同样用原子，理由同上。
+    std::atomic<uint64_t> slotFed_{0};
 
     // 槽里那一帧的尺寸。
     //
@@ -255,6 +354,20 @@ private:
     uint64_t fpsWant_ = 0;                // 请求序号
     uint64_t fpsDone_ = 0;                // 已完成到的序号
     bool fpsOk_ = false;                  // 最近一次改帧率的成败
+
+    // ---- 改码率请求（界面改配置时用）--------------------------------------
+    //
+    // 与改帧率同一套机制：命令线程置 brWantValue_/brWant_，喂帧线程在两帧
+    // 之间看到就调 encoder_->SetBitrate()，完成后置 brDone_。
+    //
+    // 为什么不跟 fps 共用一组变量：两个请求可能同时到达（用户一次把帧率和
+    // 码率都改了），共用序号会让后一个把前一个的「已完成」误当成自己的。
+    std::mutex brMu_;
+    std::condition_variable brCv_;
+    uint32_t brWantValue_ = 0;            // 命令线程要改成多少 Mbps（0 = 自动估）
+    uint64_t brWant_ = 0;                 // 请求序号
+    uint64_t brDone_ = 0;                 // 已完成到的序号
+    bool brOk_ = false;                   // 最近一次改码率的成败
 };
 
 } // namespace shadow

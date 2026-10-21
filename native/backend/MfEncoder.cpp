@@ -389,11 +389,72 @@ void ConvertBgraToNv12Impl(const uint8_t* src, uint32_t stride, uint32_t width,
     // 色度：2x2 取平均。
     // U = ((-38R - 74G + 112B + 128) >> 8) + 128
     // V = ((112R - 94G - 18B + 128) >> 8) + 128
+    //
+    // 【为什么必须向量化】实测（native/probe_nv12_time.cpp，2560x1440）：
+    //   Y 平面（已是 SSE）  1.735 ms/帧
+    //   色度（原来的标量）  3.153 ms/帧   ← 比整个 Y 平面还贵
+    //   色度（下面这版）    1.508 ms/帧
+    // 165fps 每帧预算只有 6.06ms，而 WriteSample 自己还要 2.25ms；标量色度
+    // 让每帧总成本顶到 7.14ms，喂帧线程永远追不上节拍 —— 实测 repeatFrames
+    // 占 55%、真实画面只剩 44%，主人看到的就是"卡"。
+    //
+    // 一次处理 8 像素（4 个 2x2 块）：上下两行 unpack 成 16 位后相加（相当于
+    // 对 2x2 块做 S），再 madd 一次同时算 U 和 V，横向两两相加后用 packs
+    // 压回字节。与标量版只有一处差别：标量版先 >>2 再乘系数，这里不除，
+    // 于是把 >>8 换成 >>10 —— 实测最大差 1 个色度级（不可见）。
+    //
+    // 变量名带 c 前缀：`zero` 在上面 Y 平面那一段已经用掉了，同函数内重名
+    // 会报 error C2086。
+    const __m128i cZero = _mm_setzero_si128();
+    const __m128i cU = _mm_setr_epi16(112, -74, -38, 0, 112, -74, -38, 0);
+    const __m128i cV = _mm_setr_epi16(-18, -94, 112, 0, -18, -94, 112, 0);
+    const __m128i rnd = _mm_set1_epi32(512 + (128 << 10));
     for (uint32_t y = 0; y + 1 < height; y += 2) {
         const uint8_t* s0 = src + static_cast<size_t>(y) * stride;
         const uint8_t* s1 = s0 + stride;
         uint8_t* d = uvPlane + static_cast<size_t>(y / 2) * width;
-        for (uint32_t x = 0; x + 1 < width; x += 2) {
+        uint32_t x = 0;
+        for (; x + 8 <= width; x += 8) {
+            const size_t off = static_cast<size_t>(x) * 4u;
+            const __m128i a0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s0 + off));
+            const __m128i a1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s0 + off + 16));
+            const __m128i b0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s1 + off));
+            const __m128i b1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s1 + off + 16));
+
+            const __m128i p0 =
+                _mm_add_epi16(_mm_unpacklo_epi8(a0, cZero), _mm_unpacklo_epi8(b0, cZero));
+            const __m128i p1 =
+                _mm_add_epi16(_mm_unpackhi_epi8(a0, cZero), _mm_unpackhi_epi8(b0, cZero));
+            const __m128i p2 =
+                _mm_add_epi16(_mm_unpacklo_epi8(a1, cZero), _mm_unpacklo_epi8(b1, cZero));
+            const __m128i p3 =
+                _mm_add_epi16(_mm_unpackhi_epi8(a1, cZero), _mm_unpackhi_epi8(b1, cZero));
+
+            // 每个 2x2 块：[U, V, U, V]（两次 hadd 把 4 路合并成成对结果）
+            const __m128i t0 = _mm_hadd_epi32(_mm_madd_epi16(p0, cU), _mm_madd_epi16(p0, cV));
+            const __m128i t1 = _mm_hadd_epi32(_mm_madd_epi16(p1, cU), _mm_madd_epi16(p1, cV));
+            const __m128i t2 = _mm_hadd_epi32(_mm_madd_epi16(p2, cU), _mm_madd_epi16(p2, cV));
+            const __m128i t3 = _mm_hadd_epi32(_mm_madd_epi16(p3, cU), _mm_madd_epi16(p3, cV));
+            const __m128i r0 = _mm_hadd_epi32(t0, t0);
+            const __m128i r1 = _mm_hadd_epi32(t1, t1);
+            const __m128i r2 = _mm_hadd_epi32(t2, t2);
+            const __m128i r3 = _mm_hadd_epi32(t3, t3);
+
+            const __m128i u01 = _mm_unpacklo_epi32(r0, r1); // U0 U1 V0 V1
+            const __m128i u23 = _mm_unpacklo_epi32(r2, r3); // U2 U3 V2 V3
+            __m128i uv0 = _mm_unpacklo_epi64(u01, u23);     // U0 U1 U2 U3
+            __m128i uv1 = _mm_unpackhi_epi64(u01, u23);     // V0 V1 V2 V3
+            uv0 = _mm_srai_epi32(_mm_add_epi32(uv0, rnd), 10);
+            uv1 = _mm_srai_epi32(_mm_add_epi32(uv1, rnd), 10);
+
+            // [U0..U3, V0..V3] 交错成 U0 V0 U1 V1 …
+            const __m128i pk = _mm_packs_epi32(uv0, uv1);
+            const __m128i vWords = _mm_srli_si128(pk, 8);
+            const __m128i inter = _mm_unpacklo_epi16(pk, vWords);
+            const __m128i bytes = _mm_packus_epi16(inter, inter);
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(d + x), bytes);
+        }
+        for (; x + 1 < width; x += 2) {
             const uint8_t* p00 = s0 + static_cast<size_t>(x) * 4u;
             const uint8_t* p01 = p00 + 4u;
             const uint8_t* p10 = s1 + static_cast<size_t>(x) * 4u;
@@ -539,7 +600,8 @@ bool MfEncoder::Start(const std::string& dir, uint32_t width, uint32_t height, u
     width_ = width;
     height_ = height;
     fps_ = fps ? fps : 60;
-    if (fps_ > 240) fps_ = 240;
+    // 硬上限 120fps（见 MfEncoder.h 的 kMaxFps）。老配置里手写的 240 也在这里夹住。
+    if (fps_ > kMaxFps) fps_ = kMaxFps;
     // 记下用户真正要的帧率：StartWithFpsFallback 可能会把 fps_ 降下来，
     // 界面上的说明要写「已从 X 帧降到 Y 帧」。
     requestedFps_ = fps_;
@@ -565,6 +627,9 @@ bool MfEncoder::Start(const std::string& dir, uint32_t width, uint32_t height, u
         if (bitrateMbps < 2) bitrateMbps = 2;
         if (bitrateMbps > 100) bitrateMbps = 100;
     }
+    // 记住「用户配的那个值」（0 = 没配），后面 SetFps / ResizeTo 重算码率时
+    // 要靠它区分「显式配置」和「按尺寸估算」—— 显式配置的不许被估算值覆盖。
+    requestedBitrateMbps_ = bitrateMbps;
     bitrateBps_ = bitrateMbps * 1000000u;
 
     segmentFrames_ = fps_ * segmentSeconds_;
@@ -663,10 +728,13 @@ bool MfEncoder::StartWithFpsFallback() {
     // 帧率阶梯：先用用户要的那个，被拒就往下走。
     //
     // 【为什么是阶梯而不是二分】每档失败都要重开 SinkWriter（约 300~400ms，全在
-    // NVENC 的 MFT 初始化里）。阶梯从 144 往上一档就是 165、再往上 240，实际
-    // 命中率很高；真落到 30 帧说明这个分辨率硬件压根不编码，那时帧率已经不是
-    // 主要问题了。
-    static const uint32_t kLadder[] = {240, 165, 144, 120, 90, 60, 30};
+    // NVENC 的 MFT 初始化里）。阶梯从 120 往下每档都是常用的整档，命中率很高；
+    // 真落到 30 帧说明这个分辨率硬件压根不编码，那时帧率已经不是主要问题了。
+    //
+    // 【为什么没有 144/165/240 了】主人拍板把 120 以上全部砍掉（见 MfEncoder.h
+    // 的 kMaxFps）。1440p 的物理上限 172 里，165 那档每帧成本已经顶破帧预算、
+    // 真实画面只剩一半；240 从来录不到。120 是稳定区间的最上沿。
+    static const uint32_t kLadder[] = {120, 90, 60, 30};
 
     const uint32_t requested = fps_;
     uint32_t candidate = requested;
@@ -910,72 +978,92 @@ bool MfEncoder::OpenSegment() {
 }
 
 bool MfEncoder::EnsureSample() {
-    if (sample_) return true;
+    if (!samplePool_.empty()) return true;
 
     // NV12 一帧 = Y 平面（w×h）+ 交错色度平面（(w/2)×(h/2)×2 = w×h/2）
     //          = w × h × 3/2。width_/height_ 在 Start/ResizeTo 里已经取过偶。
     const DWORD rowBytes = width_;                     // Y 平面行距 = width
     const DWORD frameBytes = width_ * height_ * 3u / 2u;
 
-    // 转换用的中间缓冲：源 BGRA 行距可能不等于 width*4（DXGI staging 对齐到
-    // 256 字节），所以按画布尺寸分配、逐行转换，不直接原地转。
-    nv12Buf_.assign(frameBytes, 0);
+    // 【池深怎么定】见 MfEncoder.h 里 samplePool_ 的注释：单样本复用会让
+    // SinkWriter 在我们改写还在途的那一帧时**静默丢帧**（165fps 只剩 31%）。
+    //
+    // 池深**随帧率走**：在途帧数就是「喂进 WriteSample 但编码器还没消费完」
+    // 的那一串，喂得越快排得越长。实测（1440p，每片 2 秒，看每片实际落盘帧数
+    // 与标称比）：
+    //     池深  8 →  90fps 100% / 120fps 100% / 144fps 96%（每片少 8~17 帧）
+    //     池深 16 →  144fps 仍 96%（272/288）
+    //     池深 24 →  90/120/144/165 四档全部 100%
+    // 所以按 fps/6 取（30→8 封底、144 及以上→24 封顶），低帧率不必白吃内存。
+    // 1440p 一份 NV12 = 5.5MB，24 份 132MB；60fps 只要 10 份 55MB。
+    uint32_t depth = fps_ / 6u;
+    if (depth < 8u) depth = 8u;
+    if (depth > 24u) depth = 24u;
+    const uint32_t kPoolDepth = depth;
 
-    IMFMediaBuffer* buf = nullptr;
-    HRESULT hr = MFCreateMemoryBuffer(frameBytes, &buf);
-    if (FAILED(hr)) {
-        status_.failed = true;
-        status_.detail = "MFCreateMemoryBuffer 失败（内存不足）";
-        return false;
-    }
+    for (uint32_t i = 0; i < kPoolDepth; ++i) {
+        IMFMediaBuffer* buf = nullptr;
+        HRESULT hr = MFCreateMemoryBuffer(frameBytes, &buf);
+        if (FAILED(hr)) {
+            status_.failed = true;
+            status_.detail = "MFCreateMemoryBuffer 失败（内存不足）";
+            ReleaseSample();
+            return false;
+        }
 
-    IMFSample* sample = nullptr;
-    hr = MFCreateSample(&sample);
-    if (FAILED(hr)) {
+        IMFSample* sample = nullptr;
+        hr = MFCreateSample(&sample);
+        if (FAILED(hr)) {
+            buf->Release();
+            status_.failed = true;
+            status_.detail = "MFCreateSample 失败";
+            ReleaseSample();
+            return false;
+        }
+        sample->AddBuffer(buf);
         buf->Release();
-        status_.failed = true;
-        status_.detail = "MFCreateSample 失败";
-        return false;
-    }
-    sample->AddBuffer(buf);
-    buf->Release();
 
-    // 一次 Lock 拿到指针常驻，写帧时只 memcpy 不再进 COM。
-    // Lock 出来的指针在 Unlock 之前一直有效，而我们在 ReleaseSample 之前
-    // 不会 Unlock —— 每帧一次 Lock/Unlock 会带来可观的 COM 开销。
-    BYTE* dst = nullptr;
-    DWORD maxLen = 0;
-    hr = sample->GetBufferByIndex(0, &buf);
-    if (SUCCEEDED(hr)) {
-        hr = buf->Lock(&dst, &maxLen, nullptr);
-        buf->Release();
-    }
-    if (FAILED(hr) || !dst) {
-        sample->Release();
-        status_.failed = true;
-        status_.detail = "锁缓冲区失败";
-        return false;
+        // 一次 Lock 拿到指针常驻，写帧时只 memcpy 不再进 COM。
+        BYTE* dst = nullptr;
+        DWORD maxLen = 0;
+        hr = sample->GetBufferByIndex(0, &buf);
+        if (SUCCEEDED(hr)) {
+            hr = buf->Lock(&dst, &maxLen, nullptr);
+            buf->Release();
+        }
+        if (FAILED(hr) || !dst) {
+            sample->Release();
+            status_.failed = true;
+            status_.detail = "锁缓冲区失败";
+            ReleaseSample();
+            return false;
+        }
+        samplePool_.push_back(sample);
+        samplePtrs_.push_back(dst);
     }
 
-    sample_ = sample;
-    sampleBytes_ = dst;
     samplePitch_ = rowBytes;  // Y 平面行距（= width），NV12 的样本缓冲按它排布
+    sampleNext_ = 0;
     return true;
 }
 
 void MfEncoder::ReleaseSample() {
-    IMFSample* sample = static_cast<IMFSample*>(sample_);
-    sample_ = nullptr;
-    sampleBytes_ = nullptr;
-    samplePitch_ = 0;
-    if (!sample) return;
-
-    IMFMediaBuffer* buf = nullptr;
-    if (SUCCEEDED(sample->GetBufferByIndex(0, &buf)) && buf) {
-        buf->Unlock();
-        buf->Release();
+    for (size_t i = 0; i < samplePool_.size(); ++i) {
+        IMFSample* sample = static_cast<IMFSample*>(samplePool_[i]);
+        if (!sample) continue;
+        IMFMediaBuffer* buf = nullptr;
+        if (SUCCEEDED(sample->GetBufferByIndex(0, &buf)) && buf) {
+            buf->Unlock();
+            buf->Release();
+        }
+        sample->Release();
     }
-    sample->Release();
+    samplePool_.clear();
+    samplePtrs_.clear();
+    sampleNext_ = 0;
+    samplePitch_ = 0;
+    // 缓冲没了，里面那些画面也就没了 —— 补帧不能把它当成可复用的内容。
+    sampleHasFrame_ = false;
 }
 
 void MfEncoder::CloseSegment() {
@@ -1196,7 +1284,14 @@ void MfEncoder::RewriteIndex() {
 }
 
 bool MfEncoder::Write(const void* pixels, uint32_t stride, uint32_t width, uint32_t height) {
-    if (!pixels || !writer_) return false;
+    // 【pixels == nullptr 表示"这一帧和上一帧一模一样"】
+    // 喂帧线程补帧时走这个口子：样本缓冲里已经躺着上一帧转好的 NV12，直接
+    // 换个时间戳再 WriteSample 一次就行 —— 省掉 ConvertToNv12 + memcpy。
+    //
+    // 为什么非要这个口子：1440p 一帧的转换+拷贝实测 8~9ms，而 165fps 的预算
+    // 只有 6.06ms。补帧也走全量转换的话，欠账只会越滚越大，最后写进去的
+    // 绝大部分都是重复帧 —— 用户报的「切片刻成 PPT」就是这么来的。
+    if (!writer_) return false;
 
     // 喂帧线程通常和 Start() 那个线程不同，套间要自己进。
     //
@@ -1228,17 +1323,23 @@ bool MfEncoder::Write(const void* pixels, uint32_t stride, uint32_t width, uint3
     // `if 大/else if 不等`，切片那条路就不进 WritePadded，下面按画布行距读源
     // 缓冲逐行越界，0xC0000005，Fault offset 0x55A30）。两个独立的 if：只要
     // 尺寸不一致就走贴图路径，那条路径里的 width_/height_ 一定装得下这一帧。
-    if (width > width_ || height > height_) {
-        if (!ResizeTo(width, height)) return false;
-    }
-    if (width != width_ || height != height_) {
-        // WritePadded 会递归回 Write（画布尺寸已匹配），那次再进套间是嵌套
-        // 计数，无害。
-        return WritePadded(pixels, stride, width, height);
+    //
+    // 【补帧（pixels == nullptr）整段跳过尺寸判断】它复用样本里已有的画面，
+    // 没有像素也就无所谓尺寸；而且换尺寸那一拍样本刚被 ReleaseSample 扔掉，
+    // 下面 `sampleHasFrame_` 为假会直接空过这一拍。
+    const bool repeat = (pixels == nullptr);
+    if (!repeat) {
+        if (width > width_ || height > height_) {
+            if (!ResizeTo(width, height)) return false;
+        }
+        if (width != width_ || height != height_) {
+            // WritePadded 会递归回 Write（画布尺寸已匹配），那次再进套间是嵌套
+            // 计数，无害。
+            return WritePadded(pixels, stride, width, height);
+        }
     }
 
     IMFSinkWriter* writer = static_cast<IMFSinkWriter*>(writer_);
-    const DWORD rowBytes = width_;                       // NV12 的 Y 平面行距
     const DWORD frameBytes = width_ * height_ * 3u / 2u;  // Y + UV
     HRESULT hr = S_OK;
 
@@ -1247,35 +1348,65 @@ bool MfEncoder::Write(const void* pixels, uint32_t stride, uint32_t width, uint3
     //
     // 递归进来的那次（WritePadded 补完黑边回来）传的是**画布**尺寸，不能记账
     // —— 真实尺寸已经由 WritePadded 自己记过了。
-    if (!padRecurse_) {
+    if (!repeat && !padRecurse_) {
         if (width > segContentW_) segContentW_ = width;
         if (height > segContentH_) segContentH_ = height;
     }
 
     // 【复用样本，不再每帧分配】见 MfEncoder.h 里 sample_ 的注释：
     // 每帧 MFCreateMemoryBuffer(14.7MB) 让 1440p@144 每秒分配 2.1GB，
-    // 实测进程峰值工作集 854MB。这里改成每片分配一次。
+    // 实测进程峰值工作集 854MB。这里改成每片分配一组、写帧轮转。
+    //
+    // 【关键】每一帧都必须换池里的下一份用。复用同一份会让 SinkWriter 在
+    // 高帧率下静默丢帧（165fps 只落盘 31%，60fps 才 100%），见 MfEncoder.h
+    // 里 samplePool_ 的注释与 native/probe_sw_drop.cpp 的对照数据。
     if (!EnsureSample()) return false;
-    IMFSample* sample = static_cast<IMFSample*>(sample_);
-    uint8_t* dst = sampleBytes_;
+    const uint32_t poolDepth = static_cast<uint32_t>(samplePool_.size());
+    if (poolDepth == 0) return false;
+    const uint32_t slot = sampleNext_ % poolDepth;
+    IMFSample* sample = static_cast<IMFSample*>(samplePool_[slot]);
 
-    // 【自己转 NV12，不再让 SinkWriter 转】见 MfEncoder.h 里 nv12Buf_ 的注释：
-    // 这一步把 1440p@144 的 CPU 从 3.8~6.8 核压到 0.8 核，颜色还更准。
-    //
-    // 转换读源、写 nv12Buf_，然后整块 memcpy 进样本缓冲。不直接转进样本缓冲
-    // 的原因：DXGI staging 的行距会对齐到 256 字节（常大于 width*4），逐行
-    // 转换的源步长和目标步长不是一回事，分开写更清楚也不慢（多一次连续写）。
-    //
-    // 【不用 non-temporal】见 ConvertToNv12 的注释：Y 平面写完立刻被编码器
-    // 读回来算色度/上传，绕缓存反而更慢（probe_copy_cpu 实测 ntsse 版本
-    // 在"拷贝+写样本"里比 memcpy 还慢一倍）。
-    ConvertToNv12(static_cast<const uint8_t*>(pixels), stride, width_, height_, nv12Buf_.data());
-    std::memcpy(dst, nv12Buf_.data(), frameBytes);
-    IMFMediaBuffer* buf = nullptr;
-    if (SUCCEEDED(sample->GetBufferByIndex(0, &buf)) && buf) {
-        buf->SetCurrentLength(frameBytes);
-        buf->Release();
+    if (repeat) {
+        // 这一片还没写过真实画面（刚开片或刚换过尺寸），没有可复用的内容。
+        // 空过这一拍而不是报错：补帧是可选的，少一拍只会让时间轴轻微超前，
+        // 报错却会把整条喂帧线程打死。
+        if (!sampleHasFrame_) return true;
+        // 补帧：内容从「最近一次装满的那份」拷到本轮转到的这份。不能原地
+        // 复用同一份（那正是丢帧的原因），也不能空过（时间轴会出现空洞）。
+        if (sampleLastFilled_ != slot) {
+            std::memcpy(samplePtrs_[slot], samplePtrs_[sampleLastFilled_], frameBytes);
+            IMFMediaBuffer* buf = nullptr;
+            if (SUCCEEDED(sample->GetBufferByIndex(0, &buf)) && buf) {
+                buf->SetCurrentLength(frameBytes);
+                buf->Release();
+            }
+        }
+    } else {
+        uint8_t* dst = samplePtrs_[slot];
+
+        // 【自己转 NV12，不再让 SinkWriter 转】见 MfEncoder.h 里 nv12Buf_ 的注释：
+        // 这一步把 1440p@144 的 CPU 从 3.8~6.8 核压到 0.8 核，颜色还更准。
+        //
+        // 【直接转进样本缓冲，不再经过 nv12Buf_】原来这里是「先转进 nv12Buf_，
+        // 再 memcpy 到样本缓冲」，理由是「源行距和目的行距不是一回事」。但这个
+        // 理由不成立：ConvertToNv12 的输出布局完全由 width/height 决定（Y 平面
+        // width×height，色度紧随其后），跟源行距无关 —— 源行距是它的入参。
+        // 多出来的那次 memcpy 实测 0.208ms/帧（1440p 5.5MB），在 165fps 的
+        // 6.06ms 预算里占 3.4%，而喂帧线程本来就贴着预算跑。
+        //
+        // 【不用 non-temporal】见 ConvertToNv12 的注释：Y 平面写完立刻被编码器
+        // 读回来算色度/上传，绕缓存反而更慢（probe_copy_cpu 实测 ntsse 版本
+        // 在"拷贝+写样本"里比 memcpy 还慢一倍）。
+        ConvertToNv12(static_cast<const uint8_t*>(pixels), stride, width_, height_, dst);
+        IMFMediaBuffer* buf = nullptr;
+        if (SUCCEEDED(sample->GetBufferByIndex(0, &buf)) && buf) {
+            buf->SetCurrentLength(frameBytes);
+            buf->Release();
+        }
+        sampleHasFrame_ = true;
+        sampleLastFilled_ = slot;
     }
+    sampleNext_ = (slot + 1) % poolDepth;
 
     // 时间轴：**每个分片内部从 0 开始**。这是分片直拷能拼接的前提 ——
     // 每一片都是一个独立的、从 0 起算的短片，导出时再按顺序重编号
@@ -1421,13 +1552,13 @@ bool MfEncoder::FlushSegment() {
 bool MfEncoder::SetFps(uint32_t fps) {
     // 没在录：只更新一下记录值，下次 Start 会按它来。
     if (!status_.running) {
-        if (fps > 240) fps = 240;
+        if (fps > kMaxFps) fps = kMaxFps;
         requestedFps_ = fps ? fps : 60;
         fps_ = requestedFps_;
         return true;
     }
 
-    if (fps > 240) fps = 240;
+    if (fps > kMaxFps) fps = kMaxFps;
     if (fps == 0) fps = 60;
     if (fps == requestedFps_ && fps == fps_) return true; // 真的没变
 
@@ -1464,10 +1595,10 @@ bool MfEncoder::SetFps(uint32_t fps) {
     // 本函数要避免的事。这里自己走一遍"改值 -> 试开 -> 不行就降档"。
     //
     // 为什么要重试降档：新帧率同样受硬件"分辨率 × 帧率"吞吐上限约束
-    // （1440p 上限 172fps，见 StartWithFpsFallback 的注释）。用户从 60
-    // 改到 240 时一样会被拒，那时必须降到硬件能接受的档位继续录，不能
-    // 整路失败。
-    static const uint32_t kLadder[] = {240, 165, 144, 120, 90, 60, 30};
+    // （1440p 上限 172fps，见 StartWithFpsFallback 的注释）。上限被夹到
+    // 120 之后这一档基本不会再被拒，但不同分辨率（比如 4K）仍有可能，
+    // 那时必须降到硬件能接受的档位继续录，不能整路失败。
+    static const uint32_t kLadder[] = {120, 90, 60, 30};
     const uint32_t requested = fps;
     uint32_t candidate = requested;
     for (;;) {
@@ -1477,15 +1608,9 @@ bool MfEncoder::SetFps(uint32_t fps) {
         segmentFrames_ = fps_ * segmentSeconds_;
         if (segmentFrames_ < fps_) segmentFrames_ = fps_;
 
-        // 码率跟着帧率重估（ResizeTo 里同样的口径）：帧率翻倍时同样的
-        // 码率会让每帧分到的比特减半，画质掉得厉害。
-        {
-            const double px = static_cast<double>(width_) * height_;
-            uint32_t mbps = static_cast<uint32_t>(px * 0.15 * fps_ / 1e6 + 0.5);
-            if (mbps < 2) mbps = 2;
-            if (mbps > 100) mbps = 100;
-            bitrateBps_ = mbps * 1000000u;
-        }
+        // 码率跟着帧率重算（口径见 RefreshBitrate）：**用户显式配了的就照配的
+        // 走**，只有没配时才按新帧率估算。
+        RefreshBitrate();
 
         status_.failed = false;
         status_.detail.clear();
@@ -1524,6 +1649,62 @@ bool MfEncoder::SetFps(uint32_t fps) {
     }
 }
 
+bool MfEncoder::SetBitrate(uint32_t bitrateMbps) {
+    if (bitrateMbps > 200) bitrateMbps = 200;
+
+    // 先算一下「改成这个值之后实际会用多少 bps」。目标没变就别白切一片
+    // （切一次要重开 SinkWriter，约 300~400ms，那段时间录的是空的）。
+    const uint32_t oldRequested = requestedBitrateMbps_;
+    const uint32_t oldBps = bitrateBps_;
+    requestedBitrateMbps_ = bitrateMbps;
+    RefreshBitrate();
+    if (bitrateBps_ == oldBps) return true; // 实际码率没变（比如从"自动估出 5"改成"显式配 5"）
+
+    // 没在录：更新记录值就够了，下次 Start / 下次开片自然会用新码率。
+    // 注意此时 requestedBitrateMbps_ 已经写好了，不用回滚。
+    if (!status_.running || !writer_) return true;
+
+    // CloseSegment / OpenSegment 都要碰 SinkWriter，必须在本线程有套间。
+    MfThreadScope threadScope;
+    if (!threadScope.ok) {
+        status_.failed = true;
+        status_.detail = "改码率时拿不到 COM 套间";
+        requestedBitrateMbps_ = oldRequested;
+        bitrateBps_ = oldBps;
+        return false;
+    }
+
+    // 收掉当前片，再按新码率开一片。与 SetFps 完全同一套取舍：
+    //   * 已经写进去的画面不丢（Finalize 后是完整可读的分片）；
+    //   * 一帧都没有的空片直接删掉、不推进 segmentSeq_（否则时间轴多个洞）；
+    //   * segmentSeq_ 继续递增、nextSegStartUnix_ 继续顺延、轮次目录不变。
+    const bool emptySegment = (framesInSegment_ == 0 && writer_ != nullptr);
+    if (emptySegment) {
+        IMFSinkWriter* w = static_cast<IMFSinkWriter*>(writer_);
+        w->Finalize();
+        w->Release();
+        writer_ = nullptr;
+        ReleaseSample();
+        std::error_code ec;
+        if (!currentPath_.empty()) fs::remove(fs::u8path(currentPath_), ec);
+    } else {
+        CloseSegment();
+        ++segmentSeq_;
+    }
+
+    status_.failed = false;
+    status_.detail.clear();
+    if (OpenSegment()) return true;
+
+    // 开不出来的原因是码率本身（绝大多数硬件编码器对码率很宽松，正常不会）。
+    // 回滚参数并重新把当前片开起来，别让这一路因为一次改码率就停摆。
+    status_.failed = true;
+    if (status_.detail.empty()) status_.detail = "改码率后重开分片失败";
+    requestedBitrateMbps_ = oldRequested;
+    bitrateBps_ = oldBps;
+    return false;
+}
+
 void MfEncoder::Finish() {
     if (writer_) {
         MfThreadScope threadScope; // 停止线程也要有套间才能 Finalize
@@ -1553,6 +1734,32 @@ int64_t MfEncoder::NowUnixMs() {
     return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::system_clock::now().time_since_epoch())
                                     .count());
+}
+
+void MfEncoder::RefreshBitrate() {
+    // 用户显式配了码率就照配的走。
+    //
+    // 【为什么帧率/尺寸变了也不再重估】以前这里无条件按
+    // 「像素 × 0.15 bit × 帧率」估算，把用户在界面里配的 5 Mbps 覆盖成 79 Mbps
+    // （1440p@144 的估算值）—— 用户以为自己在按 5 Mbps 录，实际文件大了十几倍，
+    // 而且改一次帧率或拖一次窗口就会被重新冲一遍，行为完全不可预期（m14071
+    // 「像配置改帧率，改码率什么的」要的是「配了就是配了」）。
+    //
+    // 画质兜底交给编码器：CBR 目标定得低时 NVENC 自己降质量，不会失败。
+    if (requestedBitrateMbps_ > 0) {
+        uint32_t mbps = requestedBitrateMbps_;
+        if (mbps < 2) mbps = 2;
+        if (mbps > 200) mbps = 200;
+        bitrateBps_ = mbps * 1000000u;
+        return;
+    }
+
+    // 没配才估算：像素数 × 每像素 0.15 bit × 帧率（与 Start 同口径）。
+    const double px = static_cast<double>(width_) * height_;
+    uint32_t mbps = static_cast<uint32_t>(px * 0.15 * static_cast<double>(fps_) / 1e6 + 0.5);
+    if (mbps < 2) mbps = 2;
+    if (mbps > 100) mbps = 100;
+    bitrateBps_ = mbps * 1000000u;
 }
 
 bool MfEncoder::ResizeTo(uint32_t newW, uint32_t newH) {
@@ -1628,16 +1835,9 @@ bool MfEncoder::ResizeTo(uint32_t newW, uint32_t newH) {
         lastResizeMs_ = nowMs;
     }
 
-    // 码率按新分辨率重估（原来按旧尺寸算的，放大之后会糊）。显式配了码率的
-    // 场景这里也重算 —— 因为 bitrateBps_ 本来就是"按当时的尺寸估"的结果，
-    // 没有单独记住用户的原值。分段编码本来就不追求跨片码率一致。
-    {
-        const double px = static_cast<double>(width_) * height_;
-        uint32_t mbps = static_cast<uint32_t>(px * 0.15 * fps_ / 1e6 + 0.5);
-        if (mbps < 2) mbps = 2;
-        if (mbps > 100) mbps = 100;
-        bitrateBps_ = mbps * 1000000u;
-    }
+    // 码率跟着新分辨率重算（原来按旧尺寸算的，放大之后会糊）。口径与
+    // SetFps 完全一致：**用户显式配了码率就照配的走**，没配才按像素估算。
+    RefreshBitrate();
 
     if (!OpenSegment()) return false;
     return true;

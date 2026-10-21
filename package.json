@@ -22,7 +22,10 @@
     "test:export": "node scripts/test-export.mjs 18",
     "offsets": "node scripts/offsets.mjs",
     "test:selfheal": "node scripts/test-selfheal.mjs",
-    "test:pipe": "node scripts/test-pipe.mjs"
+    "test:pipe": "node scripts/test-pipe.mjs",
+    "test:reload": "node scripts/test-reload.mjs",
+    "test:reload:cdp": "node scripts/test-reload.mjs --cdp 9222",
+    "test:budget": "node scripts/test-budget.mjs"
   },
   "devDependencies": {
     "electron": "^42.2.0"

@@ -90,6 +90,27 @@ struct SessionStatus {
     uint32_t recordedSegments = 0; // 当前保留的分片数
     uint64_t recordedBytes = 0;    // 分片总字节数
     uint64_t recordedFrames = 0;
+    // 码率（Mbps）：配置值与编码器实际值。
+    //
+    // 【为什么两个都要报】用户报「每次改完东西码率像没生效」（m14071）。
+    // 以前只有 bitrateBps_ 一个内部变量，用户配的 5 Mbps 会被 SetFps/ResizeTo
+    // 用像素公式覆盖成估算值（1440p@144 估出 79 Mbps），界面却毫无显示。
+    // 现在两者都写进状态，界面可以并排显示「配置 5 / 实际 5」。
+    uint32_t requestedBitrateMbps = 0;
+    uint32_t effectiveBitrateMbps = 0;
+    // 帧率同上：requested 是配置值，effective 是硬件吞吐上限降档后的值。
+    uint32_t requestedFps = 0;
+    uint32_t effectiveFps = 0;
+    // 「丢帧」的两个口径（见 RecorderStats 里同名字段的注释）。
+    //
+    // 用户的要求（m15478）：「我可以理解降帧率，但是最好不要丢帧」。降帧率时
+    // 采集快于编码，必然有帧进不了编码器；时间轴落后时又必须拿重复帧顶上。
+    // 这两个数报出来，界面才能回答「到底丢了多少、是不是在变速」。
+    uint64_t repeatFrames = 0;
+    uint64_t captureDropped = 0;
+    // 采集端一共投进编码器的帧数（Feed 成功次数）。
+    // 与 recordedFrames 一比就能分辨「采集端没给够」和「取槽相位错开」。
+    uint64_t captureFrames = 0;
     // 「立刻切片」完成的次数（只增不减）。
     //
     // 【为什么要有这个计数】界面点导出走的是插件（Electron 主进程里跑），
@@ -154,10 +175,24 @@ public:
     bool SameSettingsIgnoringFps(const Profile& other) const {
         return profile_.SameSettingsIgnoringFps(other);
     }
+
+    /**
+     * 同上，但忽略帧率**和码率** —— 这两个都能就地改（见 ApplyLiveSettings）。
+     *
+     * 【为什么需要】reload 原来只有两级判定：完全一样 → 什么都不做；只差帧率
+     * → 就地改帧率。差码率就落到第三级「拆会话重建」—— 新轮次目录、
+     * recordSegments 归零（导出按钮变灰）、时间轴出现空洞。用户只是把码率从
+     * 20 改成 10，界面表现却像重启了一次（m14071）。
+     *
+     * 有了这一级，reload 可以「就地改帧率 + 就地改码率」，两者互不影响。
+     */
+    bool SameSettingsIgnoringFpsBitrate(const Profile& other) const {
+        return profile_.SameSettingsIgnoringFpsBitrate(other);
+    }
     const Profile& Config() const { return profile_; }
 
     /**
-     * 把新配置里**可以就地生效**的部分应用到正在跑的会话上（目前只有帧率）。
+     * 把新配置里**可以就地生效**的部分应用到正在跑的会话上（帧率、码率）。
      *
      * 【为什么需要】用户把帧率从 144 改成 60 时，服务走 reload。原来 reload
      * 判「配置变了」就整路拆掉重建：新 Session -> 新录制器 -> 新轮次目录，
@@ -166,14 +201,17 @@ public:
      * 「降帧率的时候，会出现短暂的 no signal，和导出按钮被禁用，帧率刚切换
      * 那会点击会出现该路未在录制」。
      *
-     * 现在 reload 先看 Profile::SameSettingsIgnoringFps()：除了帧率以外都
-     * 一样就调这里，改完立刻生效，不换目录、不清分片、不动时间轴。
+     * 码率同理（m14071：「有关编辑的东西一保存立刻落地，像配置改帧率，改
+     * 码率什么的」）：它也写在 SinkWriter 的输出流上，也能靠"收掉当前片、
+     * 按新参数开新片"就地生效，不该走重建。
      *
-     * 返回 true 表示真的就地应用了；false 表示这份配置不能只靠改帧率，
-     * 必须重建会话（码率、分片时长、回放窗口、采集源变了都算）。
+     * 现在 reload 先看 Profile::SameSettingsIgnoringFpsBitrate()：除了帧率、
+     * 码率以外都一样就调这里，改完立刻生效，不换目录、不清分片、不动时间轴。
+     *
+     * 返回 true 表示真的就地应用了；false 表示这份配置不能只靠改帧率/码率，
+     * 必须重建会话（分片时长、回放窗口、采集源、缩放变了都算）。
      */
     bool ApplyLiveSettings(const Profile& next);
-
     // 配置显示名（导出文件名前缀、事件里给界面显示用）。
     const std::string& Name() const { return profile_.name; }
 
@@ -307,6 +345,14 @@ private:
     // 地方记住环的真实状态，才不会被反复 SetMode。
     uint32_t ringW_ = 0;
     uint32_t ringH_ = 0;
+
+    // 窗口锁定：这一路一旦选定并成功 Init 了一个窗口 hwnd，就锁死它。
+    // 环境波动（标题变了、被最小化、锁屏）都不再重新按匹配规则去解，
+    // 避免同 class 的窗口（如多个 Chrome_WidgetWin_1）被 pick:largest 选错源、
+    // 用户看着像"中途偷偷换了窗口"。只有该窗口真的被销毁（IsWindow 为假）
+    // 才清零、退回重新匹配。reload 重建会话时这个对象本身是新的，自然为 0
+    // —— 用户主动改了匹配规则，本就该重新解一次。
+    uint64_t lockedHwnd_ = 0;
     // Capture() 的元数据出口（尺寸/QPC）。像素不用它——像素走 snap_。
     FrameView fvRaw_;
     // 本路已经吃过的「最近一张」版本号。多路同源时靠它决定要不要真的去

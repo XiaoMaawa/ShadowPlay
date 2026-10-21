@@ -120,6 +120,26 @@ public:
     MfEncoder& operator=(const MfEncoder&) = delete;
 
     /**
+     * 帧率硬上限：**120fps**。超过它的一律夹回来。
+     *
+     * 【为什么不再给 144/165/240】这条是主人拍板的（「直接把 120 以上的帧率
+     * 全部删除，不包括 120fps」）。在此之前这套代码为了够到 240 付了一串
+     * 代价，而 120 以上每一档都是负收益：
+     *
+     *   * 1440p 的硬件 H.264 编码器物理上限是 172fps（探针实测 173 起就
+     *     `SetInputMediaType` 报 `0xC00D36B4`），所以「240」这一档从来录不
+     *     到 240，只能降档；
+     *   * 165fps 那一档的每帧成本 6.09ms（转换 3.24 + WriteSample 2.25）
+     *     已经顶破 6.06ms 的帧预算，喂帧线程每拍都欠一帧，真实画面只剩
+     *     50%；
+     *   * 120 及以下是实测的稳定区间：真实画面 89~93%、落盘 100%、PTS 零空洞。
+     *
+     * 保留这条夹取是因为**手改过 profiles.json 的老配置还在磁盘上**，不能让
+     * 一个 `"fps": 240` 继续把硬件顶到降档 + 看门狗降频那一串连锁里。
+     */
+    static constexpr uint32_t kMaxFps = 120u;
+
+    /**
      * 开始录制。dir 必须是已存在的绝对路径。
      *
      * @param fps            喂进来的帧率（时间轴按它算，必须和实际喂帧速率一致）
@@ -150,6 +170,12 @@ public:
      * （SegmentRecorder 的喂帧线程就是为这个存在的），不能放在采集线程。
      *
      * 返回 false 表示编码器坏了（Status().detail 有原因），调用方应停止喂帧。
+     *
+     * 【pixels == nullptr = 再来一帧上一帧的画面】
+     * 喂帧线程补帧时不用把同一份 BGRA 再喂一遍 —— 传 nullptr 就直接复用样本
+     * 缓冲里已经转好的 NV12，只换时间戳再 WriteSample 一次。省下的正是
+     * ConvertToNv12 + memcpy 那 8~9ms（1440p）。width/height 仍要传当前画布
+     * 尺寸（补帧不会触发换尺寸）。此时 stride 参数被忽略。
      */
     bool Write(const void* pixels, uint32_t stride, uint32_t width, uint32_t height);
 
@@ -175,6 +201,17 @@ public:
      * 是真实的 —— 只是每秒的帧数比配置里少。
      */
     uint32_t EffectiveFps() const { return fps_; }
+
+    /**
+     * 用户配置里写的帧率（可能高于 EffectiveFps()，被降过档）。
+     *
+     * 【为什么需要单独一个】run.json 要把「配置的」和「实际用的」都写下来：
+     * 配置 240、实际 165 时，喂帧线程必须按 165 灌帧（否则时间轴错位，见
+     * SegmentRecorder::Start 里那段注释），而界面上仍要能告诉用户"你配的
+     * 240 录成了 165"。只有 fps_ 一个字段时，喂帧线程按它算节拍，就没法再
+     * 记配置值了。
+     */
+    uint32_t RequestedFps() const { return requestedFps_; }
 
     /** 收尾：finalize 当前分片。可重复调用。 */
     void Finish();
@@ -221,6 +258,31 @@ public:
      * 返回 true 表示已经按新帧率开好新片（或者新帧率跟当前一致、什么都不用做）。
      */
     bool SetFps(uint32_t fps);
+
+    /**
+     * 就地改码率（不中断录制、不换轮次目录、切片序号继续递增）。
+     *
+     * 【为什么需要】用户报「配置改帧率、改码率什么的，一保存就该立刻落地」
+     * （m14071）。帧率已经能就地改了（SetFps），但码率原来只写在
+     * MfEncoder::Start() 的入参里，改它只能靠 reload 把整路 Session 拆掉重建：
+     * 新轮次目录、recordSegments 归零（导出按钮变灰）、时间轴出现空洞。
+     *
+     * 码率和帧率一样写在 SinkWriter 的**输出流**上
+     * （MakeH264OutType 里的 MF_MT_AVG_BITRATE），所以也必须重开一片才生效 ——
+     * 但重开分片 ≠ 重建会话：segmentSeq_ 继续递增、nextSegStartUnix_ 继续
+     * 顺延、轮次目录不变，导出端看到的还是一条连续的时间轴。
+     *
+     * 【0 的含义】0 = 没配，按「像素数 × 0.15 bit × 帧率」估（与 Start 同口径）。
+     * 注意：以前 SetFps/ResizeTo 会**无条件**用那个公式覆盖码率，导致用户在
+     * 界面里配的 5 Mbps 一改帧率就被冲掉。现在配了就照配的来，没配才估。
+     */
+    bool SetBitrate(uint32_t bitrateMbps);
+
+    /** 当前实际生效的码率（Mbps，四舍五入）。界面用它核对「配置的值真的落地了」。 */
+    uint32_t EffectiveBitrateMbps() const { return (bitrateBps_ + 500000u) / 1000000u; }
+
+    /** 用户/配置要的码率（Mbps，0 = 没配、走估算）。 */
+    uint32_t RequestedBitrateMbps() const { return requestedBitrateMbps_; }
 
     bool Running() const { return status_.running; }
 
@@ -271,12 +333,34 @@ private:
      */
     static int64_t NowUnixMs();
 
+    /**
+     * 按「用户配的码率」或「像素数 × 0.15 bit × 帧率」重算 bitrateBps_。
+     *
+     * 三种场景都调它：开片前、改帧率后、换尺寸后。区别只在 requestedBitrateMbps_
+     * 是否为 0 —— 不为 0 就照用户配的走（帧率翻倍也不动），为 0 才按尺寸估算。
+     *
+     * 【以前是两段复制粘贴的估算公式】SetFps 与 ResizeTo 各写了一遍，都是
+     * 无条件估算，把用户显式配的码率冲掉了。收敛成一个函数，口径不会再分叉。
+     */
+    void RefreshBitrate();
+
     std::string dir_;
     uint32_t    width_ = 0;
     uint32_t    height_ = 0;
     uint32_t    fps_ = 60;            // 编码器**实际**跑的帧率（可能被降过档）
     uint32_t    requestedFps_ = 60;   // 用户/配置要的帧率，只用于状态说明
     uint32_t    bitrateBps_ = 0;
+    /**
+     * 用户在配置里填的码率（Mbps，0 = 没配）。
+     *
+     * 【为什么必须单独记住】以前只有 bitrateBps_，而它是「按当时的尺寸/帧率
+     * 估出来的结果」，分不清「用户配的 5 Mbps」和「估出来恰好 5 Mbps」。
+     * SetFps()/ResizeTo() 于是无条件用像素公式把它覆盖掉 —— 用户配 5 Mbps，
+     * 一改帧率就变成估算值（1440p@144 估算 79 Mbps），文件暴涨而用户毫无感知。
+     *
+     * 记下原值之后：配了就一直按配的走（只夹到 [2,200]），没配才按公式估。
+     */
+    uint32_t    requestedBitrateMbps_ = 0;
     uint32_t    segmentSeconds_ = 2;
     uint32_t    keepSegments_ = 2;
     uint32_t    segmentFrames_ = 0;   // 每片多少帧（= fps * segmentSeconds）
@@ -359,23 +443,72 @@ private:
     uint32_t streamIndex_ = 0;
 
     /**
-     * 复用样本与它的缓冲（每片一份，开新片时重建）。
+     * 样本池（每片一组，开新片时重建）。
      *
-     * 【为什么要复用】原来每写一帧都 MFCreateMemoryBuffer(14.7MB) +
+     * 【为什么要池化】原来每写一帧都 MFCreateMemoryBuffer(14.7MB) +
      * MFCreateSample，2560x1440@144 时等于每秒分配 2.1GB 内存、再整块
      * memcpy 一遍。实测进程峰值工作集 854MB、CPU 里有一大截耗在堆分配
      * 和页错误上（主人报的「内存 800M」就是它）。
      *
-     * 复用之后每片只分配一次，写帧时只 memcpy 进已有缓冲。SinkWriter 是
-     * 同步收下样本的（BeginWriting 之后 WriteSample 返回时数据已被拷进
-     * 编码器内部缓冲），所以同一个 IMFSample 反复用是安全的。
+     * 【为什么是"池"而不是"一个"】—— 这是本类最隐蔽的一个坑，别改回单例。
+     *
+     * 曾经只复用**一个** IMFSample：每帧把 NV12 写进同一个缓冲、改时间戳、
+     * WriteSample。低帧率下完全没问题（60fps 实测 240/240 帧全落盘），
+     * 但帧率上去以后 SinkWriter 还没来得及把上一帧下发完，我们就把下一帧
+     * 写进**同一块内存**了 —— 结果 WriteSample 照样返回 S_OK，帧却被**静默
+     * 丢弃**。探针 native/probe_sw_drop.cpp 的对照数据（2560x1440，4 秒）：
+     *
+     *     165fps 复用单样本   提交 660 → 落盘 207 帧（31%）
+     *     165fps 每帧新建     提交 660 → 落盘 660 帧（100%）
+     *     144fps 复用单样本   提交 576 → 落盘 130 帧（23%）
+     *     144fps 每帧新建     提交 576 → 落盘 576 帧（100%）
+     *      60fps 复用单样本   提交 240 → 落盘 240 帧（100%）
+     *
+     * 落盘帧率不足的后果就是主人报的「240fps 录出来卡成 PPT」：帧数少、
+     * PTS 有空洞（avg_frame_rate 变成 51810/329 这种怪分数）、画面几秒才动一下。
+     *
+     * 修法是轮转一个够大的池：只要池深 > 编码器在途帧数，就不会踩到还没
+     * 消费完的那一份。每片分配一次，代价可以接受（1440p 一帧 NV12 约 5.5MB）。
+     *
+     * 【池深为什么是 16 而不是 8】实测 8 份时 165fps 已经 100%，但 144fps 仍
+     * 只有 96%（每片少 8~17 帧，文件里能直接看到 PTS 空洞）。编码器在途帧数
+     * 随「片刚开、首帧还没出编码队列」那一刻最高，16 份之后 90/120/144/165
+     * 四档全部 100%。代价是 1440p 一片 88MB —— 与录制端 200MB 级工作集同量级，
+     * 可接受（切片时才重建）。
      *
      * 类型用 void*：头文件不把 mfapi.h / mfidl.h 拖给所有包含者。
      * 实际类型是 IMFSample*，它持有的 IMFMediaBuffer 可以 Lock 后直接写。
      */
-    void*    sample_ = nullptr;
-    uint8_t* sampleBytes_ = nullptr;  // 样本缓冲最近一次 Lock 拿到的指针
-    uint32_t samplePitch_ = 0;        // 样本缓冲的行距（= width*4）
+    std::vector<void*> samplePool_;
+    /** 池里每一份样本各自 Lock 出来的常驻写指针（与 samplePool_ 一一对应）。 */
+    std::vector<uint8_t*> samplePtrs_;
+    /** 下一帧用池里的哪一份（取模轮转）。 */
+    uint32_t sampleNext_ = 0;
+    /**
+     * 池里最近一次**装满真实画面**的那一份的下标（补帧从这里复制内容）。
+     *
+     * 补帧（`Write(nullptr)`）不能再"改写同一份样本" —— 那正是让 SinkWriter
+     * 静默丢帧的原因（见上面 samplePool_ 的注释）。所以补帧也走池轮转，
+     * 内容从这一份 memcpy 过去：一次连续拷贝约 0.5ms（1440p NV12 5.5MB），
+     * 比重新跑一遍 ConvertToNv12 便宜得多。
+     */
+    uint32_t sampleLastFilled_ = 0;
+    /** 样本缓冲的行距（Y 平面 = width_）。 */
+    uint32_t samplePitch_ = 0;
+
+    /**
+     * 样本缓冲里现在装的是不是一帧**已经写进过编码器**的画面。
+     *
+     * 补帧（`Write(nullptr)`）要直接复用这份内容，但刚开片、刚换尺寸、
+     * 刚切分片之后样本是空的（`ReleaseSample` 把 sample_ 扔了，`EnsureSample`
+     * 重新锁出来的是全零缓冲）—— 这时候补帧没有内容可复用，只能空过这一拍。
+     *
+     * 注意「写进过编码器」这个限定没写在名字里但很重要：`EnsureSample` 成功
+     * 只代表有缓冲可用，`sampleHasFrame_` 才代表里面是真实画面。
+     * `ReleaseSample()` 里必须置 false，否则换尺寸后补帧会把上一片的旧画面
+     * 贴到新片里（尺寸都不一样，画面必然错乱）。
+     */
+    bool sampleHasFrame_ = false;
 
     /**
      * 自己把 BGRA 转成 NV12 再喂编码器 —— **这是本轮最大的性能修复**。
@@ -402,9 +535,6 @@ private:
      */
     void ConvertToNv12(const uint8_t* src, uint32_t stride, uint32_t width, uint32_t height,
                        uint8_t* dst);
-
-    /** NV12 转换的中间缓冲（尺寸 = width_ × height_ × 1.5，每片重建一次）。 */
-    std::vector<uint8_t> nv12Buf_;
 
     uint32_t segmentSeq_ = 0;         // 已经开了第几个分片（全局序号，不取模）
     uint32_t slotInUse_ = 0;          // 当前分片占的槽位号（0..keepSlots_-1）

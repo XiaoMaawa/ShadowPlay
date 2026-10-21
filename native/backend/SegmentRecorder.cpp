@@ -400,7 +400,8 @@ SegmentRecorder::SegmentRecorder(std::string dir, VideoSpec video, uint32_t widt
     // 帧率是可热改的（见 SetFps），所以存进 atomic 成员。
     {
         uint32_t f = video_.fps ? video_.fps : 60u;
-        if (f > 240) f = 240; // 离谱值兜一下，别让 GOP 算爆
+        // 硬上限 120fps（见 MfEncoder.h 的 kMaxFps）：离谱值兜一下，别让 GOP 算爆
+        if (f > MfEncoder::kMaxFps) f = MfEncoder::kMaxFps;
         fps_.store(f, std::memory_order_relaxed);
     }
 }
@@ -413,6 +414,13 @@ std::string SegmentRecorder::SegmentsDir() const { return segmentsDir_; }
 bool SegmentRecorder::Running() const {
     std::lock_guard<std::mutex> lk(mu_);
     return stats_.active;
+}
+
+uint32_t SegmentRecorder::CurrentFps() const {
+    // encoder_ 的指针在整个运行期不会换（换帧率是就地改，不重建编码器），
+    // EffectiveFps() 内部自己带锁，所以这里不用再拿 mu_。
+    if (!encoder_ || !encoder_->Running()) return 0;
+    return encoder_->EffectiveFps();
 }
 
 // 清掉本轮运行目录里上一轮留下的分片和清单。
@@ -590,6 +598,27 @@ bool SegmentRecorder::Start() {
     // 【run.json 必须写编码器实际用的帧率】见上面那段注释。MfEncoder 可能
     // 因为硬件吞吐上限把帧率降下来（EffectiveFps()），导出端按它铺时间轴。
     const uint32_t actualFps = encoder_->EffectiveFps();
+
+    // 【喂帧节拍必须立刻切到编码器实际能接受的帧率】
+    //
+    // 用户配 240 帧、NVENC 只接受 165 帧时，MfEncoder 会自己降档到 165
+    // （StartWithFpsFallback），它按 165 打时间戳、每 165*segmentSeconds 帧
+    // 切一片。但 fps_ 原来是构造函数里存进去的**配置值 240**，喂帧线程于是
+    // 按 240 的节奏灌帧 —— 每片 330 帧只用 330/240 = 1.375 秒墙钟就灌满了，
+    // 编码器却按 165 打成 2 秒内容。结果：
+    //
+    //   * 编码器时间轴（帧数/165）比真实墙钟快 1.45 倍；
+    //   * index.csv 的 nextSegStartUnix_ 也按 frames/165 顺延，同样快 1.45 倍；
+    //   * 导出端按 index.csv 排出来的 20 秒，实际只覆盖 13.8 秒真实画面 ——
+    //     画面被慢放，看起来就是「录 240 结果比 5fps 还卡」。
+    //
+    // 实测（%TEMP%\shadow-play\freeze-f240，配 240 帧、实际 165 帧）：14 秒
+    // 墙钟落了 12 片（每片 330 帧 = 24 秒时间轴），而 recordFrames 只有 1979
+    // （=141fps）。修法就是把 fps_ 设成 EffectiveFps()，让喂帧线程和编码器
+    // 用同一个节拍。SetFps() 那条热改路径本来就已经这么做了（见下面
+    // `fps_.store(encoder_->EffectiveFps())`），只有 Start() 漏了。
+    fps_.store(actualFps ? actualFps : 60u, std::memory_order_relaxed);
+
     {
         std::ofstream man(PathToUtf8(fs::u8path(runDir_) / fs::u8path("run.json")),
                           std::ios::binary | std::ios::trunc);
@@ -599,7 +628,7 @@ bool SegmentRecorder::Start() {
                 << std::strtoul(fs::path(runDir_).filename().u8string().c_str(), nullptr, 10)
                 << ",\n"
                 << "  \"fps\": " << actualFps << ",\n"
-                << "  \"requestedFps\": " << fps_.load(std::memory_order_relaxed) << ",\n"
+                << "  \"requestedFps\": " << encoder_->RequestedFps() << ",\n"
                 << "  \"width\": " << width_ << ",\n"
                 << "  \"height\": " << height_ << ",\n"
                 << "  \"segmentSeconds\": " << segmentSeconds << ",\n"
@@ -636,6 +665,8 @@ void SegmentRecorder::StartFeeder() {
         slotFull_ = false;
         slotSeq_ = 0;
         slotTakenSeq_ = 0;
+        slotOverwritten_.store(0, std::memory_order_relaxed);
+        slotFed_.store(0, std::memory_order_relaxed);
     }
     feeder_ = std::thread([this] { FeederLoop(); });
 }
@@ -661,25 +692,42 @@ bool SegmentRecorder::Feed(const void* pixels, uint32_t stride, uint32_t width, 
     const size_t rowBytes = static_cast<size_t>(width) * 4u;
     const size_t need = rowBytes * height;
 
-    // 拷进槽里就得返回。这一步是纯内存拷贝（一次 4.78MB 的那种），
-    // 不会阻塞在编码器上 —— 那才是原来把采集节拍拖垮的东西。
-    {
-        std::lock_guard<std::mutex> lk(slotMu_);
-        slot_.resize(need);
+    // 【拷贝在锁外做】原来整段 memcpy 都在 slotMu_ 里面（1440p 是 14.7MB，
+    // 实测约 1.5ms），而喂帧线程取帧要的正是这把锁 —— 等于每次投帧都把
+    // 配帧线程堵住 1.5ms。165fps 每帧预算只有 6.06ms，这一堵就吃掉四分之一，
+    // 于是喂帧线程总是"晚到"、槽里永远是上一拍那帧，只能补重复帧（实测
+    // repeatFrames 占一半、真实画面只剩 50%）。
+    //
+    // Feed() 只有一个生产者（Session 的采集线程按路各一个），所以 writeBuf_
+    // 不需要保护：先拷进 writeBuf_，再在锁里 O(1) 换进 slot_。锁只护住那个
+    // swap，喂帧线程几乎感觉不到我们在投帧。
+    writeBuf_.resize(need);
+    if (stride == rowBytes) {
+        std::memcpy(writeBuf_.data(), p, need);
+    } else {
         // 行距和紧凑行距不一致（DXGI 的 staging 纹理会对齐到 256 字节）：
         // 一行一行拷，别把行尾的填充字节也当成像素（那样画面会斜）。
-        if (stride == rowBytes) {
-            std::memcpy(slot_.data(), p, need);
-        } else {
-            for (uint32_t y = 0; y < height; ++y) {
-                std::memcpy(slot_.data() + static_cast<size_t>(y) * rowBytes,
-                            p + static_cast<size_t>(y) * stride, rowBytes);
-            }
+        for (uint32_t y = 0; y < height; ++y) {
+            std::memcpy(writeBuf_.data() + static_cast<size_t>(y) * rowBytes,
+                        p + static_cast<size_t>(y) * stride, rowBytes);
         }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(slotMu_);
+        // 【这一行就是"丢帧"的计量】槽里还躺着一帧没被喂帧线程取走，现在要
+        // 被这一帧覆盖掉 —— 那一帧的像素永远进不了编码器了。采集快于编码
+        // （比如 240 帧采集、165 帧编码）时它必然发生，是降帧率的固有代价，
+        // 但用户要能看见它，不能像以前那样静默发生（m15478「最好不要丢帧」）。
+        if (slotFull_ && slotSeq_ != slotTakenSeq_) {
+            slotOverwritten_.fetch_add(1, std::memory_order_relaxed);
+        }
+        slot_.swap(writeBuf_);
         slotW_ = width;
         slotH_ = height;
         slotFull_ = true;
         ++slotSeq_;
+        slotFed_.fetch_add(1, std::memory_order_relaxed);
     }
     slotCv_.notify_one();
     return true;
@@ -718,9 +766,29 @@ void SegmentRecorder::FeederLoop() {
     uint64_t framesWritten = 0;
     auto t0 = std::chrono::steady_clock::now();
 
+    // 【吞吐看门狗已经删掉了】这里原来有一套"喂不满就自动降一档（120→90→60）"
+    // 的机制：重复帧占比连续两窗超过 40% 就 `encoder_->SetFps()` 降档，而且
+    // **只降不升**。主人的判断是：降档该由他自己决定，不该由程序偷偷改 ——
+    // 配置写 120 就按 120 录，跑不动那是可见的事实（状态里 repeatFrames 会
+    // 涨、画面会卡），比"悄悄降到 60 还不告诉用户"强。
+    // 留下的影响：录制帧率始终等于配置帧率（除非硬件**拒收**这个媒体类型，
+    // 那种降档在 MfEncoder::StartWithFpsFallback 里，必须留着）。
+
+    // 写一帧**新画面**（槽里取出来的那份像素）。
     auto writeOnce = [&](const std::vector<uint8_t>& buf) -> bool {
         if (buf.empty()) return true; // 还没采到第一帧，没法补
         if (!EncodeFrame(buf)) return false;
+        ++framesWritten;
+        return true;
+    };
+    // 补一帧**重复画面**：让编码器复用样本缓冲，不碰 BGRA。
+    //
+    // 与 writeOnce 分开是为了不再把同一份 BGRA 转一遍 —— 见 EncodeRepeat()。
+    // 空槽的判据不同：writeOnce 看 buf 空不空，这里看"编码器里有没有可复用的
+    // 上一帧"（刚开片/刚换尺寸时没有，那种情况直接空过这一拍）。
+    auto writeRepeat = [&]() -> bool {
+        if (frame.empty()) return true;
+        if (!EncodeRepeat()) return false;
         ++framesWritten;
         return true;
     };
@@ -738,6 +806,9 @@ void SegmentRecorder::FeederLoop() {
                 frame.swap(slot_);
                 lastSeq = slotSeq_;
                 slotFull_ = false;
+                // 记下"取到哪一帧了"，Feed() 靠它区分「覆盖了还没人要的帧」
+                // （真的丢了内容）和「槽本来就是空的」。
+                slotTakenSeq_ = slotSeq_;
                 frameW = slotW_;
                 frameH = slotH_;
                 if (frameW > 0 && frameH > 0) {
@@ -756,21 +827,59 @@ void SegmentRecorder::FeederLoop() {
                      std::chrono::duration<double>(static_cast<double>(framesWritten) / fps));
         if (std::chrono::steady_clock::now() < nextDue) {
             // 条件变量带超时：Stop() 置 feedStop_ 时能立刻醒。
+            //
+            // 【谓词里**不能**再放 slotFull_】原来写的是 `feedStop_ || slotFull_`，
+            // 后果很严重：采集端每投一帧就把喂帧线程叫醒一次，而醒来时往往还没到
+            // 节拍点（need 算出来是 0）。那种"提前醒"会走到下面去取槽 —— 取出
+            // 一整帧、算完 need=0、什么也不写，**这一帧就凭空没了**；紧接着下一次
+            // 真到节拍时槽是空的，只能补重复帧。实测 60fps 下 recordFrames=1089、
+            // repeatFrames=1072（98.2% 全是重复帧），而 captureFrames=1090 说明
+            // 采集端一帧没少给 —— 帧是在这里被自己扔掉的，不是采集不到。
+            //
+            // 现在只等 feedStop_：节拍由 nextDue 决定，采集端投帧不再参与唤醒，
+            // 槽里自然会一直躺着"最新那一帧"，到点再取。
             std::unique_lock<std::mutex> lk(slotMu_);
             if (feedStop_) break;
-            slotCv_.wait_until(lk, nextDue, [this] { return feedStop_ || slotFull_; });
+            slotCv_.wait_until(lk, nextDue, [this] { return feedStop_; });
             if (feedStop_) break;
         }
+
+        // ---- 先算"现在一共该写多少帧"，再决定要不要从槽里取 ---------------
+        //
+        // 【顺序不能反】这两步以前是"先取槽、后算 need"。一旦算出 need=0，
+        // 刚取出来的那一帧已经被 swap 走了，只能丢弃 —— 这就是上面那段注释里
+        // 98% 重复帧的来源。先算 need，need==0 时**根本不动槽**，帧留在那里等
+        // 下一个节拍。
+        const double elapsedSec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const uint64_t due = static_cast<uint64_t>(elapsedSec * fps) + 1;
+        const uint64_t need = due > framesWritten ? (due - framesWritten) : 0;
+        if (need == 0) continue; // 还没到点，槽里的帧留着下一步用
 
         // ---- 取槽里的最新帧 ----------------------------------------------
         bool haveNew = false;
         {
-            std::lock_guard<std::mutex> lk(slotMu_);
+            std::unique_lock<std::mutex> lk(slotMu_);
             if (feedStop_) break;
+            // 【节拍到了但槽里还是旧帧时，给它半帧时间】见下面那段注释：
+            // 采集和编码同速却异相时，一半节拍会白白补重复帧。这里最多等
+            // 半个帧周期（165fps 是 3.0ms），拿到就写真实画面，拿不到才补重复。
+            //
+            // wait_for 等待期间会释放 slotMu_，所以采集线程能照常写槽并
+            // notify_one 把我们叫醒 —— 不会互相卡死。
+            if (slotSeq_ == lastSeq) {
+                const auto budget =
+                    std::chrono::microseconds(static_cast<long long>(500000.0 / fps));
+                slotCv_.wait_for(lk, budget, [this, lastSeq] {
+                    return feedStop_ || slotSeq_ != lastSeq;
+                });
+                if (feedStop_) break;
+            }
             if (slotFull_ && slotSeq_ != lastSeq) {
                 frame.swap(slot_); // 交换而不是拷贝：连一次 memcpy 都省掉
                 lastSeq = slotSeq_;
                 slotFull_ = false;
+                slotTakenSeq_ = slotSeq_; // 见 Feed() 里那个丢帧计数
                 haveNew = true;
                 // 尺寸跟着帧走：槽里这一帧有多大，这拍就按多大编码。
                 frameW = slotW_;
@@ -790,9 +899,6 @@ void SegmentRecorder::FeederLoop() {
         //   * 正常节奏：due 比已写的多 1，就是正常写一帧；
         //   * 落后了：due 比已写的多 k 张，连续写 k 张（内容是同一帧），
         //     把欠账一次补齐，时间轴立刻回到真实时间。
-        const double elapsedSec =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        const uint64_t due = static_cast<uint64_t>(elapsedSec * fps) + 1;
 
         // ---- 为什么这里**绝对不能**给补帧设上限 ----------------------------
         //
@@ -802,19 +908,52 @@ void SegmentRecorder::FeederLoop() {
         // 帧率越高、机器越忙，这种缺口越多，240fps 尤其明显。
         //
         // 现在的取舍（用户明确要求）：**允许卡，不允许变速**。落后多少就补多少
-        // 重复帧，重复帧编同一张画面代价极低，内存占用不随缺口大小增长 ——
-        // 补帧用的始终是本地那一帧缓冲，不会额外分配。
+        // 重复帧。补帧现在**不再拷贝像素**（EncodeRepeat 让编码器复用样本缓冲），
+        // 一帧只花 WriteSample 的代价，所以补得动 —— 这是让"允许卡"真正成立的
+        // 前提。以前补帧也走全量 ConvertToNv12 + memcpy（1440p 要 8~9ms，而
+        // 165fps 预算只有 6.06ms），欠账越补越滚，实测写进去的真实更新率只剩
+        // 0.9%，主人看到的就是"切片卡成 PPT、好几秒才动一帧"。
         //
         // 唯一的例外是"从没采到过任何帧"（frame 为空），那种情况下面补不了，
         // 只能等，等到了重新计时。
-        const uint64_t need = due > framesWritten ? (due - framesWritten) : 0;
+        //
+        // 【第一帧写真实画面，其余补重复】第一帧必须是槽里刚取到的新画面
+        // （否则采到的新内容永远进不了编码器），多出来的欠账才是重复帧。
+        // 这一拍没取到新帧（haveNew 为假）时，连第一帧也只能补重复 ——
+        // 手里 `frame` 里那份内容是上一拍已经写过的，再全量转一遍纯属浪费。
+        //
+        // `need` 在上面「先算该写多少帧」那一步已经算好了（那时还没取槽），
+        // 这里直接用它，别再算一遍 —— 中间隔了取槽和尺寸判断，重算会得到
+        // 略微不同的值，且会与上面的定义冲突。
+        uint64_t wroteReal = 0;
+        uint64_t wroteRepeat = 0;
         for (uint64_t i = 0; i < need; ++i) {
-            if (!writeOnce(frame)) {
+            const bool isReal = (i == 0 && haveNew);
+            const bool ok = isReal ? writeOnce(frame) : writeRepeat();
+            if (!ok) {
                 alive = false;
                 break;
             }
+            if (isReal) {
+                ++wroteReal;
+            } else {
+                ++wroteRepeat;
+            }
         }
-        (void)haveNew;
+        // wroteRepeat 现在只用来标记"这一拍补了几帧重复"；重复帧总数仍由
+        // writeRepeat() 自己累加进 stats_.repeatFrames（见下面那个函数），
+        // 界面和服务状态照旧看得到。
+
+        // ---- 吞吐看门狗：已删除 --------------------------------------------
+        //
+        // 这里原来是"重复帧占比连续两窗 >40% 就自动降一档（120→90→60，只降
+        // 不升）"。主人拍板删掉：配置写多少就录多少，跑不动是**可见的事实**
+        // （状态里的 repeatFrames 会涨、画面会卡），不该由程序偷偷改写成 60
+        // 还把痕迹抹干净 —— 那次正是它把 requestedFps 也改成 60，导致界面
+        // 上的降档提示判定失效，用户只看到"配 120 却显示 60"而没有任何解释。
+        //
+        // 硬件**拒收**媒体类型时的降档（MfEncoder::StartWithFpsFallback）不在
+        // 此列，那个必须留着：不降就整路录不起来。
 
         // ---- 有人要求"立刻切片"（导出前）---------------------------------
         //
@@ -894,6 +1033,38 @@ void SegmentRecorder::FeederLoop() {
                 fpsCv_.notify_all();
             }
         }
+
+        // ---- 有人要求"改码率"（界面改配置时）------------------------------
+        //
+        // 与改帧率同一套机制、同样放在补帧之后。码率写在 SinkWriter 的输出
+        // 流上，所以同样要收掉当前片再重开 —— 但**不换轮次目录、不归零分片
+        // 序号、时间轴继续顺延**，导出端看到的还是一条连续的时间轴。
+        //
+        // 用户的诉求（m14071）：「有关编辑的东西一保存立刻落地，像配置改
+        // 帧率，改码率什么的」。以前改码率只能靠 reload 拆会话重建。
+        if (alive) {
+            uint32_t wantMbps = 0;
+            uint64_t wantSeq = 0;
+            {
+                std::lock_guard<std::mutex> lk(brMu_);
+                wantMbps = brWantValue_;
+                wantSeq = brWant_;
+            }
+            if (wantSeq != brDone_) {
+                const bool ok = encoder_ && encoder_->SetBitrate(wantMbps);
+                if (ok) {
+                    // 让 RecorderStats / run.json 里的码率描述跟上（只是记录值，
+                    // 真正的码率在编码器里）。
+                    video_.bitrateMbps = wantMbps;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(brMu_);
+                    brDone_ = wantSeq;
+                    brOk_ = ok;
+                }
+                brCv_.notify_all();
+            }
+        }
     }
 
     if (!alive) {
@@ -923,6 +1094,28 @@ bool SegmentRecorder::EncodeFrame(const std::vector<uint8_t>& frame) {
     return true;
 }
 
+bool SegmentRecorder::EncodeRepeat() {
+    if (!encoder_) return false;
+
+    // 【补帧走 nullptr，不再把同一份 BGRA 再转一遍】见 MfEncoder::Write 的注释：
+    // 1440p 一帧的 ConvertToNv12 + memcpy 实测 8~9ms，165fps 的预算只有 6.06ms。
+    // 补帧也走全量转换的话，欠账只会越滚越大，最后写进去的绝大部分都是重复帧
+    // —— 主人报的「切片刻成 PPT」就是这么来的（实测真实更新率 0.9%）。
+    //
+    // 复用样本只花 WriteSample 的代价（实测把 165fps 的真实吞吐从 ~107fps
+    // 提到接近编码器上限），同样的欠账能真补上，画面不动但时间轴是对的。
+    if (!encoder_->Write(nullptr, 0, width_, height_)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(mu_);
+    ++stats_.framesIn;
+    // 补帧计入 repeatFrames：帧数没少，但这一拍画面是上一帧重复的。
+    // framesIn 与 repeatFrames 一起看才有意义（见 RecorderStats 的注释）。
+    ++stats_.repeatFrames;
+    return true;
+}
+
 bool SegmentRecorder::FlushSegment(uint32_t timeoutMs) {
     // 喂帧线程没起来（Start 失败 / 已经 Stop）就没有"正在写的那一片"。
     if (!feeder_.joinable()) return false;
@@ -945,7 +1138,7 @@ bool SegmentRecorder::FlushSegment(uint32_t timeoutMs) {
 
 bool SegmentRecorder::SetFps(uint32_t fps, uint32_t timeoutMs) {
     if (fps == 0) fps = 60;
-    if (fps > 240) fps = 240;
+    if (fps > MfEncoder::kMaxFps) fps = MfEncoder::kMaxFps;
 
     // 喂帧线程没起来（Start 失败 / 已经 Stop）：只改记录值，下次 Start 会用。
     if (!feeder_.joinable() || !encoder_ || !encoder_->Running()) {
@@ -970,6 +1163,41 @@ bool SegmentRecorder::SetFps(uint32_t fps, uint32_t timeoutMs) {
                                      [&] { return fpsDone_ >= want; });
     if (!done) return false;
     return fpsOk_;
+}
+
+bool SegmentRecorder::SetBitrate(uint32_t bitrateMbps, uint32_t timeoutMs) {
+    if (bitrateMbps > 200) bitrateMbps = 200;
+
+    // 喂帧线程没起来（Start 失败 / 已经 Stop）：只改记录值，下次 Start 会用。
+    if (!feeder_.joinable() || !encoder_ || !encoder_->Running()) {
+        video_.bitrateMbps = bitrateMbps;
+        return true;
+    }
+
+    // 跟当前一致就不用麻烦喂帧线程（改一次要重开 SinkWriter，约 300~400ms）。
+    //
+    // 注意比的是**请求值**不是实际值：从「自动估出 5 Mbps」改成「显式配
+    // 5 Mbps」实际码率没变，也没必要切片。
+    if (bitrateMbps == encoder_->RequestedBitrateMbps() &&
+        bitrateMbps == encoder_->EffectiveBitrateMbps()) {
+        video_.bitrateMbps = bitrateMbps;
+        return true;
+    }
+
+    uint64_t want = 0;
+    {
+        std::lock_guard<std::mutex> lk(brMu_);
+        brWantValue_ = bitrateMbps;
+        want = ++brWant_;
+        brOk_ = false;
+    }
+    slotCv_.notify_all(); // 让喂帧线程从 wait 里醒过来，别等满一个节拍
+
+    std::unique_lock<std::mutex> lk(brMu_);
+    const bool done = brCv_.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                                     [&] { return brDone_ >= want; });
+    if (!done) return false;
+    return brOk_;
 }
 
 void SegmentRecorder::Stop() {    // 先收喂帧线程：它可能正卡在 WriteSample 上等编码器。
@@ -1008,10 +1236,20 @@ void SegmentRecorder::RefreshDiskStatsLocked() const {
     std::error_code ec;
     uint32_t count = 0;
     uint64_t bytes = 0;
-    // 分片现在分布在各轮次的子目录里，磁盘统计要连子目录一起扫 ——
-    // 只扫一层的话，界面上永远显示"0 个分片 / 0 MB"。
-    if (!segmentsDir_.empty()) {
-        const fs::path root = fs::u8path(segmentsDir_);
+    // 【只扫**本轮**目录，不扫整个 segments 根】
+    //
+    // 以前这里 `recursive_directory_iterator(segmentsDir_)` 把每一轮的历史
+    // 目录全算进来，于是 `recordSegments` 里混着上一次运行留下的片 ——
+    // 服务重启后它一上来就是 10 片，界面据此立刻认为"够导了"，点导出时
+    // 真正属于本次录制的只有 2~3 秒，其余全被补成 NO SIGNAL。
+    // 实测（`launch.mjs --gui-export`）：`exportSegments=2`、
+    // `noSignalSeconds=17.1`，就在这个坑里。
+    //
+    // 导出端**仍然**扫全部轮次（`Exporter::ListSegments`）—— 那是刻意的：
+    // 服务中途退出再起来，回放窗口里既有旧片也有新片，中间那段按设计补
+    // NO SIGNAL（见 DESIGN 9.4）。但"我手上还有多少可导的片"必须只数本轮。
+    const fs::path root = fs::u8path(runDir_.empty() ? segmentsDir_ : runDir_);
+    if (!root.empty()) {
         std::error_code ecDir;
         if (fs::exists(root, ecDir)) {
             for (const auto& e : fs::recursive_directory_iterator(root, ecDir)) {
@@ -1034,7 +1272,19 @@ void SegmentRecorder::RefreshDiskStatsLocked() const {
 RecorderStats SegmentRecorder::Stats() const {
     std::lock_guard<std::mutex> lk(mu_);
     RefreshDiskStatsLocked();
-    return stats_;
+    RecorderStats out = stats_;
+    // 帧率/码率现问编码器：它们能被就地改（SetFps / SetBitrate），也可能被
+    // 硬件吞吐上限降档。界面要能看到「我配的是 X、实际跑的是 Y」。
+    if (encoder_) {
+        out.requestedFps = encoder_->RequestedFps();
+        out.effectiveFps = encoder_->EffectiveFps();
+        out.requestedBitrateMbps = encoder_->RequestedBitrateMbps();
+        out.effectiveBitrateMbps = encoder_->EffectiveBitrateMbps();
+    }
+    // 采集端被顶掉的帧数（只在 Feed 里累加，那边用的是 slotMu_）。
+    out.captureDropped = slotOverwritten_.load(std::memory_order_relaxed);
+    out.captureFrames = slotFed_.load(std::memory_order_relaxed);
+    return out;
 }
 
 } // namespace shadow

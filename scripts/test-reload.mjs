@@ -22,7 +22,22 @@
 //    只是刚起来。所以下面先用 waitStable() 等齐，再开始测量。
 //
 // 跑完会把目标路的帧率改回原值，不给用户留烂摊子。
-const DEBUG_PORT = Number(process.argv[2] || 9222)
+// 端口来源：`--cdp <端口>`、裸位置参数、或默认 9222。
+//
+// 【踩过的坑】原来只写 `Number(process.argv[2] || 9222)`。照提示敲
+// `node scripts/test-reload.mjs --cdp` 时 argv[2] 是字符串 `--cdp`，
+// Number('--cdp') 得到 **NaN**，然后一路拼成 `http://127.0.0.1:NaN/json/list`
+// —— 报的错是 `ERR_INVALID_URL`，跟"端口没开"长得完全不一样，而且上面那行
+// 「请先这样启动界面：node scripts/launch.mjs --cdp NaN」还教人去敲一个
+// 不存在的端口号。参数解析必须同时认这两种写法。
+function parsePort(argv) {
+  const fromFlag = argv.indexOf('--cdp')
+  const raw = fromFlag >= 0 ? argv[fromFlag + 1] : argv[2]
+  const n = Number(raw)
+  // 没给、给了个不是数字的东西（比如把 `--cdp` 写成了位置参数）→ 回默认值。
+  return Number.isFinite(n) && n > 0 && n < 65536 ? n : 9222
+}
+const DEBUG_PORT = parsePort(process.argv)
 const TARGET_ID = 'p-desk'
 
 const { execFileSync } = await import('node:child_process')
@@ -111,7 +126,24 @@ const cur = Math.round(before[TARGET_ID]?.target ?? 60)
 const toggle = cur === 60 ? 120 : 60
 
 // 直接走界面那条单路保存通道（preload.saveProfile），和用户点保存完全同一条路。
-const list = await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json()
+//
+// 【前置条件】界面必须带着调试端口启动：
+//     node scripts/launch.mjs --cdp 9222
+// 以前 launch.mjs 从不传 `--remote-debugging-port`，这里一连就 ECONNREFUSED，
+// 整个脚本永远跑不起来（不是产品坏了，是测试缺了那个开关）。现在启动脚本
+// 支持 `--cdp <端口>`，连不上时这里给一句能照做的提示，而不是抛原始错误。
+let list
+try {
+  list = await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json()
+} catch (err) {
+  console.error(
+    `连不上界面调试端口 ${DEBUG_PORT}（${err?.cause?.code ?? err?.message ?? err}）。\n` +
+      `请先这样启动界面，再重跑本脚本：\n` +
+      `    node scripts/launch.mjs --cdp ${DEBUG_PORT}\n` +
+      `（日常 npm start 默认不开调试端口，那是安全考虑；这个测试需要它。）`,
+  )
+  process.exit(1)
+}
 const page = list.find((t) => t.type === 'page')
 if (!page) {
   console.log('找不到 Electron 页面，无法通过界面通道保存')

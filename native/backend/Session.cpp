@@ -17,7 +17,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
+#include <vector>
 
 #include "JsonUtil.h"
 #include "RingNames.h"
@@ -34,6 +36,50 @@ constexpr double kDefaultFps = 60.0;
 // 才 4.17ms，等 2ms 就等于把一半预算白扔了。1ms 是 DXGI 能接受的最小实用值，
 // 而且它只在桌面**没有新帧**时才等满 —— 有内容时立刻返回。
 constexpr uint32_t kCaptureTimeoutMs = 1;
+
+// ---------------------------------------------------------------------------
+// 预览降采样
+//
+// 【为什么要降】预览这一条路是：服务 memcpy 进共享内存 → 界面每帧
+// texSubImage2D 上传 → WebGL 采样 → 窗口合成。1440p 每帧 14.7MB，120fps
+// 就是 1.77GB/s 的上传量，实测界面只能画出 77fps（上传 + 合成把每帧拖到
+// 13ms），GPU 占用也长期偏高。而预览面板实际只有几百到一千多像素宽 ——
+// 按原始分辨率传纯属浪费。
+//
+// 【为什么放在服务侧】界面读的帧尺寸来自每个槽自己的槽头（ringLayout.ts
+// 的 readPublishedFrame），所以服务发布小一号的帧，界面自动按新尺寸建纹理，
+// 前端一个字节都不用改。反过来在界面侧缩是没有意义的：像素都已经传过来了。
+//
+// 【录制完全不受影响】编码器吃的是 snap_ 原图（走 frameAction 那条路），
+// 只有发进共享环的这一份被缩小。
+// ---------------------------------------------------------------------------
+// 宽超过这个值就降一半：2560x1440 → 1280x720，仍然比任何预览面板都宽，
+// 而上传量降到 1/4。小窗口（比如一个 800px 的记事本）不降，保持清晰。
+constexpr uint32_t kPreviewDownscaleAboveWidth = 1600;
+
+/**
+ * 隔行隔列取点，把 BGRA8 画面降到 1/2（尺寸向下取整到偶数）。
+ * dst 至少要 outW*outH*4 字节。
+ *
+ * 为什么是"取点"而不是 2x2 求平均：采集一拍的预算只有 8.33ms（120fps），
+ * 而 captureMs 已经占掉 5.25ms。求平均要读满 14.7MB 再逐通道算，实测会把
+ * 这一笔推到 3ms 以上；取点只读一半的行、每行跳着读，成本约 0.5ms。
+ * 画质上差的那一点由界面侧的 WebGL LINEAR 采样补回来（它本来也要把纹理
+ * 缩到面板尺寸）。
+ */
+void DownsampleHalfBgra(const uint8_t* src, uint32_t srcStride, uint32_t w, uint32_t h,
+                        uint8_t* dst) {
+    const uint32_t outW = w / 2;
+    const uint32_t outH = h / 2;
+    for (uint32_t y = 0; y < outH; ++y) {
+        const uint8_t* row = src + static_cast<size_t>(2 * y) * srcStride;
+        for (uint32_t x = 0; x < outW; ++x) {
+            std::memcpy(dst, row, 4);
+            dst += 4;
+            row += 8;
+        }
+    }
+}
 // 采集被中断（窗口关掉 / 锁屏 / 切分辨率）后，重建最多试几次、之间隔多久。
 //
 // 6 次 × 约 1 秒 是刻意的折中：窗口关掉再开通常几秒内完成，这段重试窗口足够
@@ -148,6 +194,20 @@ std::string Session::StatusJson() const {
                  ",\"recordSegments\":" + std::to_string(status_.recordedSegments) +
                  ",\"recordBytes\":" + std::to_string(status_.recordedBytes) +
                  ",\"recordFrames\":" + std::to_string(status_.recordedFrames) +
+                 // 帧率/码率：配置值与实际值并排报，界面才能说清「我配的 240 帧
+                 // 其实跑的是 165」这种降档，以及「我配的 5 Mbps 真的落地了」
+                 // 而不是被估算公式换掉（m14071 / m13697）。
+                 ",\"requestedFps\":" + std::to_string(status_.requestedFps) +
+                 ",\"effectiveFps\":" + std::to_string(status_.effectiveFps) +
+                 ",\"requestedBitrateMbps\":" + std::to_string(status_.requestedBitrateMbps) +
+                 ",\"effectiveBitrateMbps\":" + std::to_string(status_.effectiveBitrateMbps) +
+                 // 丢帧的两个口径（m15478「可以降帧率，但最好不要丢帧」）：
+                 //   repeatFrames   = 时间轴不够时用重复帧顶上的数量（画面卡，不加速）
+                 //   captureDropped = 采集到的帧被待喂槽顶掉、没进编码器的数量
+                 // 界面拿它们和 recordFrames 一比就知道"丢了多少、卡不卡"。
+                 ",\"repeatFrames\":" + std::to_string(status_.repeatFrames) +
+                 ",\"captureDropped\":" + std::to_string(status_.captureDropped) +
+                 ",\"captureFrames\":" + std::to_string(status_.captureFrames) +
                  // 立刻切片完成计数：界面发完 flush 命令后轮询这个字段，
                  // 变了才说明"点按钮那一刻"的分片真的落盘了，可以开始导出。
                  // 管道是单向的，服务没法回话，这就是那条回执。
@@ -182,7 +242,7 @@ std::string Session::StatusJson() const {
     std::snprintf(buf, sizeof(buf),
                   "{\"type\":\"session\",\"id\":\"%s\",\"name\":\"%s\","
                   "\"state\":\"%s\",\"detail\":\"%s\",\"enabled\":%s,"
-                  "\"attached\":%s,\"hwnd\":%llu,\"matchedTitle\":\"%s\","
+                  "\"attached\":%s,\"hwnd\":%u,\"matchedTitle\":\"%s\","
                   "\"width\":%u,\"height\":%u,\"targetFps\":%.2f,"
                   "\"actualFps\":%.2f,\"gapMs\":%.2f,\"captureMs\":%.2f,"
                   "\"produced\":%llu,\"dropped\":%llu,\"consumerPid\":%u,"
@@ -191,7 +251,9 @@ std::string Session::StatusJson() const {
                   JsonEscape(s.id).c_str(), JsonEscape(s.name).c_str(),
                   ToString(s.state), JsonEscape(s.detail).c_str(),
                   s.enabled ? "true" : "false", s.attached ? "true" : "false",
-                  static_cast<unsigned long long>(s.hwnd),
+                  // hwnd 统一按无符号 32 位上报，和 main.cpp 的窗口列表同一个口径
+                  // （见 BuildWindowsJson 的说明：64 位值在 JS 里存不准）。
+                  static_cast<unsigned>(static_cast<uint32_t>(s.hwnd)),
                   JsonEscape(s.matchedTitle).c_str(),
                   s.width, s.height, s.targetFps,
                   s.actualFps, s.gapMs, s.captureMs,
@@ -283,14 +345,16 @@ void Session::EnsureRecorder(uint32_t w, uint32_t h) {
 
 // 把新配置里可以就地生效的部分应用到正在跑的会话上。
 bool Session::ApplyLiveSettings(const Profile& next) {
-    // 只有「除了帧率以外全都一样」才允许就地改。别的字段都写死在采集器 /
-    // 录制器的构造里（码率、分片时长、回放窗口、采集源），改不了。
-    if (!profile_.SameSettingsIgnoringFps(next)) return false;
+    // 只有「除了帧率、码率以外全都一样」才允许就地改。别的字段都写死在采集器 /
+    // 录制器的构造里（分片时长、回放窗口、采集源、缩放），改不了。
+    if (!profile_.SameSettingsIgnoringFpsBitrate(next)) return false;
 
     const double oldFps = profile_.video.fps;
     const double newFps = next.video.fps;
+    const uint32_t oldBitrate = profile_.video.bitrateMbps;
+    const uint32_t newBitrate = next.video.bitrateMbps;
 
-    // 除了帧率之外的元数据（名字用于导出文件名前缀，改了要跟着走）
+    // 除了帧率/码率之外的元数据（名字用于导出文件名前缀，改了要跟着走）
     profile_.name = next.name;
 
     {
@@ -298,18 +362,28 @@ bool Session::ApplyLiveSettings(const Profile& next) {
         status_.targetFps = newFps > 0.0 ? newFps : kDefaultFps;
     }
 
-    if (oldFps == newFps) return true;
+    const bool fpsChanged = (oldFps != newFps);
+    const bool bitrateChanged = (oldBitrate != newBitrate);
+    if (!fpsChanged && !bitrateChanged) return true;
 
     profile_.video.fps = newFps;
+    profile_.video.bitrateMbps = newBitrate;
 
-    // 录制器那边也要跟着改。它内部会让编码器收掉当前片、按新帧率开新片
-    // （见 SegmentRecorder::SetFps / MfEncoder::SetFps），**不换轮次目录、
+    // 录制器那边也要跟着改。它内部会让编码器收掉当前片、按新参数开新片
+    // （见 SegmentRecorder::SetFps / SetBitrate），**不换轮次目录、
     // 不归零分片序号、时间轴继续顺延**。
     //
     // 失败也不回滚：编码器可能被硬件吞吐上限卡住，但那时它会自己降档并
     // 把原因写进 recordDetail，比把会话拆了重建好得多。
     if (recorder_) {
-        recorder_->SetFps(newFps > 0.0 ? static_cast<uint32_t>(newFps + 0.5) : 60u);
+        if (fpsChanged) {
+            recorder_->SetFps(newFps > 0.0 ? static_cast<uint32_t>(newFps + 0.5) : 60u);
+        }
+        if (bitrateChanged) {
+            // 码率改完要把结果如实报给界面（SegmentRecorder 的 stats 里没有
+            // 码率字段，这里直接读编码器）。失败时 recordDetail 里会有原因。
+            recorder_->SetBitrate(newBitrate);
+        }
     }
     return true;
 }
@@ -413,6 +487,13 @@ void Session::RefreshRecordStatus() {    if (!recorder_) return;
     status_.recordedSegments = rs.segmentsOnDisk;
     status_.recordedBytes = rs.diskBytes;
     status_.recordedFrames = rs.framesIn;
+    status_.requestedBitrateMbps = rs.requestedBitrateMbps;
+    status_.effectiveBitrateMbps = rs.effectiveBitrateMbps;
+    status_.requestedFps = rs.requestedFps;
+    status_.effectiveFps = rs.effectiveFps;
+    status_.repeatFrames = rs.repeatFrames;
+    status_.captureDropped = rs.captureDropped;
+    status_.captureFrames = rs.captureFrames;
 }
 
 bool Session::ResolveSource() {
@@ -464,13 +545,51 @@ bool Session::ResolveSource() {
     }
 
     WindowInfo win;
-    if (!ResolveWindow(profile_.match, win)) {
+    // ---- 窗口锁定：选定了就别中途换 --------------------------------------
+    // 用户要求："选好一个窗口要录制了，就不要中途换来换去"。环境波动
+    // （标题变了、被最小化、锁屏）都不该触发重新匹配——否则同 class 的窗口
+    // 会被 pick:largest 选错源。所以优先复用锁定的 hwnd：它还活着（IsWindow
+    // 为真，包括最小化/锁屏这种"还在"的情况）就直接用、跳过 ResolveWindow；
+    // 只有它真的被销毁（IsWindow 为假）才解锁、退回按规则重新匹配。
+    bool locked = false;
+    // 锁定的窗口"还在"的判据不能只看 IsWindow：Chromium 系关窗口只隐藏不销毁，
+    // 句柄会一直有效，但已经没有任何画面了。这种情况必须当作"丢了"处理，
+    // 才能走下面的重新匹配 —— 匹配不到就 Disabled，界面立刻盖上 NO SIGNAL。
+    // （见 WindowEnum.h 里 WindowPresent 的说明。）
+    if (lockedHwnd_ != 0 && WindowPresent(reinterpret_cast<HWND>(lockedHwnd_))) {
+        locked = true;
+        win.hwnd = reinterpret_cast<HWND>(lockedHwnd_);
+        // 顺手补标题/尺寸（最小化时枚举不一定拿到真实尺寸，但 hwnd 才是关键）。
+        const auto snap = EnumerateWindows({reinterpret_cast<HWND>(lockedHwnd_)});
+        if (!snap.empty()) {
+            win = snap.front();
+            win.hwnd = reinterpret_cast<HWND>(lockedHwnd_);  // 保真
+        } else {
+            win.title.clear();
+            win.width = 0;
+            win.height = 0;
+        }
+    } else {
+        if (lockedHwnd_ != 0) lockedHwnd_ = 0;  // 锁定的窗口没了，解锁
+        if (!ResolveWindow(profile_.match, win)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            status_.state = SessionState::Disabled;
+            // 把规则原样写出来：用户要的就是"匹配不到就别乱选"，那至少要让他
+            // 看得见"在找什么、为什么没找到"。
+            status_.detail = "匹配不到窗口（要求：" + profile_.match.Describe() +
+                             "）；不会改录别的窗口";
+            return false;
+        }
+    }
+    if (win.hwnd == 0) {
         std::lock_guard<std::mutex> lk(mu_);
         status_.state = SessionState::Disabled;
-        status_.detail = "匹配不到窗口";
+        status_.detail = "匹配到的窗口无效";
         return false;
     }
-    if (win.width <= 0 || win.height <= 0) {
+    // 非锁定窗口才用"尺寸 0 → 直接 Disabled"挡掉；锁定的窗口允许带着 0 尺寸
+    // 往下走（最小化时 WGC 抓不到会 Failed 重试，窗口一恢复就继续录同一个）。
+    if (!locked && (win.width <= 0 || win.height <= 0)) {
         std::lock_guard<std::mutex> lk(mu_);
         status_.state = SessionState::Disabled;
         status_.detail = "匹配到的窗口尺寸为 0";
@@ -488,6 +607,7 @@ bool Session::ResolveSource() {
         std::string err;
         if (windowCapture_->Init(win.hwnd, err)) {
             capture_ = nullptr;
+            lockedHwnd_ = reinterpret_cast<uint64_t>(win.hwnd);  // 锁定这一路
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 status_.hwnd = reinterpret_cast<uint64_t>(win.hwnd);
@@ -614,6 +734,9 @@ void Session::ThreadMain() {
         // 这俩只在状态上报里露出来，方便分辨"限流没生效"和"界面没画"。
         uint64_t previewPublished_ = 0;
         uint64_t previewSkipped_ = 0;
+        // 预览降采样的目标缓冲（见文件上方 DownsampleHalfBgra 的说明）。
+        // 只被采集线程自己碰，不用加锁；resize 之后一直复用，不会每帧分配。
+        std::vector<uint8_t> previewBuf;
         // 下一拍该发布的**目标时刻**（自成一体的时间轴，见下面 nextDue 的注释）。
         auto nextPublish_ = std::chrono::steady_clock::now();
         auto lastRepublish = std::chrono::steady_clock::now();
@@ -704,6 +827,25 @@ void Session::ThreadMain() {
                     // 现在的行为：没有消费者时照常采集 + 喂录制器，只是不往环里写
                     // （Publish 本来就会被环拒绝，见下面 published 的处理）。
                     waitingSkip = true;
+                    // 【采集健康、只是没人看，也必须报 Live】
+                    //
+                    // 踩过的坑：`status_.state = Live` 原来只写在上面
+                    // `if (lastFrameOk)` 那一支里，而那一支的前提是
+                    // `WaitForConsumer(0)` 成功 —— 也就是**必须有界面连上来**。
+                    // 于是服务单独跑（没开界面，常驻录制的常态）时，状态从头到尾
+                    // 停在 `waiting`，而录制一直在正常出片。自检、验收脚本和本鱼
+                    // 自己一次又一次被这个 `waiting` 误导成"这一路没工作"
+                    // （`scripts/test-budget.mjs`、`test-reload.mjs` 的
+                    // "采样前必须等每一路进入稳定状态"就是为它加的）。
+                    //
+                    // 状态该由"采集链路到底通不通"决定，跟有没有人看无关 ——
+                    // 这正是本文件顶上那段注释立的规矩。消费者不在只影响
+                    // Publish，不影响这一路是否在正常录制。
+                    if (lastFrameOk) {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        status_.state = SessionState::Live;
+                        status_.consumerPid = 0;
+                    }
                 }
             } else if (loopStart - lastConsumerCheck >= std::chrono::milliseconds(500)) {
                 lastConsumerCheck = loopStart;
@@ -725,7 +867,22 @@ void Session::ThreadMain() {
             // 「该路未在录制」）。改完这里立刻换节拍，录制器那边由
             // ApplyLiveSettings 直接通知编码器。
             {
-                const double wantFps = currentFps();
+                double wantFps = currentFps();
+                // 【采集节拍必须夹到编码器真正吃得下的帧率】用户的要求是
+                // 「可以降帧率，但最好不要丢帧」（m15478）。硬件编码器在
+                // 1440p 只吃 165 帧（探针实测 172 是物理上限），配置写 240 时
+                // 编码器会降档到 165；如果采集仍按 240 拍，多出来的 75 帧/秒
+                // 全部要在待喂槽里被顶掉 —— 实测 22 秒 captureDropped 就堆到
+                // 2727 帧，而时间轴上一片都没少。那不是"降帧率"，那是白烧
+                // CPU 和内存带宽再丢掉。
+                //
+                // 夹住之后采集端只产编码器吃得下的帧，待喂槽不再溢出，
+                // captureDropped 应当贴到 0；录制器内部还会按它自己的当前
+                // 帧率补帧，但喂得上就不需要补，repeatFrames 同样贴 0。
+                if (recorder_) {
+                    const uint32_t encFps = recorder_->CurrentFps();
+                    if (encFps > 0 && encFps < wantFps) wantFps = encFps;
+                }
                 if (wantFps != fps) {
                     fps = wantFps;
                     frameInterval =
@@ -904,6 +1061,26 @@ void Session::ThreadMain() {
                 snapW_ = gotW;
                 snapH_ = gotH;
             }
+            // ---- 桌面源：保证 snap_ 里真的装着一整帧 ----------------------
+            //
+            // CaptureSharedInto 的设计是"把这一帧 swap 进采集器自己的 lastFrame_
+            // （同源的其他会话直接 memcpy 吃现成的），把一块**可复用**的缓冲
+            // 换回 snap_"。这一路第一次拿到帧时，换回来的是空缓冲（size()==0），
+            // 而下面发布预览（降采样）、录制器 Feed、桌面静止时的重发全都按
+            // snap_ 取像素 —— 空缓冲一读就越界。
+            //
+            // 实测：服务刚起来、界面已经连上预览（或界面重启后自动重连）时，
+            // 第一帧下来就在 DownsampleHalfBgra 里段错误，服务直接消失，界面上
+            // 表现成"画面定住、状态还停在 live"。
+            //
+            // 只在这一路头一两帧发生：之后 swap 回来的是上一帧的缓冲，尺寸已经
+            // 对了，这条拷贝不会再跑。
+            if (!useWgc && frameValid && fvRaw_.pixels && fvRaw_.pixels != snap_.data()) {
+                const size_t need = static_cast<size_t>(snapW_) * 4u * snapH_;
+                if (need > 0 && snap_.size() < need) {
+                    snap_.assign(fvRaw_.pixels, fvRaw_.pixels + need);
+                }
+            }
             const uint32_t snapStride = snapW_ * 4u;
 
             // ---- 画面尺寸变了：预览和录制都得跟着改 ----------------------
@@ -1003,8 +1180,22 @@ void Session::ThreadMain() {
                         }
                     }
                     if (allowPublish) {
+                        // 宽超标的先降一半再进环：界面上传量降到 1/4
+                        // （见上面 kPreviewDownscaleAboveWidth 的说明）。
+                        uint32_t outW = pubW;
+                        uint32_t outH = pubH;
+                        const uint8_t* outSrc = src;
+                        uint32_t outStride = snapStride;
+                        if (pubW > kPreviewDownscaleAboveWidth && pubW >= 2 && pubH >= 2) {
+                            outW = pubW / 2;
+                            outH = pubH / 2;
+                            previewBuf.resize(static_cast<size_t>(outW) * outH * 4u);
+                            DownsampleHalfBgra(src, snapStride, pubW, pubH, previewBuf.data());
+                            outSrc = previewBuf.data();
+                            outStride = outW * 4u;
+                        }
                         const auto pubT0 = std::chrono::steady_clock::now();
-                        published = ring_.Publish(src, snapStride, pubW, pubH, gotQpc);
+                        published = ring_.Publish(outSrc, outStride, outW, outH, gotQpc);
                         if (published) {
                             lastPreviewPublish_ = publishedNow;
                             ++previewPublished_;
@@ -1076,11 +1267,20 @@ void Session::ThreadMain() {
                             }
                             // 句柄失效了：落到下面的重新匹配逻辑。
                         }
-                        // WGC 这一路：窗口关了就得**重新按匹配规则解一个**再 Init。
-                        // （WindowCapture 会置 closed；沿用旧句柄是死路。）
+                        // WGC 这一路：窗口断了要重建。优先复用**锁定的**那个窗口——
+                        // 它还活着（哪怕最小化/锁屏）就继续抓它，不重新按规则匹配，
+                        // 这正是"选定后不中途换窗口"。只有它真没了才解锁重解。
+                        // "没了"包括隐藏（Chromium 关窗口只隐藏不销毁），见 WindowPresent。
                         WindowInfo again;
                         if (!profile_.match.Valid()) break;  // 没规则，再试也没用
-                        if (!ResolveWindow(profile_.match, again) || !again.hwnd) continue;
+                        if (lockedHwnd_ != 0 && WindowPresent(reinterpret_cast<HWND>(lockedHwnd_))) {
+                            again.hwnd = reinterpret_cast<HWND>(lockedHwnd_);
+                            const auto snap = EnumerateWindows({again.hwnd});
+                            if (!snap.empty()) again = snap.front();
+                        } else {
+                            if (lockedHwnd_ != 0) lockedHwnd_ = 0;  // 窗口没了，解锁
+                            if (!ResolveWindow(profile_.match, again) || !again.hwnd) continue;
+                        }
                         std::string werr;
                         if (windowCapture_->Init(again.hwnd, werr)) {
                             rebuilt = true;
@@ -1189,7 +1389,21 @@ void Session::ThreadMain() {
                     snapW_ > 0 && !snap_.empty()) {
                     const uint32_t snapStride = snapW_ * 4u;
                     const uint8_t* src = snap_.data();
-                    published = ring_.RepublishLast(src, snapStride);
+                    // 和上面那条 Publish 走同一套降采样：这两处尺寸必须一致，
+                    // 否则重发的一帧尺寸突然变回 2560x1440，界面会重建纹理（闪）。
+                    uint32_t rpW = snapW_;
+                    uint32_t rpH = snapH_;
+                    const uint8_t* rpSrc = src;
+                    uint32_t rpStride = snapStride;
+                    if (snapW_ > kPreviewDownscaleAboveWidth && snapW_ >= 2 && snapH_ >= 2) {
+                        rpW = snapW_ / 2;
+                        rpH = snapH_ / 2;
+                        previewBuf.resize(static_cast<size_t>(rpW) * rpH * 4u);
+                        DownsampleHalfBgra(src, snapStride, snapW_, snapH_, previewBuf.data());
+                        rpSrc = previewBuf.data();
+                        rpStride = rpW * 4u;
+                    }
+                    published = ring_.RepublishLast(rpSrc, rpStride, rpW, rpH);
                     // 桌面静止也算一帧：录像要连续帧流，缺帧会让时间轴变短。
                     frameAction = true;
                     lastRepublish = actStart;
@@ -1239,6 +1453,38 @@ void Session::ThreadMain() {
             if (frameAction) framesInWindow++;
             // 把这一拍的结果留给下一轮的"能不能回到 Live"判断。
             lastFrameOk = frameAction;
+
+            // ---- 「采集健康就是 Live」每拍都判一次 ----------------------------
+            //
+            // 【为什么这条不能只留在上面那两个 `!connected` 分支里】
+            //
+            // 那一段只在「还没连上消费者」时进入，于是状态的写入被绑在了
+            // 「这一次进入循环时有没有消费者」上；而 `lastFrameOk` 是第一拍
+            // 才算出结果的，第一拍必然是 false。两个条件一叠加就出现一个
+            // **永久**卡死的窗口：
+            //
+            //   · 服务先起来（没有界面）→ 一直走 else 分支，第一拍 lastFrameOk
+            //     还是 false，写不成 Live；
+            //   · 界面随后连上来 → WaitForConsumer 成功、connected 置真，
+            //     那两个分支**从此再也不进**；
+            //   · 于是 status_.state 永远停在循环开始前写下的 Waiting。
+            //
+            // 实测就是这样：状态文件里 `state:"waiting"`、`consumerPid:13140`
+            // （非零，说明消费者在）、`actualFps:131`、`recordFrames:5509` ——
+            // 一切都在正常工作，只有这一个字段在撒谎。自检脚本和本鱼自己都
+            // 被它骗过好几次（"采样前必须等每一路进入稳定状态"就是为它加的）。
+            //
+            // 判据只能是「采集链路通不通」。**只覆盖 Waiting / Starting**：
+            // Reconnecting（正在重建）、Failed（等窗口回来）、Disabled（被禁用）
+            // 都是别人刚写下的、更具体的结论，这里不许冲掉 —— 那正是本文件
+            // 顶上反复强调的"NO SIGNAL 撤不掉"的另一半。
+            if (frameAction) {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (status_.state == SessionState::Waiting ||
+                    status_.state == SessionState::Starting) {
+                    status_.state = SessionState::Live;
+                }
+            }
             // "干活"估计值，用来把下一轮的 deadline 往前挪（见 nextDue 的注释）。
             //
             // 用**积分修正**而不是纯 EMA：EMA 有稳态偏差 —— 它只会从下面慢慢逼近，

@@ -20,25 +20,47 @@ import { createRequire } from 'node:module'
 import { projectRoot, tempRoot, electronDistPath, assertElectronDist } from './electron-path.mjs'
 
 const require = createRequire(import.meta.url)
-const { ensureServiceExe, TEMP_ROOT } = require('../app/temp-const.cjs')
+const { TEMP_ROOT } = require('../app/temp-const.cjs')
+
+// ---------------------------------------------------------------------------
+// 控制台中文乱码
+//
+// 现象：`[main] 宸叉竻鐞嗕笂娆¤繍琛岀殑涓存椂浜х墿` —— 这是"已清理上次运行的
+// 临时产物"的 UTF-8 字节被控制台按 GBK(936) 解出来的样子。
+//
+// 根因：
+//   · Node 自己写控制台走 WriteConsoleW（UTF-16），**不看代码页**，所以
+//     `[launch] 采集服务已启动` 这类行一直是正常的 —— 千万别拿它当"代码页已经
+//     是 UTF-8"的证据；
+//   · Electron 主进程是直接 WriteFile 到控制台句柄的**原始 UTF-8 字节**，
+//     控制台按当前代码页（中文 Windows 默认 936）解码 → 中文全成乱码。
+//
+// 两道保险，缺一不可：
+//   1. 这里把控制台代码页切到 65001（对第 2 步之外的原生程序也有用）；
+//   2. 启动界面时把 stdout/stderr 接成管道，用 Node 转写一遍（见文件末尾）——
+//      这一步不依赖代码页，是真正保证不乱码的那道。
+//
+// 【windowsHide 千万别加】加上它 Node 会用 CREATE_NO_WINDOW 给 cmd.exe 开一个
+// **新的隐藏控制台**，chcp 改的是那个一次性控制台，父控制台纹丝不动 —— 之前
+// "改了还是乱码"就是这个原因。不带它时 cmd 会继承父控制台，才改得动。
+// ---------------------------------------------------------------------------
+if (process.platform === 'win32' && process.stdout.isTTY) {
+  try {
+    spawnSync('cmd', ['/c', 'chcp', '65001'], { stdio: 'ignore' })
+  } catch {
+    /* 切不了也不影响功能：下面还有管道转写那道保险 */
+  }
+}
 
 const exe = assertElectronDist()
-// 采集服务用**运行副本**，不是 native/build 里那个原件。
+// 直接跑编译产物本身，不复制副本。
 //
-// 为什么：仓库目录可能继承一个"低完整性标签"（DSH 沙箱、同步盘、杀软都会留
-// 这种东西）。从那种目录启动的进程也是低完整性级别，于是：
-//   * 写 %TEMP% 下别的进程建的目录会被拒 —— 状态文件 status-v1.json 直接
-//     写不出来，界面永远显示"服务未启动"（本鱼实测过：原件 0 个状态文件，
-//     副本 1 个）；
-//   * WGC 抓窗口直接被系统拒绝（0x80070005）。
-// 复制到 %TEMP% 里的副本没有那个标签，两件事一起解决。
-//
-// app/main.cjs 早就在用 ensureServiceExe 了，这里以前漏了 —— 结果就是
-// `npm start` 拉起的服务和界面自己拉起的服务行为不一样。
-const BACKEND_SRC = path.join(projectRoot, 'native', 'build', 'shadow-capture.exe')
-const BACKEND = existsSync(BACKEND_SRC)
-  ? ensureServiceExe({ srcExe: BACKEND_SRC, tempRoot: TEMP_ROOT, log: (m) => console.log('[launch]', m) })
-  : BACKEND_SRC
+// 以前这里（和 app/main.cjs）会把 exe 拷到 %TEMP%/shadow-play/app/bin/ 再启动，
+// 理由是"仓库目录可能带低完整性标签"。实际那条路带来的是两个更难查的问题：
+// 副本被启动清理删掉后路径永久失效（界面一直「正在连接…」、服务起不来），
+// 以及服务在跑时副本不能刷新（重编译后"改了没生效"）。只跑一份编译产物就没
+// 这些事：路径恒定，重编译后重启服务必生效。
+const BACKEND = path.join(projectRoot, 'native', 'build', 'shadow-capture.exe')
 const ARTIFACT_DIR = path.join(projectRoot, 'native', 'build', 'artifacts')
 const REPORT = path.join(ARTIFACT_DIR, 'probe-report.json')
 
@@ -70,6 +92,27 @@ function openLogFile(append = true) {
 //       某些容器/沙箱环境下渲染进程创建子进程需要管道会被拒绝。
 const CHILD_FLAGS = ['--disable-breakpad', '--disable-crash-reporter']
 if (process.env.SHADOW_NO_SANDBOX === '1') CHILD_FLAGS.push('--no-sandbox')
+
+// --cdp <port>：打开 Chromium 调试端口，让脚本能通过 CDP 直接驱动界面。
+//
+// 【为什么需要】`scripts/test-reload.mjs` 靠 CDP 走"界面那条单路保存通道"
+// （`window.shadowPreview.saveProfile`）来验证"保存只重载改动的那一路、绝不
+// 重启服务"。以前这里从来没传过 `--remote-debugging-port`，所以那个测试
+// 一连 9222 就 ECONNREFUSED、永远跑不起来 —— 不是产品坏了，是测试缺了这个开关。
+//
+// 【默认不开】调试端口等于把界面完全暴露给本机任何进程（能读写页面、能调
+// 所有 IPC）。只在显式传 `--cdp` 时才开，日常 `npm start` 保持关闭。
+const cdpIdx = passThrough.indexOf('--cdp')
+if (cdpIdx >= 0) {
+  const value = passThrough[cdpIdx + 1]
+  if (value !== undefined && Number.isFinite(Number(value)) && Number(value) > 0) {
+    CHILD_FLAGS.push(`--remote-debugging-port=${Number(value)}`)
+    console.log(`[launch] 已打开调试端口 ${Number(value)}（CDP 测试用）`)
+  } else {
+    console.warn('[launch] --cdp 后面要跟一个端口号，本次忽略')
+  }
+  passThrough.splice(cdpIdx, value === undefined ? 1 : 2)
+}
 
 const env = { ...process.env }
 delete env.ELECTRON_RUN_AS_NODE
@@ -133,19 +176,36 @@ if (freshIdx >= 0) {
 }
 
 /**
+ * 某个 pid 现在还活着吗。
+ *
+ * 用 `process.kill(pid, 0)`：信号 0 不投递任何信号，只做权限/存在性检查。
+ * 进程不存在抛 ESRCH；存在但没权限抛 EPERM（那也是活着）。
+ */
+function pidAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return Boolean(e) && e.code === 'EPERM'
+  }
+}
+
+/**
  * 采集服务在不在跑。
  *
  * 两条判据，**必须都看**：
  *   1. `shadow-capture --status` 的退出码（互斥体）；
- *   2. 状态文件 status-v1.json 是不是新鲜。
+ *   2. 状态文件 status-v1.json 是不是新鲜，**而且它记的 pid 还活着**。
  *
  * 为什么不能只看第 1 条：互斥体是进程级的内核对象，进程刚退出、或者被杀掉
  * 之后还有一瞬间能拿到句柄，`--status` 会骗人说在跑；而"上一轮的服务已经
  * 死了、这一轮该起一个新的"这种场景，靠一个会抖的退出码判断太脆。
  *
- * 状态文件是服务每秒刷一次的可读文件（%TEMP% 下），mtime 在 5 秒内就说明
- * 服务活着，跟退出码互为印证。app/main.cjs 的 serviceRunningFast() 用的也是
- * 这个思路。
+ * 为什么第 2 条还要验 pid：状态文件每秒刷一次，**进程被杀之后文件仍然新鲜**
+ * （mtime 还是刚才那次写入）。只看 mtime 的话，`Stop-Process` 之后 5 秒内
+ * 再启动就会误判"服务还在跑"，于是跳过拉起 —— 紧接着 probe 报
+ * 「打不开共享内存帧环」。这是真踩到过的间歇性失败，见 AUDIT.md。
  */
 function serviceStatus() {
   if (backendMissing) return { running: false }
@@ -159,7 +219,15 @@ function serviceStatus() {
   const file = path.join(TEMP_ROOT, 'status', 'status-v1.json')
   try {
     const st = statSync(file)
-    if (Date.now() - st.mtimeMs < 5000) return { running: true, how: 'status-file' }
+    if (Date.now() - st.mtimeMs < 5000) {
+      let pid = 0
+      try {
+        pid = Number(JSON.parse(readFileSync(file, 'utf8')).pid) || 0
+      } catch {
+        pid = 0
+      }
+      if (pidAlive(pid)) return { running: true, how: 'status-file' }
+    }
   } catch {
     // 文件不存在 = 服务确实没跑
   }
@@ -189,6 +257,10 @@ function launchService(svcArgs) {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
+    // 把当前 node 的绝对路径告诉服务：托盘「打开主界面」要从服务这边重新
+    // 拉起界面，它得知道拿什么去跑 launch.mjs（nvm/便携版 Node 不在 PATH
+    // 里时按名字找不到，只能靠这个）。
+    env: { ...process.env, SHADOW_NODE_EXE: process.execPath },
   })
   svc.unref()
   if (waitForService(6000)) {
@@ -276,7 +348,11 @@ if (!existsSync(webEntry) && !process.env.DEV_SERVER_URL) {
   )
 }
 
-if (!isProbe && !backendMissing && !serviceStatus().running) {
+if (!backendMissing && !serviceStatus().running) {
+  // 启动时清掉可能残留的停机哨兵（上次干净退出留下的），免得它挡住本次启动。
+  try {
+    rmSync(path.join(tempRoot, 'status', 'shutdown-requested'), { force: true })
+  } catch {}
   console.log('[launch] 采集服务没在运行，先拉起它…')
   // 有 profiles.json 就让服务跑多会话模式；否则退回单路模式。
   //
@@ -316,7 +392,8 @@ if (!isProbe && !backendMissing && !serviceStatus().running) {
       const s = JSON.parse(readFileSync(settingsFile, 'utf8'))
       const raw = Number(s?.previewMaxFps)
       if (Number.isFinite(raw)) {
-        const fps = Math.max(0, Math.min(240, Math.round(raw)))
+        // 上限跟录制侧一致（120，见 MfEncoder::kMaxFps）
+        const fps = Math.max(0, Math.min(120, Math.round(raw)))
         const pipeName = '\\\\.\\pipe\\ShadowPlay.Cmd.v1'
         const line = JSON.stringify({ cmd: 'set-preview-fps', fps }) + '\n'
         for (let i = 0; i < 25; i++) {
@@ -351,7 +428,19 @@ if (isProbe) {
     /* 忽略 */
   }
 
-  const child = spawn(exe, ['.', '--probe', '--disable-gpu', '--no-sandbox', ...CHILD_FLAGS], {
+  // `--session <id>` 要透传给自检：多会话模式下每一路各有自己的环名（就是配置
+  // id），不指定就只能靠状态文件猜。这里保留原样的两个参数，Electron 主进程
+  // 的 `runProbe()` 自己解析。
+  const probeArgs = ['.', '--probe', '--disable-gpu', '--no-sandbox', ...CHILD_FLAGS]
+  const probeSessionIdx = passThrough.indexOf('--session')
+  if (probeSessionIdx >= 0) {
+    const sessionValue = passThrough[probeSessionIdx + 1]
+    if (sessionValue && !sessionValue.startsWith('-')) {
+      probeArgs.push('--session', sessionValue)
+    }
+  }
+
+  const child = spawn(exe, probeArgs, {
     cwd: projectRoot,
     detached: true,
     stdio: 'ignore',
@@ -404,9 +493,14 @@ if (isSelftest) {
   const child = spawn(exe, ['.', ...passThrough, '--no-sandbox', '--enable-logging', ...CHILD_FLAGS], {
     cwd: projectRoot,
     detached: true,
-    stdio: ['ignore', 1, 2],
+    // 同前台模式：走管道由本进程转写，避免 Electron 的原始 UTF-8 字节被按 GBK 解。
+    stdio: ['ignore', 'pipe', 'pipe'],
     env,
   })
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
+  child.stdout.on('data', (s) => process.stdout.write(s))
+  child.stderr.on('data', (s) => process.stderr.write(s))
   child.unref()
   console.log('[launch] 已启动界面自检，等待报告…')
 
@@ -442,13 +536,26 @@ if (isSelftest) {
 // 正常启动界面
 // ---------------------------------------------------------------------------
 if (detach) {
+  // 输出落到 native\build\artifacts\gui.log。
+  //
+  // 【为什么不是 stdio:'ignore'】这条路不只是在终端里跑 `npm run start:bg`：
+  // 托盘「打开主界面」也是走它拉起来的（见 native/backend/TrayIcon.cpp），
+  // 那时候界面上根本没有控制台，日志一丢就完全没法查"为什么窗口没起来"。
+  const logFd = openLogFile()
   const child = spawn(exe, ['.', ...passThrough, ...CHILD_FLAGS], {
     cwd: projectRoot,
     detached: true,
-    stdio: 'ignore',
+    stdio: ['ignore', logFd, logFd],
     env,
   })
   child.unref()
+  // 先把界面 pid 落给托盘：它靠这个文件区分"正在启动"和"已经被用户叉掉"
+  // （界面自己启动后也会写一次同值，见 app/main.cjs 的 GUI_PID_FILE）。
+  try {
+    writeFileSync(path.join(TEMP_ROOT, 'gui.pid'), String(child.pid), 'utf8')
+  } catch {
+    /* 写不了只是托盘判断慢一点，不影响启动 */
+  }
   console.log(`[launch] 界面已在后台启动（pid ${child.pid}）。`)
   process.exit(0)
 }
@@ -458,11 +565,24 @@ if (detach) {
 console.log('[launch] 启动界面…（Ctrl+C 退出；采集服务会继续在后台运行）')
 console.log(`[launch] 命令：electron . ${passThrough.concat(CHILD_FLAGS).join(' ')}`)
 
+// stdout/stderr 走管道、由本进程转写一遍（而不是直接 inherit）。
+//
+// 【为什么】Electron 主进程往控制台写的是原始 UTF-8 字节，控制台按自己的代码页
+// （中文 Windows 默认 936/GBK）解码 → `[main]` 的中文全变成「宸叉竻鐞…」。
+// 而 Node 写控制台用的是 WriteConsoleW（UTF-16），**跟代码页无关**，所以只要让
+// 输出先经过 Node 一次（按 UTF-8 解码成字符串再写出），显示就一定正确。
+// 这套不依赖 chcp，是真正兜底的那道保险。
 const child = spawn(exe, ['.', ...passThrough, ...CHILD_FLAGS], {
   cwd: projectRoot,
-  stdio: 'inherit',
+  stdio: ['inherit', 'pipe', 'pipe'],
   env,
 })
+
+// setEncoding('utf8') 用的是 StringDecoder，跨 data 事件的多字节字符不会截断成乱码。
+child.stdout.setEncoding('utf8')
+child.stderr.setEncoding('utf8')
+child.stdout.on('data', (s) => process.stdout.write(s))
+child.stderr.on('data', (s) => process.stderr.write(s))
 
 process.on('SIGINT', () => {
   try {

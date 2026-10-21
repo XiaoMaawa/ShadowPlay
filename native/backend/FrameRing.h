@@ -90,7 +90,10 @@ public:
      *   - src 为空则只推进 counter，复用槽里已有的像素。
      * 返回 false 表示还没有可复用的帧（从未发布过）。
      */
-    bool RepublishLast(const uint8_t* src = nullptr, uint32_t srcStride = 0);
+    // w/h 为 0 时沿用上一次发布的尺寸。传了就以它为准：调用方手上的像素
+    // 就是按这个尺寸降采样好的，让环照着写槽头才不会和像素对不上。
+    bool RepublishLast(const uint8_t* src = nullptr, uint32_t srcStride = 0, uint32_t w = 0,
+                       uint32_t h = 0);
 
     /** 最近一帧的发布时间（QPC），没有则为 0 */
     int64_t LastPublishQpc() const { return lastPublishedQpc_; }
@@ -145,6 +148,14 @@ private:
     uint32_t consumerPid_ = 0;
     int      nextSlot_ = 0;
     int      lastPublishedSlot_ = -1;   // 最近一次发布的槽，用于"重复发布最后一帧"
+    // 最近一次发布的**真实**尺寸。
+    //
+    // 不能拿 width_/height_ 顶替：那是 SetMode 建环时定的**采集**尺寸，而
+    // 发布出去的预览帧可能是降采样过的（2560x1440 采到 1280x720，见
+    // Session.cpp 的预览降采样）。RepublishLast 若按采集尺寸去读一份已经
+    // 缩小过的缓冲，会按 14.7MB 去读一个只有 3.7MB 的 buffer —— 直接越界。
+    uint32_t lastPublishedWidth_ = 0;
+    uint32_t lastPublishedHeight_ = 0;
     int64_t  lastPublishedQpc_ = 0;
     uint64_t produced_ = 0;
     uint64_t dropped_ = 0;

@@ -15,8 +15,8 @@
         "wgc": true
       },
       "video": {
-        "fps": 144,
-        "bitrateMbps": 5,
+        "fps": 120,
+        "bitrateMbps": 10,
         "replaySeconds": 20,
         "segmentSeconds": 2,
         "scaleWidth": 0,
@@ -36,7 +36,7 @@
         "wgc": true
       },
       "video": {
-        "fps": 30,
+        "fps": 60,
         "bitrateMbps": 10,
         "replaySeconds": 20,
         "segmentSeconds": 2,
@@ -45,57 +45,17 @@
       },
       "createdAt": "2026-01-01T00:00:00.000Z",
       "match": {
-        "by": "title",
-        "byOrder": [
-          "title",
-          "class",
-          "process"
-        ],
-        "mode": "contains",
-        "pattern": "ShadowPlay 预览",
-        "pick": "largest",
-        "pollMs": 2000,
-        "requireVisible": true,
-        "title": "ShadowPlay 预览",
-        "className": "Chrome_WidgetWin_1",
-        "process": "electron.exe"
-      }
-    },
-    {
-      "id": "p-missing",
-      "num": 3,
-      "name": "不存在的窗口",
-      "enabled": true,
-      "source": {
-        "kind": "window",
-        "monitorIndex": 0,
-        "clientAreaOnly": false,
-        "wgc": true
-      },
-      "video": {
-        "fps": 30,
-        "bitrateMbps": 8,
-        "replaySeconds": 20,
-        "segmentSeconds": 2,
-        "scaleWidth": 0,
-        "scaleHeight": 0
-      },
-      "createdAt": "2026-01-01T00:00:00.000Z",
-      "match": {
+        "rule": "class+process",
         "by": "class",
-        "byOrder": [
-          "title",
-          "class",
-          "process"
-        ],
-        "mode": "exact",
-        "pattern": "NoSuchWindowClassXyz",
+        "mode": "contains",
+        "pattern": "王源模仿者王扁被爆头，复制人圈传来噩耗",
         "pick": "largest",
         "pollMs": 2000,
         "requireVisible": true,
-        "title": "",
-        "className": "",
-        "process": ""
+        "title": "王源模仿者王扁被爆头，复制人圈传来噩耗",
+        "className": "Chrome_WidgetWin_1",
+        "process": "哔哩哔哩.exe",
+        "hwnd": 460742
       }
     }
   ]

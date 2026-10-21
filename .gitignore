@@ -11,3 +11,9 @@ _e.err.txt
 native/build/
 *.obj
 *.pdb
+
+# 工具会话数据（记忆、临时状态），不进仓库
+.workbuddy/
+
+# 早期编译试验目录：里面有 .obj/.exe 残留，不是产品源码
+test/

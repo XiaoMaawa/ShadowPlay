@@ -108,6 +108,13 @@ npm start -- --producer-fps 0      :: 采集端不限制（桌面有变化就发
 > 只改界面侧是没用的：**最终帧率取两者较小值**。想真的跑满高刷屏，两边都要提。
 > 实测（2560×1440）：默认两边 60 → 界面 ~59fps；两边都提到 120 → 界面 ~116fps。
 
+**录制帧率上限是 120fps**（界面里只有 `5/15/30/60/90/120` 六档）。这不是拍脑袋
+定的，120 以上每一档都实测负收益：1440p 的硬件 H.264 编码器物理上限只有
+172fps（所以 240 从来录不到），165 那一档每帧成本 6.09ms 已经顶破 6.06ms 的
+帧预算、真实画面只剩一半。120 及以下才是稳定区间（真实画面 89~93%、落盘
+100%、PTS 零空洞）。后端 `MfEncoder::kMaxFps = 120`，手改过 `profiles.json` 写成
+240 的也会在加载时被夹回 120。
+
 **为什么默认定 60**（用户 m01860 要求的）：采集端桌面复制本身可以跑到 200Hz+
 （真实帧来临即发），但没必要把每个新帧都画一遍 —— 屏幕也就 60Hz，多画纯烧 GPU。
 
@@ -118,6 +125,25 @@ npm run probe              :: 跑一遍完整链路并把报告写到 native\bui
 npm run selftest           :: 真的开窗口跑几秒，核对有没有持续出帧、限流是否生效
 npm run offsets            :: 打印 ShadowRingHeader 的真实字段偏移（改结构体后必跑）
 ```
+
+`probe` 要指定测哪一路的帧环。它会先读状态文件挑第一路在工作的配置 id
+（多会话模式下环名就是配置 id，比如 `p-desk`），读不到才退回固定 id
+`shadowplay-service-v1`（那是单路模式的环名，多会话模式下不存在）。想测
+指定那一路就直接给：
+
+```bat
+node scripts/launch.mjs --probe --session p-win
+```
+
+它决定会话 id 之前会轮询状态文件最多 2.5 秒 —— 因为启动清理会把 `status/`
+整个删掉，而服务要等最多一秒才写出下一份，踩在空窗上就会退回固定 id 并报出
+与服务实际状态无关的「采集服务可能没有启动」（本鱼为此多查了一轮）。
+
+`probe` 也会**自己把采集服务拉起来**。以前启动逻辑外面套着 `!isProbe`，
+于是 `npm run probe` 在干净机器上必然失败：自检进程一起来就去找环，而环的
+生产者根本没人起 —— 报的还是「采集服务可能没有启动或启动失败」，字面上没错，
+但对第一次跑的人是纯粹的劝退。自检和正常启动用的是同一个 `launchService()`，
+起来就带 `--profiles`（多会话模式的环名才和配置 id 对得上）。
 
 `npm run selftest` 不只看"画过至少一帧" —— 那正是"只出一帧"这个 bug 的样子。
 它会核对测试窗口内的累计帧数，以及绘制间隔中位数是否落在 60fps 预算附近
@@ -139,8 +165,32 @@ npm run test:recording     :: 同一目录连录两轮，验分片落地、能�
 npm run test:export        :: 录 18 秒后导一份出来，验命名、时长、h264、ftyp 头
 npm run test:selfheal      :: 验"窗口后开也能自动接上" + "关掉开关真的停止捕获"
 npm run test:pipe          :: 只验命名管道命令通道（保存配置走的就是它）
+npm run test:reload        :: 验"保存只重载改动的那一路、服务 pid 不变"（要界面在跑）
+npm run test:reload:cdp    :: 同上，显式带 --cdp 9222（别名，效果一样）
 npm run selftest:fresh     :: 自检前清掉本次录制目录，每次从零开始
 ```
+
+`test:reload` 走 CDP 驱动界面点保存（`launch.mjs --cdp` 会带
+`--remote-debugging-port`），所以跑之前得先让界面起来、且带上那个开关：
+
+```bat
+node scripts/launch.mjs --cdp 9222
+npm run test:reload
+```
+
+脚本的端口参数三种写法都认：`node scripts/test-reload.mjs --cdp 9222`、
+`node scripts/test-reload.mjs 9222`、什么都不带（默认 9222）。
+它验的是三条外部可观测事实：服务 pid 不变、目标那一路的 `gapMs` 当场换值、
+其它路的计时一拍没动。
+
+只想看"为什么帧率只到这个数"时用另一条：
+
+```bat
+node scripts/test-budget.mjs 3   :: 打印每一路每一拍的三笔开销（采集 / 发布 / 喂录制器）
+```
+
+它把一拍拆成 `captureMs` + `publishMs` + `feedMs`，与帧周期相减得到余量；
+余量为负就说明这一拍干不完，帧率必然掉到 `1000 / 每拍总耗时`。
 
 ### 临时文件在哪
 
@@ -160,7 +210,43 @@ npm run selftest:fresh     :: 自检前清掉本次录制目录，每次从零�
 `test:recording` 的判据是**分片数被限住 + 时间轴持续推进**（`index.csv` 末行
 一直在涨），而**不是**"最早那片文件名变了" —— 分片名是循环复用的槽位，回放 10 秒
 / 分片 2 秒就是 5 个槽位在 `000000.mp4`..`000004.mp4` 之间打转，任何时刻第一个文件
-都叫 `000000.mp4`。同理 `index.csv` 是追加日志，不是"当前窗口清单"。
+都叫 `000000.mp4`。
+
+`index.csv` 是**当前回放窗口的清单**（`MfEncoder::RewriteIndex()` 每次开关分片
+都整份重写），不是追加日志；过期分片被 `PurgeExpired()` 删掉时也会重写，
+所以它不会越写越长，行数一直等于"手上还能用的片数"。
+**注意**：正在写的那一片已经在磁盘上、但还**不在** `index.csv` 里 ——
+统计"时间轴末端"时它是不算的，这是很多断言差半片的原因。
+
+### 录制目录里那串小数字是什么
+
+```
+%TEMP%\shadow-play\app\records\
+  1\                    ← 配置（profile）的序号，含 meta.json 记着它是谁
+    meta.json           { profileId, profileName, sourceKind, directory }
+    segments\
+      1\                ← 这一次"起录"的轮次（generation）
+        000000.mp4 …    ← 槽位文件，名字固定，循环复写
+        index.csv       ← 六列：文件名, 起始秒, 结束秒, 起始墙钟毫秒, 内容宽, 内容高
+        run.json        ← { generation, fps, requestedFps, width, height, segmentSeconds, container }
+      2\                ← 第二次起录（改了源、改了分辨率、或服务重启过）
+```
+
+**`segments\` 下的 1/2/3 是"起录轮次"，不是"第几个文件"。** 每新建一次录制器
+就开一轮新目录（`SegmentRecorder::Start()` 取现有最大数字 +1）。下列情况会开新一轮：
+
+| 触发 | 是否开新轮次 |
+|---|---|
+| 改源（显示器 ↔ 窗口）、改分辨率、改 `replaySeconds` / `segmentSeconds` | 是 |
+| 只改 `fps` / `bitrateMbps` | **否**（`ApplyLiveSettings` 就地改，规格见 DESIGN 9.2） |
+| 保存配置但一个字段都没变 | **否**（`SameSettings` 判等，reload 回报 `applied:false`） |
+| 服务重启 | 是（新进程从磁盘上现有最大数字 +1 继续） |
+
+旧轮次目录不会立刻删：`SegmentRecorder::Start()` 保留最近
+`max(2, keep/4)` 轮（`keep = ceil(replaySeconds / segmentSeconds)`），更早的才回收。
+所以看到 2、3 甚至 7 个轮次目录都是正常的 —— 那是历史起录留下的小尾巴，
+每轮里的 `index.csv` 各自独立、互不引用，导出只认**当前活着的那一轮**。
+
 
 它默认**连录两轮进同一个目录**，这是有意的：槽位复写时**不会先截断**
 文件，所以第二轮如果没清掉上一轮的分片，磁盘占用会虚高几倍

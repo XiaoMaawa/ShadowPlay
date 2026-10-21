@@ -38,7 +38,15 @@ const path = require('node:path')
 /** proofs 里这些子目录是验证脚本的产物，启动时可以安全清掉 */
 const EPHEMERAL_IN_PROOFS = ['recording', 'export', 'selfheal', 'reload', 'hang', 'pipe', 'debug']
 
-/** 临时根下这些是**构建产物**，启动清理时必须原样留着 */
+/**
+ * 临时根下这些是**构建产物 / 运行依赖**，启动清理时必须原样留着。
+ *
+ * dist/  前端产物，删了界面白屏（见文件头那段）。
+ *
+ * bin/ 不在清单里：那是旧版本放"采集服务运行副本"的地方，现在服务直接跑
+ * 编译产物（native/build/shadow-capture.exe），这个目录已经没人用了，留着
+ * 反而让人以为启动的还是副本 —— 让它在下次启动时被清掉正好。
+ */
 const KEEP_IN_ROOT = ['dist']
 
 /**
@@ -75,6 +83,22 @@ const LIVE_WRITTEN = ['records']
  * 里面没有脚本预先要写的文件，整棵删掉最干净。
  */
 const KEEP_TOP_FILES_IN_PROOFS = ['export', 'selfheal', 'reload', 'pipe']
+
+/**
+ * 【清理顺序对自检的影响，改这里之前先读这一段】
+ *
+ * `status/` 不是构建产物、不是用户设置、也不是「有活进程在写」的 records/，
+ * 所以每次启动都会被整棵删掉 —— 这是对的（镜像文件本来就该每次重建）。
+ *
+ * 但 `--probe` 自检**要读 status/ 才知道多会话模式下各路配置的会话 id**
+ * （环名就是配置 id，见 `app/main.cjs` 的 `runProbe()`）。而 `cleanOnStartup()`
+ * 在 main.cjs 顶部就跑完了，比 `runProbe()` 早得多，服务又要等最多一秒才写下一
+ * 份状态 —— 于是自检经常正好踩在空窗上，退回固定 id `shadowplay-service-v1`，
+ * 报出与服务现状无关的「采集服务可能没有启动」。
+ *
+ * 解法不在清理这里（该删还得删），而在 `runProbe()` 里：决定会话 id 之前先
+ * 短暂轮询等状态文件出现，最多等 2.5 秒。
+ */
 
 function rmQuiet(target) {
   try {

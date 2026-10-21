@@ -54,7 +54,7 @@
         :title="exportTitle"
         @click="doExport"
       >
-        {{ exporting ? '导出中…' : '导出回放' }}
+        {{ exportButtonText }}
       </button>
 
       <button v-if="fatal" class="retry" @click="retry">重试连接</button>
@@ -93,6 +93,37 @@
               <b class="row-val">{{ previewMaxFpsDraft === 0 ? '不限' : `${previewMaxFpsDraft} fps` }}</b>
             </span>
           </label>
+
+          <!-- 重启服务：改了 native 代码、或者服务状态不对劲时用它。
+               分片留在磁盘上不会丢，重启后会接着录（回放窗口是滚动覆盖的）。
+               守护进程会把服务拉回来，所以就算重启失败也不用手动去命令行起。 -->
+          <div class="row danger-row">
+            <span class="row-label">
+              重启采集服务
+              <em class="row-hint">当前服务会停掉再重新拉起，录制短暂中断</em>
+            </span>
+            <span class="row-ctl">
+              <button class="sheet-btn danger" :disabled="restarting" @click="restartService">
+                {{ restarting ? '重启中…' : '重启服务' }}
+              </button>
+            </span>
+          </div>
+          <p v-if="restartNotice" class="hint">{{ restartNotice }}</p>
+
+          <!-- 停止服务：连同守护一起退出（写停机哨兵，守护不再拉起服务）。
+               等价于托盘图标右键菜单里的「退出」。 -->
+          <div class="row danger-row">
+            <span class="row-label">
+              停止采集服务
+              <em class="row-hint">服务与守护进程一起退出，录制会停止（也可从托盘图标退出）</em>
+            </span>
+            <span class="row-ctl">
+              <button class="sheet-btn danger" :disabled="stopping" @click="stopService">
+                {{ stopping ? '停止中…' : '停止服务' }}
+              </button>
+            </span>
+          </div>
+          <p v-if="stopNotice" class="hint">{{ stopNotice }}</p>
         </div>
 
         <div class="sheet-foot">
@@ -225,6 +256,11 @@
                 <span class="pickrow">
                   <select :value="windowPickValue" @change="useWindow(($event.target as HTMLSelectElement).value)">
                     <option value="">（选择一个窗口）</option>
+                    <!-- 服务手里握着的那个窗口如果已经不在枚举列表里（关掉重开换了
+                         hwnd / 被最小化），单独补一行，别让下拉只剩"请选择"。 -->
+                    <option v-if="capturedOption" :value="capturedOption.hwnd">
+                      当前正在录制：{{ capturedOption.title }}（已不在窗口列表中）
+                    </option>
                     <option v-for="w in windows" :key="w.hwnd" :value="String(w.hwnd)">
                       {{ windowLabel(w) }}
                     </option>
@@ -246,40 +282,24 @@
                 </span>
               </label>
 
-              <!-- 匹配优先级：拖动上下调整，越靠上越优先 -->
-              <div class="prio">
-                <div class="prio-head">
-                  <span>匹配优先级</span>
-                  <span class="prio-tip">上下拖动调整，越靠上越优先</span>
-                </div>
-                <ul class="prio-list">
-                  <li
-                    v-for="(f, i) in draft.matchOrder"
-                    :key="f"
-                    class="prio-item"
-                    :class="{ dragging: dragIndex === i }"
-                    draggable="true"
-                    @dragstart="onDragStart(i, $event)"
-                    @dragover="onDragOver(i, $event)"
-                    @dragend="onDragEnd"
-                  >
-                    <span class="prio-grip" aria-hidden="true">⠿</span>
-                    <span class="prio-rank">{{ i + 1 }}</span>
-                    <span class="prio-name">{{ MATCH_FIELD_LABEL[f] ?? f }}</span>
-                    <span class="prio-move">
-                      <button type="button" class="tiny" :disabled="i === 0" aria-label="上移" @click="moveMatchField(i, -1)">↑</button>
-                      <button
-                        type="button"
-                        class="tiny"
-                        :disabled="i === draft.matchOrder.length - 1"
-                        aria-label="下移"
-                        @click="moveMatchField(i, 1)"
-                      >↓</button>
-                    </span>
-                  </li>
-                </ul>
-                <p v-if="matchPatternHint()" class="prio-hint">{{ matchPatternHint() }}</p>
-              </div>
+              <!-- 匹配方式：下拉选四个组合，**应用程序（exe）永远是必要条件**。
+                   以前的"拖动排优先级"整个删掉了 —— 它是"标题对不上就降级到
+                   类名，于是录到同类的另一个窗口"的根源。现在没有降级：
+                   条件全部 AND，少一条就不匹配，这一路保持未采集。 -->
+              <label>
+                匹配方式
+                <select v-model="draft.matchRule">
+                  <option v-for="o in MATCH_RULE_OPTIONS" :key="o.value" :value="o.value">
+                    {{ o.label }}
+                  </option>
+                </select>
+              </label>
+
+              <!-- 当前这一档具体在比什么，逐条列出来 -->
+              <p v-if="matchRuleHint" class="rule-hint">{{ matchRuleHint }}</p>
+
+              <!-- 「列表里没有窗口满足条件」不再额外警告：这一路会保持未采集，
+                   下拉里就停在「选择一个窗口」，用户看得见，不需要一句话再说一遍。 -->
 
               <!-- 「多个都匹配时选」不再给用户选：同时命中多个窗口时一律取面积
                    最大的那个（看得最多的那个）。要求用户理解 foreground /
@@ -314,6 +334,17 @@
                 {{ saving ? '保存中…' : '保存' }}
               </button>
               <button type="button" class="mini" @click="editing = false">取消</button>
+              <!-- 删除：删的是**这一路配置**，已录好的分片不动（那是用户的素材）。
+                   放在最右边，跟保存/取消拉开距离，免得手滑点到。 -->
+              <button
+                type="button"
+                class="mini danger"
+                :disabled="deleting"
+                :title="`删除配置「${selectedProfile?.name || selectedProfile?.id}」`"
+                @click="deleteProfile"
+              >
+                {{ deleting ? '删除中…' : '删除' }}
+              </button>
             </div>
             <p v-if="saveError" class="bad">{{ saveError }}</p>
             <p v-if="saveNotice" class="hint">{{ saveNotice }}</p>
@@ -366,11 +397,13 @@
 import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
 import { usePreview } from '@/composables/usePreview'
 import { startServiceBus, stopServiceBus, useServiceBus, clearExportNotice } from '@/lib/serviceBus'
+// 只借它的类型：`recordActualText()` 的入参要跟服务状态那张表对上。
+import type { SessionLive } from '@/lib/serviceBus'
 
 const { canvas, running, fatal, waitingService, serviceHint, stats, start, stop, retry, switchSession, fpsOf, seedLedgerFromService, reportStats, setupHistory, getHistory } =
   usePreview()
 
-const { live, lastExport, exportBusy } = useServiceBus()
+const { live, lastExport, exportStates } = useServiceBus()
 
 // 自检钩子：主进程 --selftest 通过它核对渲染状态（推送模式）。
 ;(window as unknown as { __shadowStats?: () => unknown }).__shadowStats = reportStats
@@ -461,6 +494,8 @@ interface WindowItem {
   process?: string
   width?: number
   height?: number
+  /** 最小化。平时枚举会把它排掉，但正在被录的那个会被强制收录（--include-hwnd）。 */
+  minimized?: boolean
 }
 interface MonitorItem {
   index: number
@@ -500,11 +535,20 @@ interface Profile {
     scaleHeight?: number
   }
   match?: {
+    /**
+     * 匹配方式（编辑面板里那个下拉），四个取值见 MATCH_RULE_OPTIONS。
+     *
+     * 服务端（Profiles.h 的 MatchRule）按这个值决定"同时满足哪几个字段"，
+     * **应用程序（exe）永远是必要条件**，其余字段是叠加条件，全部 AND。
+     * 老配置没有这个键，读取时由 `deriveMatchRule()` 从 by/byOrder 推断。
+     */
+    rule?: string
     by: string
     /**
-     * 有序的匹配字段，第一个最优先。用户在编辑面板里上下拖动改这个顺序。
-     * 服务端（WindowEnum.cpp 的 MatchWindows）按序逐级降级：
-     * 第一个能匹到窗口的字段说了算，匹不到才试下一个。
+     * 老模型的产物：按优先级降级的字段顺序（界面以前可以拖动改）。
+     *
+     * 现在**不再参与匹配** —— 降级正是"标题对不上却录了别的窗口"的根源。
+     * 只在读老配置时用来推断 matchRule，保存时不再写。
      */
     byOrder?: string[]
     mode: string
@@ -522,10 +566,27 @@ interface Profile {
      * 字段同样只用于读写老配置。
      */
     requireVisible?: boolean
-    /** 从下拉里选窗口时记下的三份指纹，重排优先级时用来重填 pattern。 */
+    /**
+     * 重新枚举窗口的间隔（毫秒）。
+     *
+     * C++ 侧 `WindowMatch::pollMs` 一直有这个字段、服务端也真的按它轮询
+     * （`Profiles.h` 的 `WindowMatch` 结构体会读它），但界面类型里长期漏写，
+     * 于是新建配置（本文件的 `newProfile()`）和编辑页的草稿都只能靠对象字面量
+     * 绕过类型检查 —— vue-tsc 会报 TS2353。这里补全，保存时原样带给服务端。
+     */
+    pollMs?: number
+    /** 从下拉里选窗口时记下的三份指纹，按匹配方式组合使用。 */
     title?: string
     className?: string
     process?: string
+    /**
+     * 用户挑中的那个窗口（hwnd，无符号 32 位；0 = 没挑过）。
+     *
+     * 服务端（WindowMatch::preferredHwnd）只在**已经满足 rule 的候选**里优先
+     * 它 —— 是偏好不是条件。"只匹配应用程序"下同一程序的多个窗口都命中，
+     * 没有这一项就永远只会录面积最大的那个，换另一个同程序的窗口切不过去。
+     */
+    hwnd?: number
   }
   createdAt?: string
 }
@@ -538,6 +599,8 @@ const exportDir = ref('')
 const selectedId = ref<string | null>(null)
 const editing = ref(false)
 const saving = ref(false)
+/** 正在删配置（删除按钮的禁用/文案） */
+const deleting = ref(false)
 const saveError = ref('')
 const saveNotice = ref('')
 const windows = ref<WindowItem[]>([])
@@ -566,6 +629,16 @@ const staleReason = computed<{ title: string; detail: string } | null>(() => {
   if (waitingService.value || fatal.value) return null
   const l = activeLive.value
   if (!l) return null
+  // 服务不在报状态时（崩了 / 卡住 / 被杀了），手里这份 live 是**过期**的：
+  // 下面几行看到的 state 永远是它最后说的那个 live，画面就停在那儿，
+  // NO SIGNAL 永远盖不上来 —— 和"窗口关了但状态还是 live"是同一个观感。
+  // 所以先确认服务还活着，再去相信它说的状态。
+  if (!live.value.running) {
+    return {
+      title: '采集服务没有响应',
+      detail: '最后一份状态已经过期，预览停在最后一帧。服务恢复后会自动接上，不用手动刷新。',
+    }
+  }
   const state = String(l.state ?? '')
   // 没有环形缓冲的活跃会话也要盖住：源刚回来、帧还没到的那一瞬间，
   // 服务端 state 已经是 live，但画面还是一张都没有（canvas 上什么都没有）。
@@ -589,23 +662,41 @@ watch(
   { immediate: true },
 )
 
-const exporting = computed(
-  () => exportBusy.value !== null || activeLive.value?.exportRunning === true,
+/**
+ * 当前选中这一路的导出状态（null = 空闲）。
+ *
+ * **按 id 取**，不是全局一份：导出现在走队列，A 路在导的时候 B 路照样能点，
+ * 只是排在后面。按钮的禁用因此只看"我这一路"有没有在排队/在跑。
+ */
+const selectedExport = computed(() =>
+  selectedId.value ? (exportStates.value[selectedId.value] ?? null) : null,
 )
+
+/**
+ * 导出按钮上那行字：空闲 / 导出中。
+ *
+ * 队列对用户是不可见的：点了就是"导出中…"，不管现在是真在导还是排在前一路
+ * 后面。把"排队中"露出来只会让人以为卡住了、或者以为自己点错了地方。
+ */
+const exportButtonText = computed(() => (selectedExport.value ? '导出中…' : '导出回放'))
 
 const canExport = computed(() => {
   const s = activeLive.value
   if (!s) return false
-  // exportBusy 是界面自己进程里那份导出状态（见 serviceBus.ts）；
-  // s.exportRunning 是**服务**侧那条老通道，服务不在跑时永远是 false，
-  // 所以两个都要看，否则复用外部服务时按钮会被错误地锁上/解锁。
-  return !exporting.value && s.recordSegments > 0
+  // 这一路已经在队列里（或正在跑）就不能再点：主进程那边也会拒绝重复入队，
+  // 但按钮先灰掉更直观。
+  if (selectedExport.value) return false
+  // s.exportRunning 是**服务**侧那条老通道，服务不在跑时永远是 false；
+  // 界面自己的队列状态才是现在这条路的判据。
+  return s.recordSegments > 0
 })
 
 const exportTitle = computed(() => {
   const s = activeLive.value
   if (!s) return '先选一路配置'
-  if (exporting.value) return exportBusy.value?.phase || '上一轮还在导'
+  const st = selectedExport.value
+  // 排队与在跑都叫"导出中"：队列是实现细节，界面上不区分（见 exportButtonText）。
+  if (st) return `正在导出：${st.state === 'running' ? st.phase || '导出中' : '导出中'}`
   if (!s.recordSegments) return '还没有可导的分片（服务没在录，或界面读不到服务状态）'
   return `把最近 ${selectedProfile.value?.video.replaySeconds ?? 0} 秒合并成一个 MP4`
 })
@@ -614,8 +705,40 @@ const recordTitle = computed(() => {
   const s = activeLive.value
   if (!s) return ''
   if (s.recordFailed) return s.recordDetail || '录制失败'
-  return s.recording ? '正在录制，内容会在回放窗口内滚动覆盖' : '未在录制'
+  if (!s.recording) return '未在录制'
+  // 配了 240 帧但硬件只吃到 165 帧时，别只写一句"正在录制" —— 用户会以为在录 240。
+  const real = recordActualText(s)
+  const head = real ? `正在录制（${real}）` : '正在录制'
+  return `${head}，内容会在回放窗口内滚动覆盖`
 })
+
+/**
+ * 「实际在录多少帧 / 多少码率」的人话，和配置值**不一致时**才返回内容。
+ *
+ * 服务里 `effectiveFps` 是编码器降档后的真实帧率，`requestedFps` 是配置值。
+ * 两者相等（占绝大多数情况）就不啰嗦，只在降档时提示 —— 否则顶栏每天都挂着
+ * 一行"60 帧 / 20 Mbps"，纯噪音。
+ *
+ * 参考 m13697：「为什么切片里面的视频帧率是 165fps？谁让你这么干的」——
+ * 用户不是不接受降档，是不能接受**不被告知**。
+ */
+function recordActualText(s: SessionLive | null): string {
+  if (!s) return ''
+  const parts: string[] = []
+  const rf = s.requestedFps ?? 0
+  const ef = s.effectiveFps ?? 0
+  if (ef > 0 && rf > 0 && ef !== rf) {
+    parts.push(`硬件最高 ${ef} 帧，配置的 ${rf} 帧已自动降档`)
+  } else if (ef > 0) {
+    parts.push(`${ef} 帧`)
+  }
+  const rb = s.requestedBitrateMbps ?? 0
+  const eb = s.effectiveBitrateMbps ?? 0
+  if (eb > 0 && rb > 0 && eb !== rb) {
+    parts.push(`码率实际 ${eb} Mbps（配置 ${rb}）`)
+  }
+  return parts.join('，')
+}
 
 /**
  * 顶栏那枚"服务运行中 / 服务未启动"的悬停说明。
@@ -623,6 +746,10 @@ const recordTitle = computed(() => {
  * 要写清**为什么**是运行中或不是：这两条通道（stdout / 状态文件）是这次修的
  * 重点，出问题时用户第一眼就该看出是"服务真没起"还是"状态没接上"。
  */
+// 守护进程的状态**不在界面上显示**：它是服务端的实现细节（服务拉守护、守护盯
+// 服务，两条边都在服务进程那一侧），用户既不能操作它，也不用关心它在不在岗。
+// 以前顶栏挂着一枚"守护在岗"的徽标，纯噪音，已经删掉。
+
 const serviceStatusTitle = computed(() => {
   const l = live.value
   const file = l.mirrorFile || '（状态文件路径未知）'
@@ -708,7 +835,9 @@ const previewStepIndex = computed(() => {
   if (v <= 0) return 0
   let best = 1
   for (let i = 1; i < steps.length; i++) {
-    if (steps[i] <= v) best = i
+    // `steps[i]` 在 noUncheckedIndexedAccess 下是 `number | undefined`，
+    // 下标循环里用 `?? 0` 兜一下即可（循环边界已经保证 i < length）。
+    if ((steps[i] ?? 0) <= v) best = i
     else break
   }
   return best
@@ -717,11 +846,21 @@ const previewStepIndex = computed(() => {
 /** 弹窗里那份草稿值：只有点"保存"才生效，中途取消不影响正在跑的预览。 */
 const previewMaxFpsDraft = ref(60)
 
-/** 把滑杆/输入来的值夹到合法范围（0..240 的整数）。 */
+/**
+ * 帧率硬上限：120fps。录制与预览共用这一个数，后端
+ * `MfEncoder::kMaxFps` 也是 120（老配置里手写的 240 会被它夹回来）。
+ *
+ * 为什么不给 144/165/240：1440p 硬件编码器物理上限 172fps（240 从来录不到），
+ * 165 那档每帧成本已经顶破帧预算、真实画面只剩一半；120 及以下是实测的
+ * 稳定区间（真实画面 89~93%、落盘 100%）。见 FPS_CHOICES 的注释。
+ */
+const MAX_FPS = 120
+
+/** 把滑杆/输入来的值夹到合法范围（0..120 的整数；上限与录制侧一致）。 */
 function normaliseFps(v: unknown): number {
   const n = Number(v)
   if (!Number.isFinite(n)) return 0
-  return Math.max(0, Math.min(240, Math.round(n)))
+  return Math.max(0, Math.min(MAX_FPS, Math.round(n)))
 }
 
 /**
@@ -790,6 +929,70 @@ async function saveSettings() {
   }
 }
 
+// ---- 重启采集服务 ---------------------------------------------------------
+//
+// 什么时候用：重新编译过 native（改了 C++ 之后要让新 exe 生效）、或者服务
+// 状态看着不对劲（某一路卡在 starting、录制不动了）又不想去命令行敲命令。
+//
+// 录制会短暂中断（几秒），但**分片不丢**：它们已经写在磁盘上，服务起来之后
+// 回放窗口继续滚动覆盖。真要是重启失败，守护进程几秒内也会把它拉回来 ——
+// 所以这里不需要"重启失败请手动启动"这类兜底提示。
+const restarting = ref(false)
+const restartNotice = ref('')
+
+async function restartService() {
+  if (restarting.value) return
+  restarting.value = true
+  restartNotice.value = ''
+  try {
+    const res = (await (
+      api() as { restartService?: () => Promise<{ ok: boolean; error?: string; pid?: number | null }> }
+    )?.restartService?.()) ?? null
+    if (!res) {
+      restartNotice.value = '这台界面不支持重启服务（主进程没有这个接口）。'
+      return
+    }
+    if (!res.ok) {
+      restartNotice.value = res.error ?? '重启失败。'
+      return
+    }
+    restartNotice.value = res.pid ? `已重启采集服务（新 pid ${res.pid}）。` : '已重启采集服务。'
+  } catch (err) {
+    restartNotice.value = `重启出错：${(err as Error).message}`
+  } finally {
+    restarting.value = false
+  }
+}
+
+// ---- 停止整套（服务 + 守护）------------------------------------------------
+//
+// 等价于托盘图标右键菜单里的「退出」：写停机哨兵让守护不再拉起服务，再把两个
+// 进程都结束掉。设置页放这个按钮，是给「托盘够不到」时的双保险。
+const stopping = ref(false)
+const stopNotice = ref('')
+
+async function stopService() {
+  if (stopping.value) return
+  stopping.value = true
+  stopNotice.value = ''
+  try {
+    const res = (await (
+      api() as { stopService?: () => Promise<{ ok: boolean; everKilled?: boolean; stillRunning?: boolean }> }
+    )?.stopService?.()) ?? null
+    if (!res) {
+      stopNotice.value = '这台界面不支持停止服务（主进程没有这个接口）。'
+      return
+    }
+    stopNotice.value = res.ok
+      ? '已停止采集服务（含守护进程）。'
+      : '停止失败：仍有采集服务在运行，可稍后重试，或从托盘图标退出。'
+  } catch (err) {
+    stopNotice.value = `停止出错：${(err as Error).message}`
+  } finally {
+    stopping.value = false
+  }
+}
+
 /** Esc 关弹窗。挂在 document 上，因为焦点可能停在滑杆上。 */
 function settingsKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape' && settingsOpen.value) closeSettings()
@@ -809,38 +1012,44 @@ async function doExport() {
   const s = activeLive.value
   if (!s || !canExport.value) return { ok: false, error: '导出按钮当前不可用', title: exportTitle.value }
   const fn = api()?.exportReplay as
-    | ((id: string, seconds?: number) => Promise<{ ok: boolean; error?: string }>)
+    | ((
+        id: string,
+        seconds?: number,
+      ) => Promise<{ ok: boolean; error?: string; queued?: boolean; ahead?: number; position?: number; alreadyQueued?: boolean }>)
     | undefined
   if (typeof fn !== 'function') {
     exportNotice.value = { text: 'preload 没有导出接口，界面版本和服务对不上。', bad: true }
     return { ok: false, error: 'preload 没有导出接口' }
   }
-  exportNotice.value = {
-    text: `正在导出「${s.name}」最近 ${selectedProfile.value?.video.replaySeconds} 秒…`,
-    bad: false,
-  }
+  const name = s.name || s.id
   const res = (await fn(s.id, selectedProfile.value?.video.replaySeconds)) ?? { ok: false }
   if (!res.ok) {
     exportNotice.value = { text: res.error ?? '导出命令没能发出去。', bad: true }
+    return { ...res, profileId: s.id }
   }
-  // 成功时就别再写提示了：导出是异步的，立刻改成"正在导出…"会把刚写的那句
-  // 覆盖成一句没信息的话。完成/失败由下面的 export_status 事件来报。
+  // 点一次就开始导：队列对用户不可见（见 exportButtonText），所以这里也不说
+  // "排在第几个"。真正的进度/结果全部走 export_status 事件。
+  if (res.alreadyQueued) {
+    exportNotice.value = { text: `「${name}」正在导出，导完会告诉你。`, bad: false }
+  } else {
+    exportNotice.value = { text: `正在导出「${name}」最近 ${selectedProfile.value?.video.replaySeconds} 秒…`, bad: false }
+  }
   return { ...res, profileId: s.id, replaySeconds: selectedProfile.value?.video.replaySeconds ?? null }
 }
 
-// 导出结束由主进程广播的 export_status 通知（见 app/main.cjs 的 startExportStatusPoll）。
+// 导出结束由主进程广播的 export_status 通知（见 app/main.cjs 的 runExportJob）。
 // 不用轮询，也不依赖服务 —— 导出跑在界面进程自己的插件里。
-// 这里**不能**在 evt.running === true 时动提示：那句"正在导出…"是 doExport 写的，
-// 每 400ms 重写一次会让用户以为界面在抽风。
+// 队列里可能排着好几路，所以提示里带上配置名，用户才知道是哪一路导完了。
 watch(lastExport, (evt) => {
   if (!evt) return
   if (evt.running) return
+  const who = evt.name || evt.id ? `「${evt.name || evt.id}」` : ''
   if (evt.failed) {
-    exportNotice.value = { text: `导出失败：${evt.detail || '原因不明'}`, bad: true }
+    exportNotice.value = { text: `${who}导出失败：${evt.detail || '原因不明'}`, bad: true }
   } else if (evt.ok) {
     const mb = ((evt.bytes ?? 0) / 1024 / 1024).toFixed(1)
     exportNotice.value = {
-      text: `导出完成：${evt.outPath}（${(evt.durationSeconds ?? 0).toFixed(1)} 秒 / ${mb} MB）`,
+      text: `${who}导出完成：${evt.outPath}（${(evt.durationSeconds ?? 0).toFixed(1)} 秒 / ${mb} MB）`,
       bad: false,
     }
   }
@@ -900,7 +1109,15 @@ function emptyProfile(): Profile {
     enabled: true,
     source: { kind: 'window', monitorIndex: 0, clientAreaOnly: false },
     video: { fps: 60, bitrateMbps: 20, replaySeconds: 120, segmentSeconds: 2 },
-    match: { by: 'title', mode: 'contains', pattern: '', pick: 'largest', pollMs: 1000, requireVisible: true },
+    match: {
+      rule: 'title+process',
+      by: 'title',
+      mode: 'contains',
+      pattern: '',
+      pick: 'largest',
+      pollMs: 1000,
+      requireVisible: true,
+    },
     createdAt: new Date().toISOString(),
   }
 }
@@ -927,7 +1144,14 @@ function addProfile() {
  *
  * 录制帧率 = 采集器实际的抓帧节奏（定时间隔 = 1000/fps ms），
  * **和界面预览的帧率没有任何关系** —— 预览是另一条路，有它自己的上限。
- * 所以这里给到 240 是有意义的：录 240 帧的回放，预览可以只画 60 帧。
+ *
+ * 【上限就是 120，不再有 144/165/240】主人拍板：「直接把 120 以上的帧率
+ * 全部删除，不包括 120fps」。理由不是省事，是 120 以上每一档都实测负收益：
+ *   * 1440p 的硬件 H.264 编码器物理上限 172fps，240 从来录不到；
+ *   * 165 那档每帧成本 6.09ms 已经顶破 6.06ms 的帧预算，真实画面只剩一半
+ *     （喂帧端只能补重复帧）；
+ *   * 120 及以下：真实画面 89~93%、落盘 100%、PTS 零空洞 —— 稳定区间。
+ * 与之配套，后端 `MfEncoder::kMaxFps = 120` 会把老配置里手写的 240 夹回来。
  *
  * 用下拉而不是数字框，是因为帧率得能整除到定时器上；随手填 37 会得到一个
  * 27.03ms 的间隔，实际帧率既不是 37 也不是 60，没人能解释得清。
@@ -938,7 +1162,7 @@ function addProfile() {
  * 设置页的预览帧率滑杆也用这一份列表（见 settingsFpsSteps），两处口径一致，
  * 不各维护一套数字。
  */
-const FPS_CHOICES = [5, 15, 30, 60, 90, 120, 144, 165, 240]
+const FPS_CHOICES = [5, 15, 30, 60, 90, 120]
 
 /** 当前配置的帧率不在 FPS_CHOICES 里时，把原值临时挂上，免得下拉把值改掉 */
 const extraFps = ref<number | null>(null)
@@ -961,20 +1185,32 @@ const draft = ref({
   sourceKind: 'monitor',
   monitorIndex: 0,
   /**
-   * 匹配优先级：有序字段列表，第一个最优先。用户在编辑面板里上下拖动改它。
+   * 匹配方式：四个取值之一，见 MATCH_RULE_OPTIONS。
    *
-   * 默认「标题 > 窗口类名 > 进程 exe」：标题最精确（同一程序开两个窗口只有
-   * 标题能分开），类名稳定但一个 exe 的多个窗口常同类，exe 名最稳也最粗。
+   * 【为什么不再是"有序字段列表"】以前这里是 matchOrder（标题 › 类名 › exe），
+   * 服务按序降级。问题是降级会**悄悄换源**：标题一变就退到类名，而
+   * Chrome_WidgetWin_1 这种类名满机都是，于是录到了另一个窗口。用户要求
+   * 「匹配不到就不要随便选一个」，所以改成固定组合、全部 AND。
+   *
+   * 默认「名字和应用程序」：同一程序开多个窗口时，只有标题能区分它们。
    */
-  matchOrder: ['title', 'class', 'process'] as string[],
+  matchRule: 'title+process' as string,
   /**
-   * 从下拉里选窗口时记下的三份指纹。用户重排优先级时，pattern 要跟着换成
-   * 对应那份指纹 —— 否则把「标题」拖到后面（此时 pattern 还是标题）就会拿
-   * 标题去比类名，永远匹不到。
+   * 从下拉里选窗口时记下的三份指纹。按 matchRule 决定用其中几份，全部 AND。
    */
   matchTitle: '',
   matchClass: '',
   matchProcess: '',
+  /**
+   * 用户**明确挑过**的那个窗口（hwnd，0 = 没挑过）。
+   *
+   * 「只匹配应用程序」这一档里，同一程序的多个窗口全都满足规则，只看指纹
+   * 根本分不出用户到底想要哪一个：下拉会永远停在第一个命中的窗口上，看起来
+   * 就是"换一个同程序的窗口切不过去"。所以单独记下挑中的 hwnd，一起存进
+   * 配置（match.hwnd）—— 服务端把它当**偏好**用：只在已经满足规则的候选里
+   * 优先它，它关掉了就退回同程序的另一个窗口。
+   */
+  matchHwnd: 0,
   matchMode: 'contains',
   matchPattern: '',
   fps: 60,
@@ -993,19 +1229,19 @@ const draft = ref({
 function startEdit() {
   const p = selectedProfile.value
   if (!p) return
-  const order =
-    Array.isArray(p.match?.byOrder) && p.match!.byOrder!.length
-      ? [...p.match!.byOrder!]
-      : ['title', 'class', 'process']
   draft.value = {
     name: p.name,
     enabled: p.enabled,
     sourceKind: p.source.kind,
     monitorIndex: p.source.monitorIndex,
-    matchOrder: order,
+    // 老配置没有 rule 键，按它当年排的首选字段推断一档（和服务端
+    // WindowMatch::Normalize 的推断规则保持一致，否则界面显示的和服务实际
+    // 在用的会是两回事）。
+    matchRule: deriveMatchRule(p.match),
     matchTitle: p.match?.title ?? '',
     matchClass: p.match?.className ?? '',
     matchProcess: p.match?.process ?? '',
+    matchHwnd: Number(p.match?.hwnd ?? 0) || 0,
     matchMode: p.match?.mode ?? 'contains',
     matchPattern: p.match?.pattern ?? '',
     // 老配置里可能存着不在 FPS_CHOICES 里的帧率（比如手改过 json）。
@@ -1058,9 +1294,12 @@ async function saveEdits() {
   }
   if (d.sourceKind === 'window') {
     next.match = {
-      // by 保留成首选字段，老版本服务只认这一个键还能凑合用
-      by: d.matchOrder[0] ?? 'title',
-      byOrder: [...d.matchOrder],
+      // 匹配方式：四个显式选项，服务端按它决定"同时满足哪几项"（全 AND）。
+      rule: d.matchRule,
+      // by 只为"不认识 rule 的老服务"留个能读的键；新服务优先看 rule。
+      by: MATCH_RULE_FIELDS[d.matchRule]?.[0] ?? 'process',
+      // byOrder 是降级模型的产物，已经不再参与匹配 —— 不再写它，
+      // 免得下次读回来又被误当成"用户排的优先级"。
       mode: d.matchMode,
       pattern: d.matchPattern,
       // 同时命中多个窗口时固定取面积最大的那个，界面上不再给选项。
@@ -1071,10 +1310,14 @@ async function saveEdits() {
       pollMs: p.match?.pollMs ?? 1000,
       // 只匹配可见窗口：开关删了，固定 true（最小化/隐藏的窗口不录）。
       requireVisible: true,
-      // 三份指纹原样留着：下次打开编辑面板重排优先级时要靠它们重填 pattern
+      // 三份指纹都留着（切换匹配方式时按需组合），但任何一份都不会单独
+      // 绕过 matchRule 生效。
       title: d.matchTitle,
       className: d.matchClass,
       process: d.matchProcess,
+      // 用户挑中的窗口。服务端只在"已经满足 rule 的候选"里优先它 —— 它是偏好，
+      // 不是条件，所以不会让匹配变宽（仍不会乱录别的窗口）。
+      hwnd: d.matchHwnd || 0,
     }
   } else {
     delete next.match
@@ -1128,7 +1371,9 @@ async function saveOneProfile(id: string, patch: Profile): Promise<boolean> {
       saveNotice.value = '已保存。当前配置没有改动，服务未做任何变更。'
     } else if (Array.isArray(res.failed) && res.failed.length > 0) {
       // 存盘成功但没送到服务。**不重启服务**，如实告诉用户再存一次即可。
-      saveNotice.value = `已存盘，但这一拍没送到服务（${res.failed[0].error ?? '通道忙'}）。再点一次保存即可，不会重启服务。`
+      // `res.failed[0]` 在 noUncheckedIndexedAccess 下是 `… | undefined`，
+      // 上面已经判过 length > 0，这里用 `?.` 消掉类型告警。
+      saveNotice.value = `已存盘，但这一拍没送到服务（${res.failed[0]?.error ?? '通道忙'}）。再点一次保存即可，不会重启服务。`
     } else if (!Array.isArray(res.reloaded) || res.reloaded.length === 0) {
       saveNotice.value = '已保存（服务当前没在运行，下次启动按新配置走）。'
     }
@@ -1140,6 +1385,54 @@ async function saveOneProfile(id: string, patch: Profile): Promise<boolean> {
     return false
   } finally {
     saving.value = false
+  }
+}
+
+/**
+ * 删除当前这一路配置。
+ *
+ * 只删配置本身（主进程负责写盘 + 让服务停掉这一路的会话），已经录好的分片
+ * 留在磁盘上 —— 删配置不该顺手删用户的素材。
+ */
+async function deleteProfile() {
+  const p = selectedProfile.value
+  if (!p) return
+  const label = p.name || p.id
+  // 删除不可撤销（配置里这一整行参数都会没），所以问一句。
+  // Electron 渲染进程里 window.confirm 是可用的原生对话框。
+  if (typeof window.confirm === 'function') {
+    const ok = window.confirm(`删除配置「${label}」？\n\n只删配置，已经录好的分片不会被删除。`)
+    if (!ok) return
+  }
+  const fn = api()?.deleteProfile as
+    | ((id: string) => Promise<{ ok: boolean; error?: string; remaining?: number }>)
+    | undefined
+  if (typeof fn !== 'function') {
+    saveError.value = 'preload 没有删除接口，界面版本和服务对不上。'
+    return
+  }
+  deleting.value = true
+  saveError.value = ''
+  saveNotice.value = ''
+  try {
+    const res = (await fn(p.id)) ?? { ok: false }
+    if (!res.ok) {
+      saveError.value = res.error ?? '删除失败'
+      return
+    }
+    const idx = profiles.value.findIndex((x) => x.id === p.id)
+    const rest = profiles.value.filter((x) => x.id !== p.id)
+    profiles.value = rest
+    editing.value = false
+    // 选中项往"删掉那一行的位置"接：删中间一行时停在原来下一行，删最后一行
+    // 时退回新的最后一行，不会跳回第一行让用户重新找。
+    selectedId.value = rest[Math.min(Math.max(idx, 0), rest.length - 1)]?.id ?? null
+    // 编辑面板这时已经收起来了，saveNotice 在表单里看不见 —— 走顶部那条提示。
+    exportNotice.value = { text: `已删除配置「${label}」（分片仍保留在磁盘上）`, bad: false }
+  } catch (err) {
+    saveError.value = `删除出错：${(err as Error).message}`
+  } finally {
+    deleting.value = false
   }
 }
 
@@ -1167,34 +1460,201 @@ async function loadMonitors() {
   }
 }
 
-/** 窗口下拉里的当前值：按首选字段的指纹反查 hwnd，查不到就留空。 */
+/**
+ * 服务此刻真的挂在哪个窗口上（hwnd + 标题）。
+ *
+ * 这是"这一路在录什么"的**唯一权威答案**：配置里那几份指纹是用户当初挑窗口
+ * 时记下的快照，标题一变就作废了（浏览器换页面、文档改名），而服务手里握着
+ * 的是活着的句柄。
+ */
+const liveCapturedWindow = computed(() => {
+  const s = selectedLive.value
+  if (!s) return null
+  const hwnd = Number(s.hwnd ?? 0)
+  if (!hwnd) return null
+  return { hwnd, title: String(s.matchedTitle ?? '').trim() }
+})
+
+/**
+ * 下拉里要补的那一行「当前正在录制：xxx」。
+ *
+ * 需要它的场合：窗口关掉再打开、或者被最小化，hwnd 就换了一个，枚举列表里
+ * 再也找不到服务握着的那个句柄。以前这种情况下拉是空白的，用户点开编辑面板
+ * 只看到"（选择一个窗口）"，以为配置丢了 —— 其实服务还在录。补一行如实
+ * 反映现状，比留一句"请选择一个窗口"诚实得多。
+ */
+const capturedOption = computed(() => {
+  const live = liveCapturedWindow.value
+  if (!live) return null
+  if (windows.value.some((w) => Number(w.hwnd) === live.hwnd)) return null
+  return { hwnd: String(live.hwnd), title: live.title || `窗口 ${live.hwnd}` }
+})
+
+// ---- 匹配方式（四个选项）----------------------------------------------------
+//
+// 用户要求：「如果匹配不到，不要随便选择一个窗口啊，优先匹配改掉吧」。
+// 所以模型从"按优先级降级"换成"固定组合 + 全部 AND"：**应用程序（exe）是
+// 每一档的必要条件**，名字/类名是叠加条件。少了任何一条就不算匹配，这一路
+// 保持未采集 —— 宁可空着，也不退而求其次抓一个别的窗口来录。
+const MATCH_RULE_OPTIONS = [
+  { value: 'process', label: '只匹配应用程序' },
+  { value: 'title+process', label: '匹配名字和应用程序' },
+  { value: 'class+process', label: '匹配类名和应用程序' },
+  { value: 'title+class+process', label: '匹配名字、类名和应用程序' },
+] as const
+
+/** 每一档要**同时满足**的字段（与服务端 WindowMatch::RequiredFields 一一对应）。 */
+const MATCH_RULE_FIELDS: Record<string, string[]> = {
+  process: ['process'],
+  'title+process': ['title', 'process'],
+  'class+process': ['class', 'process'],
+  'title+class+process': ['title', 'class', 'process'],
+}
+
+const MATCH_FIELD_LABEL: Record<string, string> = {
+  title: '名字',
+  class: '类名',
+  process: '应用程序',
+}
+
+/**
+ * 老配置没有 `rule` 键时该显示哪一档。
+ *
+ * 必须和服务端 `WindowMatch::Normalize` 的推断**完全一致**，否则会出现
+ * 「界面显示按名字+应用程序，服务实际按只匹配应用程序在跑」这种对不上的情况。
+ */
+function deriveMatchRule(m?: Profile['match']): string {
+  if (!m) return 'title+process'
+  const given = String(m.rule ?? '').trim()
+  if (given && MATCH_RULE_FIELDS[given]) return given
+  const order = Array.isArray(m.byOrder) && m.byOrder.length ? m.byOrder : [String(m.by ?? 'title')]
+  const primary = String(order[0] ?? 'title')
+  if (primary === 'process') return 'process'
+  if (primary === 'class') return 'class+process'
+  if (String(m.title ?? '').trim()) return 'title+process'
+  if (String(m.className ?? '').trim()) return 'class+process'
+  return 'process'
+}
+
+/** 某一档规则要匹配哪几个字段。 */
+function ruleFields(rule: string): string[] {
+  return MATCH_RULE_FIELDS[rule] ?? MATCH_RULE_FIELDS['title+process']!
+}
+
+/**
+ * 某个窗口的某一项身份是否满足「指纹 + 比较方式」。
+ *
+ * 语义要和服务端 MatchWindows 对齐：**名字**按 mode（默认"包含"，标题会变），
+ * **类名 / 应用程序**只做"相等" —— 它们是标识符，用包含语义只会放宽到莫名其妙。
+ */
+function fieldMatches(field: string, w: WindowItem, fp: string, mode: string): boolean {
+  const want = fp.trim().toLowerCase()
+  if (!want) return false
+  const subject =
+    field === 'class'
+      ? String(w.class ?? '')
+      : field === 'process'
+        ? String(w.process ?? '')
+        : String(w.title ?? '')
+  const got = subject.toLowerCase()
+  if (field !== 'title') return got === want
+  switch (mode) {
+    case 'exact':
+      return got === want
+    case 'prefix':
+      return got.startsWith(want)
+    case 'regex': {
+      try {
+        return new RegExp(fp.trim(), 'i').test(subject)
+      } catch {
+        return false
+      }
+    }
+    case 'contains':
+    default:
+      return got.includes(want)
+  }
+}
+
+/** 一个窗口是否满足整条规则（全部 AND，缺一不可）。 */
+function windowSatisfies(
+  w: WindowItem,
+  rule: string,
+  title: string,
+  cls: string,
+  exe: string,
+  mode: string,
+): boolean {
+  const fp: Record<string, string> = { title, class: cls, process: exe }
+  // 只比"真的有指纹"的字段（和服务端 ActiveFields 一致）：老配置可能只记了
+  // 名字；要求它必须有 exe 等于把这个配置永久判死。但填了却没匹上 = 不匹配，
+  // 绝不降级去比别的字段。
+  const fields = ruleFields(rule).filter((f) => String(fp[f] ?? '').trim() !== '')
+  if (!fields.length) return false
+  return fields.every((f) => fieldMatches(f, w, String(fp[f] ?? ''), mode))
+}
+
+/**
+ * 窗口下拉里该选中哪一个 —— 找**同时满足全部条件**的那个窗口。
+ *
+ * 顺序很重要：
+ *   1. 用户明确挑过的那个（draft.matchHwnd）：它也满足规则就选它。
+ *      「只匹配应用程序」下同一程序的多个窗口全都满足，只看第一条命中会永远
+ *      停在同一项上 —— 用户换另一个同程序的窗口，下拉立刻弹回去，看起来就是
+ *      "切不过去"。有了这一条，挑哪个就显示哪个。
+ *   2. 没挑过时，优先"服务此刻真的在录的那个"（前提：它也满足规则）。
+ *      同样是因为同程序的多个窗口都命中，按列表顺序挑会显示 A、实际录的是 B。
+ *      注意这不等于"用正在录的窗口去盖住失效的规则"—— 它必须先满足规则。
+ *   3. 否则取列表里第一个满足规则的。
+ *   4. 都不满足就返回空（"请选择一个窗口"）：匹配不到就别乱选。
+ *
+ * 唯一例外：列表还没枚举回来（1~2 秒）时先选服务手里那个，避免这一两秒里
+ * 显示"请选择"、看着像配置丢了。
+ */
 const windowPickValue = computed(() => {
   const d = draft.value
-  const primary = d.matchOrder[0] ?? 'title'
-  const fp = fingerprintFor(primary, d.matchTitle, d.matchClass, d.matchProcess)
-  if (!fp) return ''
-  const hit = windows.value.find((w) => {
-    if (primary === 'class') return String(w.class ?? '') === fp
-    if (primary === 'process') return String(w.process ?? '') === fp
-    return String(w.title ?? '') === fp
-  })
+  const list = windows.value
+  const live = liveCapturedWindow.value
+  if (!list.length) return live ? String(live.hwnd) : ''
+  const ok = (w: WindowItem) =>
+    windowSatisfies(w, d.matchRule, d.matchTitle, d.matchClass, d.matchProcess, d.matchMode)
+  const picked = d.matchHwnd ? list.find((w) => Number(w.hwnd) === d.matchHwnd && ok(w)) : undefined
+  if (picked) return String(picked.hwnd)
+  const captured = live ? list.find((w) => Number(w.hwnd) === live.hwnd && ok(w)) : undefined
+  if (captured) return String(captured.hwnd)
+  const hit = list.find(ok)
   return hit ? String(hit.hwnd) : ''
 })
 
-/** 窗口下拉里的一行显示什么：标题 + exe，跟 OBS 的窗口列表一个路子。 */
+/** 当前这一档具体在比什么，逐条列出来。 */
+const matchRuleHint = computed(() => {
+  const d = draft.value
+  if (d.sourceKind !== 'window') return ''
+  const fp: Record<string, string> = { title: d.matchTitle, class: d.matchClass, process: d.matchProcess }
+  const parts = ruleFields(d.matchRule).map((f) => {
+    const v = String(fp[f] ?? '').trim() || '（未填）'
+    return `${MATCH_FIELD_LABEL[f] ?? f}「${v}」`
+  })
+  return `需要同时满足：${parts.join(' + ')}`
+})
+
+/**
+ * 窗口下拉里的一行显示什么：标题 + exe，跟 OBS 的窗口列表一个路子。
+ */
 function windowLabel(w: WindowItem): string {
   const t = String(w.title ?? '').trim() || '(无标题)'
   const exe = String(w.process ?? '').trim()
-  return exe ? `${t}  —  ${exe}` : t
+  // 最小化的窗口平时进不了下拉；能出现在这儿的只有"正在被录的那个"，
+  // 标注一下，免得用户奇怪为什么列表里有个看不见的窗口。
+  const suffix = w.minimized ? '  —  已最小化' : exe ? `  —  ${exe}` : ''
+  return `${t}${suffix}`
 }
 
 /**
  * 用户从下拉里挑了一个窗口。
  *
- * 跟 OBS 一样，选一次就把这个窗口的**三项身份**全记下来（标题 / 类名 / exe），
- * 然后按当前优先级填 pattern。之后用户拖动重排优先级时，pattern 会跟着换成
- * 对应那一项 —— 比如把「进程 exe」拖到第一位，pattern 就从标题变成 explorer.exe，
- * 这样同一个程序换了文档标题也还能录到。
+ * 选一次就把这个窗口的**三项身份**全记下来（名字 / 类名 / exe），具体用其中
+ * 哪几项由 matchRule 决定（全部 AND）。这样切换匹配方式时不用重新选窗口。
  */
 function useWindow(hwnd: string | number) {
   const w = windows.value.find((x) => String(x.hwnd) === String(hwnd))
@@ -1202,86 +1662,24 @@ function useWindow(hwnd: string | number) {
   const title = String(w.title ?? '').trim()
   const cls = String(w.class ?? '').trim()
   const exe = String(w.process ?? '').trim()
-  draft.value.matchTitle = title
+  // 标题可能很长（浏览器会带一堆后缀），只取前 32 字参与匹配：
+  // 后面的部分最容易变（" - 哔哩哔哩"、"▶ 正在播放"），带上只会更难匹配。
+  draft.value.matchTitle = title.slice(0, 32)
   draft.value.matchClass = cls
   draft.value.matchProcess = exe
-  // 标题可能很长（浏览器会带一堆后缀），截一段最前面的当匹配内容更稳
-  const primary = draft.value.matchOrder[0] ?? 'title'
-  draft.value.matchPattern = fingerprintFor(primary, title.slice(0, 32), cls, exe)
+  // 记下挑的是哪一个窗口。「只匹配应用程序」时三份指纹可能和上一个窗口完全
+  // 相同，只有它能区分用户想要的是同一个程序的哪个窗口（服务端按偏好处理）。
+  draft.value.matchHwnd = Number(w.hwnd) || 0
+  // pattern 只是给"不认识 rule 的老服务"留的兼容字段，取当前这一档最看重的那个
+  const strong =
+    draft.value.matchRule === 'process'
+      ? exe
+      : draft.value.matchRule === 'class+process'
+        ? cls
+        : title.slice(0, 32)
+  draft.value.matchPattern = strong
   // 挑窗口这件事本身就是「包含」语义（标题会变），正则留着手写
   draft.value.matchMode = 'contains'
-}
-
-/** 按字段取对应的指纹（供 pattern 用）。 */
-function fingerprintFor(field: string, title: string, cls: string, exe: string): string {
-  if (field === 'class') return cls
-  if (field === 'process') return exe
-  return title
-}
-
-/** 重排优先级：把 pattern 换成新首选字段的指纹。 */
-function applyMatchOrder() {
-  const d = draft.value
-  const primary = d.matchOrder[0] ?? 'title'
-  const fp = fingerprintFor(primary, d.matchTitle.slice(0, 32), d.matchClass, d.matchProcess)
-  // 只在用户从下拉里选过窗口（三份指纹至少有一份）时才自动改 pattern；
-  // 手写的正则/自定义内容不能被覆盖掉。
-  if (fp) d.matchPattern = fp
-}
-
-const MATCH_FIELD_LABEL: Record<string, string> = {
-  title: '窗口标题',
-  class: '窗口类名',
-  process: '程序名称',
-}
-
-/** 优先级行上显示的当前匹配内容（跟着顺序变，用户一眼看出在比什么）。 */
-function matchPatternHint(): string {
-  const d = draft.value
-  const primary = d.matchOrder[0] ?? 'title'
-  const fp = fingerprintFor(primary, d.matchTitle, d.matchClass, d.matchProcess)
-  return fp ? `当前按${MATCH_FIELD_LABEL[primary] ?? primary}匹配：${fp}` : ''
-}
-
-// ---- 优先级拖动 -----------------------------------------------------------
-//
-// 用原生 HTML5 拖放（draggable + dragstart/dragover/drop），不引第三方库：
-// 只有三行，手写比装一个 sortable 依赖划算，也不会多打一份包。
-const dragIndex = ref<number | null>(null)
-
-function onDragStart(i: number, ev: DragEvent) {
-  dragIndex.value = i
-  if (ev.dataTransfer) {
-    ev.dataTransfer.effectAllowed = 'move'
-    // 某些浏览器不带 data 就不肯触发 drop
-    ev.dataTransfer.setData('text/plain', String(i))
-  }
-}
-
-function onDragOver(i: number, ev: DragEvent) {
-  ev.preventDefault() // 不阻止默认行为就收不到 drop
-  const from = dragIndex.value
-  if (from === null || from === i) return
-  const list = [...draft.value.matchOrder]
-  const [moved] = list.splice(from, 1)
-  list.splice(i, 0, moved!)
-  draft.value.matchOrder = list
-  dragIndex.value = i
-}
-
-function onDragEnd() {
-  dragIndex.value = null
-  applyMatchOrder()
-}
-
-/** 上下按钮：触摸板/不习惯拖的人也能调顺序。 */
-function moveMatchField(i: number, dir: -1 | 1) {
-  const list = [...draft.value.matchOrder]
-  const j = i + dir
-  if (j < 0 || j >= list.length) return
-  ;[list[i], list[j]] = [list[j]!, list[i]!]
-  draft.value.matchOrder = list
-  applyMatchOrder()
 }
 
 async function launchService() {
@@ -1317,14 +1715,15 @@ function describeSource(p: Profile): string {
   if (p.source.kind === 'monitor') return `显示器 ${p.source.monitorIndex + 1}`
   const m = p.match
   if (!m) return '窗口（没写匹配规则）'
-  const order = Array.isArray(m.byOrder) && m.byOrder.length ? m.byOrder : [m.by]
-  const nameOf = (f: string) =>
-    f === 'title' ? '标题' : f === 'process' ? 'exe' : f === 'class' ? '类名' : f
-  const mode = m.mode === 'contains' ? '包含' : m.mode === 'exact' ? '等于' : m.mode === 'prefix' ? '开头' : '正则'
-  // 只有一个字段时保持老样子「标题包含「x」」；多字段时把优先级排出来，
-  // 用户一眼能看出"先按标题找，找不到才降级用类名"
-  if (order.length <= 1) return `${nameOf(order[0] ?? 'title')}${mode}「${m.pattern || '（空）'}」`
-  return `${order.map(nameOf).join(' › ')} ${mode}「${m.pattern || '（空）'}」`
+  // 侧栏那一行只求"一眼看出这一路在录谁"：按当前匹配方式把参与比较的值
+  // 用「·」串起来，例如「窗口 辣妹的午餐 · 哔哩哔哩.exe」。
+  const fp: Record<string, string> = {
+    title: String(m.title ?? m.pattern ?? '').trim(),
+    class: String(m.className ?? '').trim(),
+    process: String(m.process ?? '').trim(),
+  }
+  const parts = ruleFields(deriveMatchRule(m)).map((f) => fp[f] || '（空）')
+  return `窗口 ${parts.join(' · ')}`
 }
 
 function describeProfile(p: Profile): string {
@@ -1340,6 +1739,24 @@ watch(selectedId, (id) => {
 watch(editing, (v) => {
   if (v) startEdit()
 })
+
+// 编辑面板里切到"窗口捕获"时补拉一次窗口列表。
+//
+// 从"显示器捕获"改过来的配置，编辑面板打开时只拉过显示器列表，窗口下拉是空的
+// ——这时"自动选中当前录制的窗口"根本无从谈起（没有可选项）。正在加载就不重复发。
+watch(
+  () => draft.value.sourceKind,
+  (k) => {
+    if (k !== 'window') return
+    if (windows.value.length === 0 && !loadingWindows.value) void loadWindows()
+  },
+)
+
+// 【这里以前有两个 watch 去"修复"配置里的窗口身份】现在整段删掉了：
+// 新模型下窗口下拉（windowPickValue）是 computed，窗口列表一变就自己重算，
+// 不需要再**改写草稿**去对齐什么。
+// 而且那种"自动把指纹换成当前正在录的窗口"的行为本身就有害 —— 它会让一个
+// 早就对不上的规则看起来像是对的，用户永远发现不了配置已经失效。
 
 onMounted(() => {
   canvas.value = canvasEl.value
@@ -1628,6 +2045,26 @@ onBeforeUnmount(() => {
   opacity: 0.5;
   cursor: default;
 }
+/* 重启服务：破坏性操作，用红色和"确认"区分开 */
+.sheet-btn.danger {
+  background: #4a1f24;
+  border-color: #7a3038;
+  color: #ffc9cd;
+}
+.sheet-btn.danger:hover:not(:disabled) {
+  background: #5c272d;
+  border-color: #9c3d47;
+}
+/* 横排的一行（左标签 + 右按钮），跟上面纵排的滑杆行区分开 */
+.danger-row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid #232c42;
+}
 
 .dot {
   width: 8px;
@@ -1743,6 +2180,20 @@ onBeforeUnmount(() => {
 .mini.wide {
   width: 100%;
   padding: 5px;
+}
+
+/* 删除：红色但压暗，跟"保存"的蓝色拉开距离；margin-left:auto 把它推到行尾，
+   手滑点"取消"时不会误伤。 */
+.mini.danger {
+  margin-left: auto;
+  border-color: #4a2426;
+  background: #241315;
+  color: #ff9b95;
+}
+.mini.danger:hover:not(:disabled) {
+  border-color: #7a3336;
+  background: #33181a;
+  color: #ffb3ad;
 }
 
 .empty {
@@ -2031,98 +2482,11 @@ onBeforeUnmount(() => {
   }
 }
 
-/* ---- 匹配优先级（可拖动排序） -------------------------------------------- */
-.prio {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.prio-head {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  font-size: 11.5px;
-  color: #7c879b;
-}
-.prio-tip {
+/* 匹配方式的说明行（"需要同时满足：…"）：中性灰，只是补充信息。 */
+.rule-hint {
+  margin: 4px 0 0;
   font-size: 10.5px;
-  color: #4f5a6e;
-}
-.prio-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.prio-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 6px;
-  border: 1px solid #1f2738;
-  border-radius: 4px;
-  background: #0e1420;
-  color: #c3cede;
-  font-size: 11.5px;
-  cursor: grab;
-  user-select: none;
-}
-.prio-item:hover {
-  border-color: #2b3550;
-}
-/* 拖动中的那一行淡化，作为"它正在被搬走"的反馈。
-   为什么不用半透明占位+插入线：只有三行，简单淡化已经够明白，
-   多做的视觉反馈反而让这几行看起来很重。 */
-.prio-item.dragging {
-  opacity: 0.45;
-  cursor: grabbing;
-  border-style: dashed;
-  border-color: #2b6cb0;
-}
-.prio-grip {
-  color: #4f5a6e;
-  font-size: 12px;
-  line-height: 1;
-}
-.prio-rank {
-  flex: 0 0 auto;
-  min-width: 14px;
-  text-align: center;
-  color: #4f5a6e;
-  font-variant-numeric: tabular-nums;
-}
-.prio-name {
-  flex: 1 1 auto;
-}
-.prio-move {
-  display: flex;
-  gap: 2px;
-}
-.tiny {
-  width: 18px;
-  height: 18px;
-  padding: 0;
-  border: 1px solid #26304a;
-  border-radius: 3px;
-  background: #0b1018;
-  color: #8fa2bd;
-  font-size: 10px;
-  line-height: 1;
-  cursor: pointer;
-}
-.tiny:hover:not(:disabled) {
-  border-color: #2b6cb0;
-  color: #e7ecf5;
-}
-.tiny:disabled {
-  opacity: 0.35;
-  cursor: default;
-}
-.prio-hint {
-  margin: 0;
-  font-size: 10.5px;
+  line-height: 1.5;
   color: #616d84;
   word-break: break-all;
 }

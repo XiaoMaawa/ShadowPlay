@@ -350,12 +350,72 @@ export function usePreview() {
     // 按路清零会让"画面到底动没动"这个判据失效；帧率才是按路的属性。
     applyLedger(ledgerKey())
 
-    const info = api?.status()?.ringInfo ?? null
-    if (!info) {
-      await connect()
-      return
+    // 这一路现在可能压根没有环（窗口源匹配不到 → 服务不建环）。连不上不算
+    // 错误：attachWatch 会一直盯着，服务把环建起来的那一刻自己接上。
+    //
+    // 注意**不要**在这里退回"随便拿一路已就绪的环"（以前是 api.status().ringInfo，
+    // 那是 firstReady 的环）—— 那会把别的分路的画面画到这里来。
+    if (await reconnectActive()) return
+    if (activeSessionId === null) {
+      // 单路兼容模式：没有指定会话时才让 connect 去接"第一路"
+      if (!(await connect())) scheduleRetry()
     }
-    await connectBuffer(info as RingInfo)
+  }
+
+  /**
+   * 把**当前这一路**的帧环重新挂一遍。
+   *
+   * 【为什么必须有】帧环是"服务把这一路的源解析成功之后"才建出来的：
+   *   · 窗口源一开始匹配不到 → 服务标 Disabled，**环根本不存在**；
+   *   · 用户在编辑面板里换了匹配方式 / 换了窗口再保存 → 服务重建会话、
+   *     这时候才把环建出来。
+   * 而页面这一侧的 `view` 是切换分路那一刻问 preload 要来的快照 —— 当时没有
+   * 就一直是 null，后面谁也不会再问一次。表现就是：NO SIGNAL → 改配置保存 →
+   * 服务明明已经在出帧了，预览却一直黑着，切到别的分路再切回来才正常
+   * （切回来时才重新问了一次）。
+   *
+   * 这里就是"再问一次"：拿到就把新的 ArrayBuffer 换上，拿不到返回 false，
+   * 交给 attachWatch 下一拍再试。
+   */
+  async function reconnectActive(): Promise<boolean> {
+    if (!api) return false
+    try {
+      const handle = api.getRingBuffer(activeSessionId ?? undefined)
+      if (!handle?.buffer) return false
+      attachBuffer(handle.info, handle.buffer)
+      transport.value = 'bridge'
+      waitingService.value = false
+      // 能拿到环就说明 addon 和通道都是好的，"连不上"那类致命提示该撤了
+      fatal.value = null
+      return true
+    } catch {
+      // 取不到就安静等下一拍：这不是错误，只是"源还没就绪"
+      return false
+    }
+  }
+
+  /**
+   * 帧环的看门狗：预览没有 `view` 时，每 400ms 试着重挂一次。
+   *
+   * 事件（session-ready）已经能在"环刚建好"那一刻立刻接上，但事件可能早于
+   * 监听注册、或者 preload 那边是等下一轮扫描（2 秒）才连上的 —— 这条低频
+   * 轮询是兜底，代价只有一次 getRingBuffer（内部是复用已有的 ArrayBuffer）。
+   */
+  let attachTimer: ReturnType<typeof setInterval> | null = null
+
+  function startAttachWatch() {
+    if (attachTimer) return
+    attachTimer = setInterval(() => {
+      if (!running.value || view) return
+      void reconnectActive()
+    }, 400)
+  }
+
+  function stopAttachWatch() {
+    if (attachTimer) {
+      clearInterval(attachTimer)
+      attachTimer = null
+    }
   }
 
   async function connect(): Promise<boolean> {
@@ -375,6 +435,14 @@ export function usePreview() {
     if (status.state === 'failed') {
       fatal.value = status.fatal?.message ?? '初始化失败'
       return false
+    }
+
+    // 已经选定了某一路时，只认**那一路**的环。以前这里先看 status().ringInfo
+    // （那是"第一路已就绪的会话"），选中的那一路没就绪、别的路先就绪时，
+    // 会把别人的画面接过来 —— 而且直接判"没就绪"，连重挂的机会都没有。
+    if (activeSessionId && (await reconnectActive())) {
+      waitingService.value = false
+      return true
     }
 
     const info = (status.ringInfo ?? ringInfo.value) as RingInfo | null
@@ -546,7 +614,13 @@ export function usePreview() {
       if (l.history.length > kFpsHistorySize) l.history.shift()
       const sorted = [...l.history].sort((a, b) => a - b)
       const mid = sorted.length >> 1
-      l.lastShown = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+      // 中位数：偶数个取中间两个的均值。下标访问在 noUncheckedIndexedAccess 下
+      // 是 `number | undefined`，用 `?? 0` 兜底（边界已由 `sorted.length` 保证，
+      // 这里的兜底只是为了消掉类型告警，运行时取不到值等价于 0）。
+      l.lastShown =
+        sorted.length % 2
+          ? (sorted[mid] ?? 0)
+          : (((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2)
       // 只有当前正在看的那一路才往响应式 stats 上写；后台那一路只更新账本
       if (key === ledgerKey()) {
         stats.value.renderFps = l.lastRaw
@@ -568,6 +642,26 @@ export function usePreview() {
       case 'ready':
         ringInfo.value = payload.info as RingInfo
         break
+      case 'session-ready': {
+        // 这一路的帧环刚建好（窗口刚匹上、配置刚改完重建、服务刚重启）。
+        // 只在它是当前正在看的那一路时才重挂 —— 后台那几路的环由切过去时的
+        // switchSession 负责。
+        //
+        // 没有它的话就是用户报的那个 bug：NO SIGNAL → 改匹配方式 → 保存 →
+        // 服务已经在出帧了，预览却一直黑着，非得切到别的分路再切回来。
+        const id = String(payload.session ?? '')
+        if (!activeSessionId || id === activeSessionId) void reconnectActive()
+        break
+      }
+      case 'session-gone': {
+        if (String(payload.session ?? '') === (activeSessionId ?? '')) {
+          view = null
+          pixelView = null
+          pixelViewOffset = -1
+          ringInfo.value = null
+        }
+        break
+      }
       case 'waiting-service':
         waitingService.value = true
         serviceHint.value = String(payload.message ?? '')
@@ -609,6 +703,8 @@ export function usePreview() {
     // 统计窗口的起点在 renderOnce 里"第一次真正画帧时"才落（见 FpsLedger），
     // 这里不预置 —— 预置成 start() 的时刻会把"等待服务"的那段空转算进帧率里。
     rafId = requestAnimationFrame(renderLoop)
+    // 帧环看门狗：没有 view 时定时重挂（窗口源后来才匹上、配置改完重建会话…）
+    startAttachWatch()
 
     if (await connect()) return
 
@@ -633,6 +729,7 @@ export function usePreview() {
     if (rafId) cancelAnimationFrame(rafId)
     rafId = 0
     stopRetryTimer()
+    stopAttachWatch()
     unlisten?.()
     unlisten = null
     view = null
@@ -779,10 +876,12 @@ export function usePreview() {
     if (drawStamps.length < 2) return 0
     const intervals: number[] = []
     for (let i = 1; i < drawStamps.length; i++) {
-      intervals.push(drawStamps[i] - drawStamps[i - 1])
+      // 相邻两个时间戳都一定存在（i 与 i-1 都在 0..length-1 内），
+      // `?? 0` 只为消掉 noUncheckedIndexedAccess 的告警。
+      intervals.push((drawStamps[i] ?? 0) - (drawStamps[i - 1] ?? 0))
     }
     intervals.sort((a, b) => a - b)
-    return intervals[Math.floor(intervals.length / 2)]
+    return intervals[Math.floor(intervals.length / 2)] ?? 0
   }
 
   /**
@@ -850,7 +949,12 @@ export function usePreview() {
         // 上报失败不能影响渲染
       }
     }, 500)
-    historyTimer.unref?.()
+    // setInterval 在浏览器/DOM 类型里返回 number，只有 Node 的 timer 才有 unref。
+    // 这里判断一下再调，否则 vue-tsc 报 TS2339（Property 'unref' does not exist
+    // on type 'number'）。
+    if (typeof (historyTimer as { unref?: unknown }).unref === 'function') {
+      ;(historyTimer as unknown as { unref: () => void }).unref()
+    }
   }
 
   function getHistory() {
@@ -865,10 +969,10 @@ export function usePreview() {
   function reportStats() {
     const intervals: number[] = []
     for (let i = 1; i < drawStamps.length; i++) {
-      intervals.push(drawStamps[i] - drawStamps[i - 1])
+      intervals.push((drawStamps[i] ?? 0) - (drawStamps[i - 1] ?? 0))
     }
     const sorted = [...intervals].sort((a, b) => a - b)
-    const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0
+    const median = sorted.length ? (sorted[Math.floor(sorted.length / 2)] ?? 0) : 0
     const mean = intervals.length
       ? intervals.reduce((a, b) => a + b, 0) / intervals.length
       : 0

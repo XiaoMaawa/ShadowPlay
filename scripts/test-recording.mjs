@@ -54,9 +54,9 @@ import path from 'node:path'
 import { projectRoot, tempRoot } from './electron-path.mjs'
 import { ensureServiceExe } from '../app/temp-const.cjs'
 
-// 必须走 ensureServiceExe 拿「临时目录里那份副本」，不能直接用 native/build 下的原件。
-// 仓库目录可能带 Low 完整性标签（DSH 沙箱会打），原件的进程也跟着是 Low，
-// 于是往 %TEMP% 里建录制目录会直接 `Access is denied.`。详见 app/temp-const.cjs。
+// 直接用编译产物（ensureServiceExe 现在就是个恒等函数，保留调用只为写法统一）。
+// 以前会拷一份到 %TEMP% 当"运行副本"再跑，那条路已经废掉：副本被启动清理删掉后
+// 路径失效、服务在跑时又不能刷新，两头都是坑。详见 app/temp-const.cjs。
 const SERVICE = ensureServiceExe({
   srcExe: path.join(projectRoot, 'native', 'build', 'shadow-capture.exe'),
   tempRoot,
@@ -87,6 +87,37 @@ if (!existsSync(SERVICE)) {
 rmSync(TEST_ROOT, { recursive: true, force: true })
 mkdirSync(TEST_ROOT, { recursive: true })
 mkdirSync(path.dirname(PROFILE_FILE), { recursive: true })
+
+// 起服务之前先确认**没有**别的采集服务在跑。
+//
+// 【踩过的坑】这台机器上可能正开着界面（`npm start`），那也是一个采集服务、
+// 占着同一个互斥体 `Local\ShadowPlay.Service.v1`。此时本脚本 spawn 出来的
+// 那一个会在启动第一秒就退出，打印
+//
+//     {"type":"error","code":"already_running", ...}
+//
+// 而脚本要等到 40 秒后才去看目录 —— 看到的是一个空目录，于是报
+//
+//     ✗ 第 1 轮没找到任何分片目录 —— 录制根本没起来
+//
+// 一句话把「产品没坏、是环境里有另一个服务」说成了「录制坏了」。
+// 本鱼自己就被这条误导过一次（还以为是改坏了）。所以这里提前查、并且
+// **明确拒绝抢跑**：随手 taskkill 掉别人正在跑的服务是更糟的选择（界面和
+// 隔壁那一路的录制会一起断）。
+function serviceRunningNow() {
+  const r = spawnSync(SERVICE, ['--status'], { stdio: 'ignore', windowsHide: true })
+  return r.status === 0
+}
+if (serviceRunningNow()) {
+  console.error(
+    '\n[recording] 已经有一个采集服务在跑（同一个互斥体 Local\\ShadowPlay.Service.v1），' +
+      '本脚本起的那个会被立刻拒绝。\n' +
+      '            先停掉它再重跑：\n' +
+      '                npm run service:stop        （或者关掉正在开的界面）\n' +
+      '            本脚本刻意不自动杀 —— 那会把界面上正在录的那几路一起掐断。',
+  )
+  process.exit(2)
+}
 
 const doc = {
   version: 1,
@@ -344,15 +375,44 @@ for (let i = 0; i < runs.length; i++) {
     if (r.timeline.last < REPLAY_S) {
       problems.push(`${tag}：时间轴末端只有 ${r.timeline.last.toFixed(1)}s，没超过回放窗口 ${REPLAY_S}s`)
     }
-    if (r.timeline.last <= r.segs.length * SEGMENT_S) {
-      problems.push(`${tag}：时间轴末端 ${r.timeline.last.toFixed(1)}s 还没超出磁盘容量 ${r.segs.length * SEGMENT_S}s —— 没滚过`)
-    }
     // 环形窗口的正确形态：清单里各槽位按起点排好后应当**首尾相接、无缝**，
     // 且总跨度等于回放窗口（不留过期余量时最多 window + 一片，因为过期判定
     // 发生在开新片的那一刻）。起点不是 0 是正常的 —— 录到 18 秒时，
     // 留在盘上的是最后 10 秒（8s..18s），最早那几片已经被清掉了。
     // 曾经在这里断言"第二轮必须从 0 开始"，那是对环形缓冲的误解。
     const sorted = [...r.timeline.rows].sort((a, b) => a.start - b.start)
+    // 「滚过没有」的判据：清单**首行起点 > 0**。
+    //
+    // 曾经写的是「时间轴末端 <= 分片数 × 片长 → 没滚过」，这条口径从一开始
+    // 就是错的，而且在不同的观察时长下时通时不通（20 秒观察失败、25 秒观察
+    // 通过）：
+    //   - `r.segs.length` 是**磁盘上的 mp4 文件数**，含那片正在写的半截；
+    //   - `r.timeline.last` 是 **index.csv 的末端**，只含**已写完**的片。
+    // 正在写的那片一边在磁盘上、一边还没登记进清单，两者天然差一段；再加上
+    // 槽位现在按 PickSlot 挑空槽、文件名一路递增不回绕，「末端 > 片数×片长」
+    // 在稳态下根本不成立（窗口 10s / 片 2s 时稳态就是 6 片 12s 内容 + 1 片在写）。
+    //
+    // 真正能证明「老内容被删掉了」的只有一件事：清单第一行的起点不再是 0。
+    //
+    // 【观察时长门槛必须算清楚，否则会假失败】PurgeExpired 的过期线是
+    // `axisNow - 回放窗口 - 两片余量`，所以内容攒到 `回放窗口 + 2 × 片长`
+    // 之前**第一片本来就不该被删**，清单从 0 开始是正确行为。窗口 10s / 片 2s
+    // 时门槛 = 14 秒内容，再往后两秒才第一次删（16 秒）。留一点编码延迟余量，
+    // 观察到的内容不到 `窗口 + 3 × 片长` 就不判这条，只提示。
+    const scrollAt = REPLAY_S + SEGMENT_S * 3
+    if (r.timeline.last >= scrollAt) {
+      if (sorted[0].start <= 0.05) {
+        problems.push(
+          `${tag}：内容已经录到 ${r.timeline.last.toFixed(1)}s，清单第一行起点却还是 ` +
+            `${sorted[0].start.toFixed(2)}s —— 老分片没被清掉，没滚过`,
+        )
+      }
+    } else {
+      console.log(
+        `（提示）内容只录到 ${r.timeline.last.toFixed(1)}s，还没到开始删老片的 ` +
+          `${scrollAt}s，本轮不判"滚过"；想验这条把观察时长加到 ${Math.ceil(scrollAt * 1.8 + 6)} 秒以上`,
+      )
+    }
     let gaps = 0
     for (let k = 1; k < sorted.length; k++) {
       if (Math.abs(sorted[k].start - sorted[k - 1].end) > 0.05) gaps++

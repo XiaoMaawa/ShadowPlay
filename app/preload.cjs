@@ -590,6 +590,16 @@ const api = {
     return ipcRenderer.invoke('service:save-profile', { id, patch })
   },
 
+  /**
+   * 删除一路配置。
+   *
+   * 只删配置文件里的这一条（+ 让服务把这一路的会话停掉），**不动**已经录好的
+   * 分片目录 —— 那是用户的素材，删配置不该顺手删录像。
+   */
+  deleteProfile(id) {
+    return ipcRenderer.invoke('service:delete-profile', { id })
+  },
+
   /** 配置文档（主进程会补齐缺省值，界面拿到的就是服务真正会用的那份） */
   serviceProfiles() {
     return ipcRenderer.invoke('service:profiles')
@@ -599,6 +609,27 @@ const api = {
     // 曾经写的是 'service:spawn-detached' —— 主进程里根本没有这个通道，
     // 点了就抛 "No handler registered for 'service:spawn-detached'"。
     return ipcRenderer.invoke('service:launch')
+  },
+
+  /**
+   * 重启采集服务（设置页那个按钮用）。
+   *
+   * 停掉当前那个再拉一个新的。分片留在磁盘上不会丢，重新起来之后回放窗口
+   * 继续滚动覆盖；真失手了守护进程（shadow-capture --guard）也会把它拉回来。
+   */
+  restartService() {
+    return ipcRenderer.invoke('service:restart')
+  },
+
+  /**
+   * 停止整套（服务 + 守护）。
+   *
+   * 不是简单 taskkill：守护会立刻把服务拉起来，所以要先立「停机哨兵」，再按
+   * PID 把服务和守护都杀掉。哨兵让守护下一轮直接退出、且不再拉起服务。
+   * 托盘图标的「退出」走的是同一条逻辑（原生侧）。
+   */
+  stopService() {
+    return ipcRenderer.invoke('service:stop')
   },
 
   /**

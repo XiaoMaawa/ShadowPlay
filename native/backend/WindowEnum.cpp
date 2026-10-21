@@ -79,6 +79,16 @@ bool StartsWith(const std::string& s, const std::string& prefix) {
     return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
 }
 
+// hwnd 的"可跨界比较"形态：低 32 位无符号数。
+//
+// HWND 本身是 32 位句柄，传到 64 位代码里会被**符号扩展**（0x...AABBCCDD 变成
+// 0xFFFFFFFFAABBCCDD）。而交给界面 / 从命令行拿回来时我们按无符号 32 位传，
+// 于是同一个窗口会有两个不同的 64 位写法。凡是跨边界的比较（偏好窗口、
+// --include-hwnd）一律用这个键，不要直接比指针值。
+inline uint32_t HwndKey(HWND h) {
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(h));
+}
+
 // ---------------------------------------------------------------------------
 // 枚举回调
 // ---------------------------------------------------------------------------
@@ -86,12 +96,53 @@ bool StartsWith(const std::string& s, const std::string& prefix) {
 struct EnumCtx {
     std::vector<WindowInfo>* out = nullptr;
     HWND foreground = nullptr;
+    const std::vector<HWND>* forceInclude = nullptr;
     bool ok = true;
+
+    bool Forced(HWND hwnd) const {
+        if (!forceInclude) return false;
+        for (HWND h : *forceInclude) {
+            // 按低 32 位比：外部传进来的 hwnd 是无符号 32 位，进程内的 HWND
+            // 是符号扩展过的 64 位值，直接比指针值会永远不相等（见 HwndKey）。
+            if (HwndKey(h) == HwndKey(hwnd)) return true;
+        }
+        return false;
+    }
 };
+
+// 填充一个 WindowInfo（枚举到的 hwnd 必然还在；force 的那些可能已经销毁）
+static void FillWindowInfo(HWND hwnd, WindowInfo& info, HWND foreground) {
+    DWORD pid = 0;
+    ::GetWindowThreadProcessId(hwnd, &pid);
+    RECT rc{};
+    if (!::GetWindowRect(hwnd, &rc)) {
+        rc = RECT{};
+    }
+    info.hwnd = hwnd;
+    info.title = ReadWindowText(hwnd);
+    info.className = ReadClassName(hwnd);
+    info.pid = pid;
+    info.left = rc.left;
+    info.top = rc.top;
+    info.width = rc.right - rc.left;
+    info.height = rc.bottom - rc.top;
+    info.minimized = ::IsIconic(hwnd) != FALSE;
+    info.foreground = (hwnd == foreground);
+}
 
 BOOL CALLBACK EnumProc(HWND hwnd, LPARAM lparam) {
     auto* ctx = reinterpret_cast<EnumCtx*>(lparam);
     if (!ctx || !ctx->out) return FALSE;
+
+    // 服务正在录的窗口：无论最小化、多小、是不是 toolwindow、是不是顶层，
+    // 都要列出来 —— 否则下拉框里找不到它（详见 WindowEnum.h 里 forceInclude
+    // 的说明）。这一条必须排在"只取顶层"前面：Owned window 也可能在被录。
+    if (ctx->Forced(hwnd)) {
+        WindowInfo info;
+        FillWindowInfo(hwnd, info, ctx->foreground);
+        ctx->out->push_back(std::move(info));
+        return TRUE;
+    }
 
     // 只看顶层。EnumWindows 天然只给顶层，但 GetParent 能挡掉 owned window。
     if (::GetParent(hwnd) != nullptr) return TRUE;
@@ -118,19 +169,8 @@ BOOL CALLBACK EnumProc(HWND hwnd, LPARAM lparam) {
     // 太小的窗口（工具栏、浮标）不列出来
     if (w < 64 || h < 64) return TRUE;
 
-    DWORD pid = 0;
-    ::GetWindowThreadProcessId(hwnd, &pid);
-
     WindowInfo info;
-    info.hwnd = hwnd;
-    info.title = title;
-    info.className = cls;
-    info.pid = pid;
-    info.left = rc.left;
-    info.top = rc.top;
-    info.width = w;
-    info.height = h;
-    info.foreground = (hwnd == ctx->foreground);
+    FillWindowInfo(hwnd, info, ctx->foreground);
     ctx->out->push_back(std::move(info));
     return TRUE;
 }
@@ -148,6 +188,20 @@ std::string WindowClassName(HWND hwnd) {
 bool WindowRect(HWND hwnd, RECT& out) {
     if (!hwnd) return false;
     return ::GetWindowRect(hwnd, &out) != FALSE;
+}
+
+bool WindowPresent(HWND hwnd, uint32_t pid) {
+    if (!hwnd) return false;
+    if (!::IsWindow(hwnd)) return false;
+    // 隐藏 = 没有画面。Chromium 系关窗口只 ShowWindow(SW_HIDE)，句柄还活着，
+    // 只判 IsWindow 会让这一路永远停在最后一帧（详见头文件说明）。
+    if (!::IsWindowVisible(hwnd)) return false;
+    if (pid != 0) {
+        DWORD actual = 0;
+        ::GetWindowThreadProcessId(hwnd, &actual);
+        if (actual != pid) return false;  // 句柄被系统回收后给了别的窗口
+    }
+    return true;
 }
 
 std::string ProcessNameOf(uint32_t pid) {
@@ -170,11 +224,12 @@ std::string ProcessNameOf(uint32_t pid) {
     return result;
 }
 
-std::vector<WindowInfo> EnumerateWindows() {
+std::vector<WindowInfo> EnumerateWindows(const std::vector<HWND>& forceInclude) {
     EnumCtx ctx;
     std::vector<WindowInfo> out;
     ctx.out = &out;
     ctx.foreground = ::GetForegroundWindow();
+    ctx.forceInclude = &forceInclude;
     ::EnumWindows(&EnumProc, reinterpret_cast<LPARAM>(&ctx));
 
     // 补齐进程名（OpenProcess 有点开销，所以放在枚举之后单独一遍，
@@ -199,44 +254,57 @@ std::vector<WindowInfo> EnumerateWindows() {
     return out;
 }
 
+std::vector<WindowInfo> EnumerateWindows() {
+    return EnumerateWindows({});
+}
+
 std::vector<WindowInfo> MatchWindows(const std::vector<WindowInfo>& all,
-                                     const WindowMatch& rule) {
+                                     const WindowMatch& ruleIn) {
     std::vector<WindowInfo> hits;
+
+    // 【新模型：全部 AND，应用程序必选】
+    //
+    // 以前这里是「按优先级逐字段降级，第一个能匹到的说了算」，于是标题一变就会
+    // 悄悄降级到类名，进而选中同一类名（Chrome_WidgetWin_1）里面积最大的那个
+    // 窗口 —— 用户看到的是"标题完全对不上，却录了别的窗口"。现在改成：
+    //   RequiredFields() 里的每一份指纹**都必须命中**，少一条就不算匹配，
+    //   这一路保持未采集（宁可空着，也不乱抓一个别的东西来录）。
+    //
+    // Normalize() 是幂等的，会顺手把老配置（只有 pattern / 只有 byOrder）
+    // 补成新模型的形态，所以这里拿到的一定是完整规则。
+    WindowMatch rule = ruleIn;
+    rule.Normalize();
+
     if (!rule.Valid()) return hits;
 
-    // 按用户排的优先级逐字段尝试：第一个能匹配到窗口的字段说了算。
-    //
-    // 为什么不把所有命中的字段混在一起取并集：那样"标题像、但根本不是同一个
-    // 程序"的窗口也会被录进来。优先级的意义就是「标题最准，标题匹不上才降级
-    // 用类名，再降级用 exe 名」，一旦降级成功就不再往后看。
-    // 代价是：标题能匹到时，同 exe 的另一窗口不会被录进来 —— 这正是要的。
-    //
-    // 每个字段用**自己那份指纹**去比（rule.PatternFor）而不是共用 pattern：
-    // 以前只有 pattern 一个值、装的又是标题，于是降级到 class 时等于拿整串标题
-    // 去比 "CabinetWClass"，永远不命中 —— 降级链其实一直是断的，表现就是
-    // "标题一变（换个文件夹）这一路就报匹配不到窗口"。
-    for (MatchField f : rule.FieldOrder()) {
-        const std::string& own = rule.PatternFor(f);
-        if (own.empty()) continue; // 这个字段没有指纹，直接看下一个
+    // 参与比较的字段：规则要求的字段里**真的有指纹**的那些。
+    // 一个都没有 = 规则是空的，直接不匹配（不要"什么条件都没有所以全都算命中"）。
+    const auto fields = rule.ActiveFields();
+    if (fields.empty()) return hits;
 
-        const std::string pattern = ToLowerAscii(own);
-
-        // 正则也按字段各自编译（每字段文字不同，不能复用上面那份）
-        std::regex fieldRe;
-        bool hasFieldRegex = false;
-        if (rule.mode == MatchMode::Regex) {
+    // 正则每字段各自编译一次（各字段文字不同，不能复用）。
+    std::vector<std::regex> regexes(fields.size());
+    std::vector<bool> hasRegex(fields.size(), false);
+    if (rule.mode == MatchMode::Regex) {
+        for (size_t i = 0; i < fields.size(); ++i) {
             try {
-                fieldRe = std::regex(own, std::regex::ECMAScript | std::regex::icase);
-                hasFieldRegex = true;
+                regexes[i] = std::regex(rule.FieldPattern(fields[i]),
+                                        std::regex::ECMAScript | std::regex::icase);
+                hasRegex[i] = true;
             } catch (const std::regex_error&) {
-                hasFieldRegex = false;
+                hasRegex[i] = false;  // 正则写错 → 这个字段永远不命中
             }
         }
+    }
 
-        for (const auto& w : all) {
-            if (rule.requireVisible && w.minimized) continue;
+    for (const auto& w : all) {
+        if (rule.requireVisible && w.minimized) continue;
 
-            // 取要匹配的字段（统一转小写，做大小写不敏感比较）
+        bool ok = true;
+        for (size_t i = 0; i < fields.size() && ok; ++i) {
+            const MatchField f = fields[i];
+            const std::string pattern = ToLowerAscii(rule.FieldPattern(f));
+
             std::string subject;
             switch (f) {
                 case MatchField::Process: subject = w.processName; break;
@@ -245,33 +313,55 @@ std::vector<WindowInfo> MatchWindows(const std::vector<WindowInfo>& all,
             }
             const std::string lowered = ToLowerAscii(subject);
 
-            bool matched = false;
             switch (rule.mode) {
                 case MatchMode::Exact:
-                    matched = (lowered == pattern);
+                    ok = (lowered == pattern);
                     break;
                 case MatchMode::Contains:
-                    matched = lowered.find(pattern) != std::string::npos;
+                    ok = lowered.find(pattern) != std::string::npos;
                     break;
                 case MatchMode::Prefix:
-                    matched = StartsWith(lowered, pattern);
+                    ok = StartsWith(lowered, pattern);
                     break;
                 case MatchMode::Regex:
-                    if (hasFieldRegex) {
+                    if (hasRegex[i]) {
                         try {
-                            matched = std::regex_search(subject, fieldRe);
+                            ok = std::regex_search(subject, regexes[i]);
                         } catch (const std::regex_error&) {
-                            matched = false;
+                            ok = false;
                         }
+                    } else {
+                        ok = false;
                     }
                     break;
             }
-            if (matched) hits.push_back(w);
         }
-        if (!hits.empty()) break; // 这个优先级匹到了，后面的字段不再参战
+        if (ok) hits.push_back(w);
     }
 
     if (hits.empty()) return hits;
+
+    // 用户在下拉里明确挑过的那个窗口优先 —— 但仍然必须在上面那轮筛选里命中。
+    //
+    // 【为什么需要】「只匹配应用程序」下同一程序的多个窗口全部命中，按
+    // pick:largest 只会一直录面积最大的那个。用户在下拉里换成同程序的另一个
+    // 窗口时，exe 指纹一个字都没变，服务没理由换源，表现成"下拉能点、画面
+    // 不换"。preferredHwnd 记下用户挑的那个，这里在**命中集合内**优先返回它；
+    // 它不在了（关掉/销毁）就自然落到下面的 pick 逻辑，退回同程序的另一个
+    // 窗口 —— 这正好是这一档该有的语义。
+    //
+    // 注意：偏好**不参与**上面的字段比较，所以它绝不会让不满足规则的窗口被选中
+    // （"匹配不到就别乱选"这条仍然成立）。
+    //
+    // 只比低 32 位：HWND 本身是 32 位句柄，交给 JS 时也统一按无符号 32 位输出
+    // （见 main.cpp 的 BuildWindowsJson）。直接用 64 位值比会因为符号扩展后的
+    // 高位对不上，而且超过 2^53 的值在 JS 里根本存不准。
+    if (rule.preferredHwnd != 0) {
+        const uint32_t want = static_cast<uint32_t>(rule.preferredHwnd);
+        for (const auto& w : hits) {
+            if (HwndKey(w.hwnd) == want) return {w};
+        }
+    }
 
     // 多个命中时挑一个
     switch (rule.pick) {

@@ -669,7 +669,9 @@ Exporter::Exporter(std::string segmentsDir, std::string exportDir, std::string p
       exportDir_(ExpandEnv(exportDir)),
       prefix_(std::move(prefix)),
       maxSeconds_(maxSeconds),
-      targetFps_(targetFps > 240u ? 240u : targetFps),
+      // 输出帧率上限跟录制侧一致（120）：录制最高 120fps，输出再高只能是
+      // 重复插帧，没有意义；再低则按整数倍插帧，见 DESIGN 9.6。
+      targetFps_(targetFps > MfEncoder::kMaxFps ? MfEncoder::kMaxFps : targetFps),
       // 分片时长夹到合理区间：0 或者离谱的值都按 2 秒处理，否则"最后一片够
       // 不够长"那个判据就失去意义了。
       segmentSeconds_(segmentSeconds >= 1u && segmentSeconds <= 60u ? segmentSeconds : 2u) {}
@@ -723,6 +725,46 @@ bool Exporter::Start() {
     worker_ = std::thread(&Exporter::Run, this);
     return true;
 }
+
+namespace {
+
+/**
+ * 导出用的临时工作目录（分片副本都放这儿）。
+ *
+ * 【为什么不再放在导出目录里】以前是 `<导出目录>/.shadow-export-tmp` ——
+ * 用户在资源管理器里打开 export/ 就能看见一个带点的目录；导出被强杀时它
+ * 还会留在那儿，堆一堆几 MB 的分片副本。导出的中间文件本来就不该出现在
+ * 成品目录里。
+ *
+ * 现在放到系统临时目录下、每次导出用一个独立子目录：
+ *     %TEMP%\shadow-play\export\<pid>-<序号>
+ * 上一次被强杀留下的残骸也只是躺在 temp 里，不污染用户看的地方。
+ * 正常收尾时 Finish() 会把整棵目录删掉（删失败也无所谓，temp 本来就该被清理）。
+ *
+ * 为什么带 pid 和序号：导出线程可能和上一个进程留下的同名目录撞上（pid 会被
+ * 系统复用），序号保证同一个进程里的多次导出各用各的目录。
+ */
+fs::path MakeExportTempDir() {
+    static unsigned seq = 0;
+    const unsigned n = ++seq;
+
+    wchar_t base[MAX_PATH + 1] = {0};
+    const DWORD got = GetTempPathW(MAX_PATH, base);
+    fs::path root;
+    if (got > 0 && got < MAX_PATH) {
+        root = fs::path(base);
+    } else {
+        // GetTempPathW 失败（极罕见）：退回 std::filesystem 的临时目录实现，
+        // 再不行就用相对路径 —— 至少别让导出因为一个路径问题直接崩掉。
+        std::error_code ec;
+        root = fs::temp_directory_path(ec);
+        if (ec) root = fs::path(L".");
+    }
+    return root / L"shadow-play" / L"export" /
+           (std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(n));
+}
+
+} // namespace
 
 void Exporter::Finish(bool ok, const std::string& detail, const std::string& outPath,
                       const std::string& segmentsDirUsed, const std::string& listFile) {
@@ -959,8 +1001,12 @@ void Exporter::Run() {
         }
     }
 
-    tmpDir = PathToUtf8(fs::u8path(exportDir_) / fs::u8path(".shadow-export-tmp"));
+    // 临时目录放到系统 temp 里（见 MakeExportTempDir 的注释）—— 绝不能放在
+    // 导出目录下，否则用户打开 export/ 会看到一堆中间文件。
+    ec.clear();
+    tmpDir = PathToUtf8(MakeExportTempDir());
     fs::remove_all(fs::u8path(tmpDir), ec);
+    ec.clear();
     fs::create_directories(fs::u8path(tmpDir), ec);
     if (ec) {
         MfRelease();

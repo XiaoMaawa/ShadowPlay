@@ -52,6 +52,11 @@ const SERVICE_SOURCES = [
   'native\\backend\\Utf8Path.cpp',
   'native\\backend\\EnvPath.cpp',
   'native\\backend\\StatusFile.cpp',
+  // 守护模式（--guard）：服务自己拉起它、它盯着服务，双向看门。
+  'native\\backend\\GuardianMode.cpp',
+  // 系统托盘图标：挂在服务进程上，右键菜单里有「退出」。
+  'native\\backend\\TrayIcon.cpp',
+  'native\\backend\\GuiNotify.cpp',
 ]
 
 const SERVICE_LIBS = [

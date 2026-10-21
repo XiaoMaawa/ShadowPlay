@@ -64,6 +64,15 @@ export class FrameRenderer {
   private texH = 0
   private disposed = false
 
+  // uniform 的位置只在程序链接后变一次，**缓存起来别每帧查**。
+  //
+  // getUniformLocation 是一次同步的 JS↔GL 往返，浏览器还要按名字做一次符号
+  // 查找并建 WebGLUniformLocation 对象。144Hz 预览下每帧查两次（u_tex、u_scale）
+  // 就是 288 次/秒的同步往返，全部压在渲染主线程上 —— 而主线程同时还要做
+  // 共享内存 ArrayBuffer 的纹理上传，这里省下的每一次往返都直接换算成帧时间。
+  private uTexLoc: WebGLUniformLocation | null = null
+  private uScaleLoc: WebGLUniformLocation | null = null
+
   /** 最近一次上传的几何信息，用于计算显示比例 */
   public sourceWidth = 0
   public sourceHeight = 0
@@ -113,6 +122,10 @@ export class FrameRenderer {
     gl.enableVertexAttribArray(loc)
     gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0)
     gl.bindVertexArray(null)
+
+    // uniform 位置一次查好（见字段声明处的注释）。
+    this.uTexLoc = gl.getUniformLocation(program, 'u_tex')
+    this.uScaleLoc = gl.getUniformLocation(program, 'u_scale')
 
     const tex = gl.createTexture()
     if (!tex) throw new Error('createTexture failed')
@@ -188,8 +201,19 @@ export class FrameRenderer {
     const dpr = Math.min(window.devicePixelRatio || 1, 2)
     const cssW = this.canvas.clientWidth || 1
     const cssH = this.canvas.clientHeight || 1
-    const w = Math.max(1, Math.round(cssW * dpr))
-    const h = Math.max(1, Math.round(cssH * dpr))
+    let w = Math.max(1, Math.round(cssW * dpr))
+    let h = Math.max(1, Math.round(cssH * dpr))
+    // 画布不许比源更细。
+    //
+    // 源只有 1280x720（服务侧已经给预览降过采样），而高分屏（dpr 2）上一块
+    // 1200px 宽的面板会开出 2400x1350 的画布 —— 那是源的 3.5 倍像素，每帧
+    // 多填三百多万像素，画面却不会更清楚（放大采样出来的，细节本来就没有）。
+    // 把画布压回源的宽度，剩下的放大交给浏览器合成画布那一步（几乎免费）。
+    if (this.sourceWidth > 0 && w > this.sourceWidth) {
+      const k = this.sourceWidth / w
+      w = Math.max(1, Math.round(w * k))
+      h = Math.max(1, Math.round(h * k))
+    }
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w
       this.canvas.height = h
@@ -203,7 +227,7 @@ export class FrameRenderer {
     gl.bindVertexArray(this.vao)
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, this.texture)
-    gl.uniform1i(gl.getUniformLocation(this.program, 'u_tex'), 0)
+    gl.uniform1i(this.uTexLoc, 0)
     // 保持宽高比：取两个方向缩放的较小者，画面就完整落在视口内，
     // 多出来的那一对轴不铺满、露出黑边（letterbox），而不是被拉伸变形。
     // 这是需求 (3) 明确要求的 —— 多路源宽高比不同（整屏 16:9、窗口 1.92:1）
@@ -213,7 +237,7 @@ export class FrameRenderer {
     const fit = Math.min(sx, sy)
     const scaleX = this.sourceWidth > 0 ? (this.sourceWidth * fit) / w : 1
     const scaleY = this.sourceHeight > 0 ? (this.sourceHeight * fit) / h : 1
-    gl.uniform2f(gl.getUniformLocation(this.program, 'u_scale'), scaleX, scaleY)
+    gl.uniform2f(this.uScaleLoc, scaleX, scaleY)
     gl.drawArrays(gl.TRIANGLES, 0, 6)
     gl.bindVertexArray(null)
   }

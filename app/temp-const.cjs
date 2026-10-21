@@ -8,7 +8,7 @@
 //
 //   %TEMP%/shadow-play/app/           ← 根（每次启动先整个清掉）
 //     dist/        前端构建产物（Electron 从这里 loadFile index.html）
-//     bin/         采集服务的运行副本（见下方 ensureServiceExe 的说明）
+//     bin/         （已废弃：以前放采集服务的运行副本，现在直接跑编译产物）
 //     records/     采集服务的录制分片（生产默认落点）
 //     proofs/      验证脚本的产物（录制/导出/自检/探针的证据目录）
 //     status/      服务状态镜像
@@ -40,7 +40,7 @@ const TEMP = {
   root: TEMP_ROOT,
   /** 前端构建产物（app/main.cjs 按这个路径 loadFile） */
   dist: path.join(TEMP_ROOT, 'dist'),
-  /** 采集服务的运行副本（见 ensureServiceExe） */
+  /** （已废弃，保留只是为了老脚本不报错：采集服务现在直接跑编译产物） */
   bin: path.join(TEMP_ROOT, 'bin'),
   /** 采集服务的录制分片默认落点 */
   records: path.join(TEMP_ROOT, 'records'),
@@ -61,77 +61,29 @@ function ensureDir(dir, fs = require('node:fs')) {
 }
 
 /**
- * 返回「该运行的那一份采集服务 exe」。
+ * 返回「该运行的那一份采集服务 exe」：**就是编译产物本身**，原样返回。
  *
- * 为什么不直接跑 native/build/shadow-capture.exe：**Windows 的完整性级别是
- * 从文件继承的**。仓库目录如果带了 `Mandatory Label\Low Mandatory Level`
- * （DSH 沙箱就会打这个标签，同步盘/某些杀毒软件也会），构建出来的 exe 会
- * 继承那个标签，于是服务进程以 Low 完整性级别运行，两个后果都很难看：
+ * 【这里以前会把 exe 复制到临时根再跑 —— 那条路已经废掉，别加回来】
+ * 旧实现的理由是"仓库目录可能带低完整性标签（DSH 沙箱、同步盘会打），
+ * 从那里起的进程会被 WGC 拒绝，复制到 %TEMP% 就没有那个标签"。收益没兑现，
+ * 代价倒是实打实的两个：
  *
- *   1. WGC 窗口采集被系统拒绝：`0x80070005`「进程完整性级别低于 Medium」；
- *   2. 往 Medium 目录写文件被拒：`建不了分配记录目录：Access is denied.`
- *      —— 临时目录（%TEMP%）正是 Medium 的。
+ *   1. 副本成了第二个真实存在的可执行文件，"服务在用哪一份"变成新的状态。
+ *      启动清理把 bin/ 删掉后，SERVICE_EXE 永久指向一个不存在的路径：探测
+ *      不到 → 自动启动 → 还是那个不存在的路径 → 起不来。界面就一直显示
+ *      「正在连接…」，任务管理器里也没有采集服务。
+ *   2. 服务已经在跑时副本不能刷新（换文件等于弄死正在跑的进程），于是重新
+ *      编译出来的 exe 在老服务活着时永远用不上，排查"改了没生效"全卡在这。
  *
- * 而继承来的标签**改不掉**：`icacls /setintegritylevel Medium` 会报
- * `Access is denied`（继承 ACE 不是自己的，当前用户又没有 WRITE_OWNER）。
+ * 只跑一份编译产物，两类问题一起消失：路径恒定、重编译后重启服务必生效。
  *
- * 所以换个思路：把 exe **复制到临时根**再跑。副本是在 %TEMP% 下新建的文件，
- * 继承的是临时目录的标签（Medium），一复制问题就没了。成本是一次几十 MB
- * 的拷贝，所以带缓存：源文件大小 + 修改时间都没变就直接复用上次的副本。
- *
- * 在没打标签的机器上这等于多一次无害的复制（首次），之后完全走缓存。
+ * 函数保留（签名不变）只是为了让既有调用方不必改：它现在就是个恒等函数。
  *
  * @param {{srcExe: string, tempRoot?: string, log?: (msg: string) => void}} opts
- * @returns {string} 该 spawn 的 exe 路径（源文件不存在时原样返回，让调用方报错）
+ * @returns {string} 该 spawn 的 exe 路径
  */
 function ensureServiceExe(opts) {
-  const fs = require('node:fs')
-  const srcExe = opts.srcExe
-  const tempRoot = opts.tempRoot || TEMP_ROOT
-  const log = opts.log || (() => {})
-
-  if (!fs.existsSync(srcExe)) return srcExe
-
-  const binDir = path.join(tempRoot, 'bin')
-  const dstExe = path.join(binDir, path.basename(srcExe))
-  const stampPath = path.join(binDir, '.stamp.json')
-
-  let srcStat
-  try {
-    srcStat = fs.statSync(srcExe)
-  } catch {
-    return srcExe
-  }
-  const want = `${srcStat.size}:${srcStat.mtimeMs}`
-
-  // 缓存命中：副本在，且记录的大小/时间与源文件一致
-  try {
-    const got = JSON.parse(fs.readFileSync(stampPath, 'utf8'))
-    if (got && got.stamp === want && fs.existsSync(dstExe) && fs.statSync(dstExe).size === srcStat.size) {
-      return dstExe
-    }
-  } catch {
-    /* 没有缓存，下面复制 */
-  }
-
-  try {
-    fs.mkdirSync(binDir, { recursive: true })
-    // 目标可能正被上一次的服务进程占着（Windows 上运行中的 exe 不能覆盖），
-    // 那就先删；删不掉说明真的在用，直接用现有的那份。
-    try {
-      if (fs.existsSync(dstExe)) fs.unlinkSync(dstExe)
-    } catch {
-      return dstExe
-    }
-    fs.copyFileSync(srcExe, dstExe)
-    fs.writeFileSync(stampPath, JSON.stringify({ stamp: want, src: srcExe }), 'utf8')
-    log(`已把采集服务复制到临时目录：${dstExe}`)
-    return dstExe
-  } catch (err) {
-    // 复制失败（权限、占用）就退回原件：打不了标签的机器上原件本来就能跑
-    log(`复制采集服务失败（${err.message}），直接使用 ${srcExe}`)
-    return srcExe
-  }
+  return opts.srcExe
 }
 
 /**

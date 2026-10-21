@@ -450,6 +450,10 @@ bool FrameRing::Publish(const uint8_t* src, uint32_t srcStride, uint32_t width, 
     sh->producerPid = static_cast<uint32_t>(GetCurrentProcessId());
 
     PublishInternal(slot, width, height, rowBytes, presentQpc);
+    // 记住这一帧的真实尺寸：RepublishLast 要按它去重发（见 FrameRing.h 里
+    // lastPublishedWidth_ 的注释 —— 不能用建环时的 width_/height_，那会越界）。
+    lastPublishedWidth_ = width;
+    lastPublishedHeight_ = height;
     return true;
 }
 
@@ -491,7 +495,7 @@ void FrameRing::PublishInternal(int slot, uint32_t width, uint32_t height, uint3
     SetEvent(frameEvent_);
 }
 
-bool FrameRing::RepublishLast(const uint8_t* src, uint32_t srcStride) {
+bool FrameRing::RepublishLast(const uint8_t* src, uint32_t srcStride, uint32_t w, uint32_t h) {
     if (!header_) return false;
     if (lastPublishedSlot_ < 0) return false;
 
@@ -500,11 +504,18 @@ bool FrameRing::RepublishLast(const uint8_t* src, uint32_t srcStride) {
 
     // 有像素就直接走正常发布（会换一个槽，内容一致）；
     // 没有就只把 counter 往前推，让下游知道"有一帧可以画"。
-    if (src && width_ > 0 && height_ > 0) {
-        return Publish(src, srcStride, width_, height_, 0);
+    //
+    // 尺寸必须用**上一帧真实发布过的**尺寸，不能用建环时的 width_/height_：
+    // 预览帧可能是降采样过的（见 Session.cpp），按采集尺寸读会越界，而且
+    // 槽头会写回一个和像素对不上的几何，界面那边的纹理就得重建（表现为闪）。
+    const uint32_t rw = w > 0 ? w : (lastPublishedWidth_ > 0 ? lastPublishedWidth_ : width_);
+    const uint32_t rh = h > 0 ? h : (lastPublishedHeight_ > 0 ? lastPublishedHeight_ : height_);
+
+    if (src && rw > 0 && rh > 0) {
+        return Publish(src, srcStride, rw, rh, 0);
     }
 
-    PublishInternal(lastPublishedSlot_, width_, height_, width_ * 4u, 0);
+    PublishInternal(lastPublishedSlot_, rw, rh, rw * 4u, 0);
     return true;
 }
 
