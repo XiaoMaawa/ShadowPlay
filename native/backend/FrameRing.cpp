@@ -458,7 +458,7 @@ bool FrameRing::Publish(const uint8_t* src, uint32_t srcStride, uint32_t width, 
 }
 
 void FrameRing::PublishInternal(int slot, uint32_t width, uint32_t height, uint32_t stride,
-                                uint64_t presentQpc) {
+                                uint64_t presentQpc, bool repeatContent) {
     (void)width; (void)height; (void)stride;
 
     // 顺序很重要：
@@ -467,6 +467,10 @@ void FrameRing::PublishInternal(int slot, uint32_t width, uint32_t height, uint3
     //   2) 发布槽号；
     //   3) 递增发布序号 —— 消费者以"序号变了"作为有完整新帧的信号。
     _ReadWriteBarrier();
+    // 这一帧的像素和上一帧完全相同（桌面静止）。写在发布序号之前，
+    // 消费者读到新序号时这个标记已经是这一帧的了（见 ShadowRing.h 里
+    // repeatContent 的注释）。
+    StoreU64(&header_->repeatContent, repeatContent ? 1u : 0u);
     StoreU32(&header_->publishedSlot, static_cast<uint32_t>(slot));
     StoreU64(&header_->counter, LoadU64(&header_->counter) + 1);
 
@@ -495,7 +499,8 @@ void FrameRing::PublishInternal(int slot, uint32_t width, uint32_t height, uint3
     SetEvent(frameEvent_);
 }
 
-bool FrameRing::RepublishLast(const uint8_t* src, uint32_t srcStride, uint32_t w, uint32_t h) {
+bool FrameRing::RepublishLast(const uint8_t* src, uint32_t srcStride, uint32_t w, uint32_t h,
+                              bool repeatContent) {
     if (!header_) return false;
     if (lastPublishedSlot_ < 0) return false;
 
@@ -511,11 +516,20 @@ bool FrameRing::RepublishLast(const uint8_t* src, uint32_t srcStride, uint32_t w
     const uint32_t rw = w > 0 ? w : (lastPublishedWidth_ > 0 ? lastPublishedWidth_ : width_);
     const uint32_t rh = h > 0 ? h : (lastPublishedHeight_ > 0 ? lastPublishedHeight_ : height_);
 
+    // 内容没变：连槽都不换、像素一个字节都不拷，只把序号推进并打上标记。
+    //
+    // 换槽的代价不只是 memcpy：换了槽，消费者那边也认不出"这是同一张图"，
+    // 只能再上传一次纹理 —— 而 GPU 上传正是这条链路上最贵的一步。
+    if (repeatContent) {
+        PublishInternal(lastPublishedSlot_, rw, rh, rw * 4u, 0, true);
+        return true;
+    }
+
     if (src && rw > 0 && rh > 0) {
         return Publish(src, srcStride, rw, rh, 0);
     }
 
-    PublishInternal(lastPublishedSlot_, rw, rh, rw * 4u, 0);
+    PublishInternal(lastPublishedSlot_, rw, rh, rw * 4u, 0, false);
     return true;
 }
 

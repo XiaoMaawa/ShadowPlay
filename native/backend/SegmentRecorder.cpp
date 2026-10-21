@@ -1268,7 +1268,8 @@ bool SegmentRecorder::SetBitrate(uint32_t bitrateMbps, uint32_t timeoutMs) {
     return brOk_;
 }
 
-void SegmentRecorder::Stop() {    // 先收喂帧线程：它可能正卡在 WriteSample 上等编码器。
+void SegmentRecorder::Stop() {
+    // 先收喂帧线程：它可能正卡在 WriteSample 上等编码器。
     // 必须等它退出来再 Finish 编码器，否则它可能往已经关掉的 writer 里写。
     if (feeder_.joinable()) {
         {
@@ -1277,6 +1278,51 @@ void SegmentRecorder::Stop() {    // 先收喂帧线程：它可能正卡在 Wri
         }
         slotCv_.notify_all();
         feeder_.join();
+    }
+
+    // ---- 把队列里剩下的帧写完再收工 --------------------------------------
+    //
+    // 【为什么必须补这一步】喂帧线程是"到点才写"的（节拍由墙钟 × 帧率决定），
+    // 所以停服务的那一刻，队列里通常还躺着几帧已经采到、但还没轮到写的画面。
+    // 以前这里直接把线程收掉就 Finish 了 —— 那几帧凭空消失，用户看到的就是
+    // 「点重启前最后一两秒的切片没了、画面在点击之前就断了」。
+    //
+    // 队列深度最多 depth 帧（0.6 秒 / 40 帧封顶），一帧编码 8~9ms，所以这一步
+    // 最多花三四百毫秒；调用方（优雅停机）给它留的是几秒。
+    //
+    // 顺序不能反：必须在 feeder_.join() 之后、encoder_->Finish() 之前 ——
+    // 前者保证没有别人同时在写编码器，后者保证这几帧还在同一个分片里。
+    if (encoder_) {
+        std::vector<uint8_t> buf;
+        uint32_t w = 0;
+        uint32_t h = 0;
+        int drained = 0;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lk(slotMu_);
+                if (ringDepth_ == 0 || ringRead_ >= ringWrite_) break;
+                PendingFrame& p = ring_[static_cast<size_t>(ringRead_ % ringDepth_)];
+                buf.swap(p.buf);
+                w = p.w;
+                h = p.h;
+                ++ringRead_;
+            }
+            if (w == 0 || h == 0) continue;
+            const size_t rowBytes = static_cast<size_t>(w) * 4u;
+            if (w != width_ || h != height_) continue; // 尺寸换代前的残帧，编码器接不了
+            if (buf.size() < rowBytes * h) continue;
+            if (!encoder_->Write(buf.data(), static_cast<uint32_t>(rowBytes), w, h)) break;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                ++stats_.framesIn;
+                stats_.bytesIn += static_cast<uint64_t>(rowBytes) * h;
+            }
+            ++drained;
+        }
+        if (drained > 0) {
+            std::lock_guard<std::mutex> lk(mu_);
+            stats_.drainedOnStop = static_cast<uint64_t>(drained);
+        }
     }
 
     {

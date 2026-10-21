@@ -397,6 +397,18 @@ void SyncRingToBuffer(SharedRing* shared) {
     const size_t slotBytes = static_cast<size_t>(src->slotStride);
     if (slotOffset + slotBytes > shared->size) return;
 
+    // 【内容没变就别拷】桌面静止时服务按帧率重发同一张图，像素一个字节都
+    // 没变。这时候还整槽 memcpy（1440p 是 14.7MB，60/s 就是 880MB/s）然后把
+    // 同一张图再传一次 GPU，纯属白烧 —— 而画面一像素都不会变。
+    //
+    // 判据必须同时满足两条：
+    //   * 缓冲区里**已经有**一帧（syncVersion != 0），否则没有"上一帧"可复用；
+    //   * 上一帧拷的就是这个槽（publishedSlot 相同）—— 服务端换了槽就说明
+    //     像素确实换过了，标记再怎么说是 repeat 也得老实拷。
+    const bool repeatPixels = src->repeatContent == 1 &&
+                              dst->syncVersion != 0 &&
+                              dst->publishedSlot == publishedSlot;
+
     // 这是消费者/生产者之间唯一的同步字段（sequence lock）：
     //   syncVersion 只在"槽内容 + 头部标量都写完"之后才推进。
     // 消费者在拷像素前后各读一次 syncVersion，两次相同且非 0 就说明读到的是
@@ -406,9 +418,11 @@ void SyncRingToBuffer(SharedRing* shared) {
     dst->syncVersion = 0; // 声明"正在写"
     _ReadWriteBarrier();
 
-    // 1) 槽内容（槽头 + 像素）
-    std::memcpy(shared->data + slotOffset,
-                static_cast<const uint8_t*>(ring->view()) + slotOffset, slotBytes);
+    // 1) 槽内容（槽头 + 像素）。重复帧跳过 —— 缓冲区里就是同一张图。
+    if (!repeatPixels) {
+        std::memcpy(shared->data + slotOffset,
+                    static_cast<const uint8_t*>(ring->view()) + slotOffset, slotBytes);
+    }
 
     // 2) 头部标量
     dst->headerSize = src->headerSize;
@@ -424,7 +438,7 @@ void SyncRingToBuffer(SharedRing* shared) {
     dst->lastPublishQpc = src->lastPublishQpc;
     dst->producedFrames = src->producedFrames;
     dst->droppedFrames = src->droppedFrames;
-    dst->skippedFrames = src->skippedFrames;
+    dst->repeatContent = src->repeatContent;
     dst->modeChangeCount = src->modeChangeCount;
     dst->captureErrors = src->captureErrors;
     dst->publishedSlot = publishedSlot;

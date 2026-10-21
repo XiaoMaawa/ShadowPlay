@@ -85,6 +85,9 @@ struct RecorderStats {
     uint64_t framesIn = 0;         // 成功编码进去的帧数
     uint64_t bytesIn = 0;          // 喂进去的字节数（未压缩）
     uint64_t droppedFrames = 0;    // 因为采不到/尺寸不符丢掉的帧
+    // 停机时从待喂队列里补写进编码器的帧数（见 Stop 里的注释）。
+    // 0 表示停机那一刻队列正好是空的；非 0 说明"最后这一两百毫秒"被救回来了。
+    uint64_t drainedOnStop = 0;
     uint32_t segmentsOnDisk = 0;   // 当前目录里的分片数
     uint64_t diskBytes = 0;        // 分片目录总字节数
     // 码率（Mbps）。requested 是配置值（0 = 没配、走估算），effective 是编码器

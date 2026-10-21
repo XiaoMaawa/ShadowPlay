@@ -1236,6 +1236,91 @@ function loadProfiles() {
  * 自己执行 npm run service:stop + npm run service —— 那是他的选择，不是程序
  * 偷偷替他做的。
  */
+/**
+ * 停掉整套（服务 + 守护），**先礼后兵**。
+ *
+ * 三步，顺序不能乱：
+ *   1) 先立「停机哨兵」—— 守护每 2 秒巡检一次，不立的话杀掉服务的瞬间它就
+ *      把服务拉起来，「停止」永远停不干净。
+ *   2) 再请服务**自己优雅退出**（管道发 {"cmd":"shutdown"}）—— 它会把每个
+ *      会话的 Stop() 跑完：待喂队列里已经采到的帧补写进编码器、正在写的那
+ *      个分片 Finalize（没有这一步，最后那个分片是读不出来的半截文件）。
+ *   3) 等不到才 taskkill 兜底。
+ *
+ * 【为什么非要这一步】以前只有 1 和 3，直接 taskkill /F 把进程当场打死，
+ * Session::Stop() 根本没机会跑。用户在设置页点「重启服务」时，最后一两秒的
+ * 分片就是这么丢的，而且画面在点按钮**之前**就断了（磁盘上的内容停在更早的
+ * 时刻）。用户的原话：「我应该把一直录到重启服务那一刻才出现 no signal」。
+ */
+async function stopServiceGracefully() {
+  const { execFileSync, spawnSync } = require('node:child_process')
+  // 1) 立哨兵
+  try {
+    writeFileSync(path.join(TEMP_ROOT, 'status', 'shutdown-requested'), '', 'utf8')
+  } catch {}
+
+  // 2) 优雅退出
+  //
+  // 最多等 5 秒：Session::Stop() 要等喂帧线程退出、把队列里剩下的帧补写完、
+  // 再把当前分片 Finalize（每路 0.1~0.5 秒），多路加起来可能要一两秒。这点
+  // 等待换来的是"最后一个分片完整可读"，值得。
+  let graceful = false
+  try {
+    await sendServiceCommand({ cmd: 'shutdown' })
+    for (let i = 0; i < 25; i++) {
+      if (serviceRunning() !== true) {
+        graceful = true
+        break
+      }
+      await new Promise((r) => setTimeout(r, 200))
+    }
+  } catch (err) {
+    log('[service:stop] 优雅停机请求失败，改用强杀：', err?.message ?? err)
+  }
+
+  // 3) 循环强杀兜底（优雅退出成功的话不必再白等 15 秒）
+  const deadline = Date.now() + (graceful ? 3000 : 15000)
+  let everKilled = false
+  const guardPid = (() => {
+    try {
+      const doc = JSON.parse(readFileSync(path.join(TEMP_ROOT, 'status', 'guardian-v1.json'), 'utf8'))
+      const p = Number(doc?.pid)
+      return Number.isFinite(p) && p > 0 ? p : null
+    } catch {
+      return null
+    }
+  })()
+  const pids = new Set([serviceChild?.pid, guardPid].filter((p) => p))
+  while (Date.now() < deadline) {
+    for (const p of pids) {
+      try {
+        execFileSync('taskkill', ['/PID', String(p), '/F'], { stdio: 'ignore', windowsHide: true })
+        everKilled = true
+      } catch {}
+    }
+    try {
+      const byName = spawnSync('taskkill', ['/IM', 'shadow-capture.exe', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
+      if (byName.status === 0) everKilled = true
+    } catch {}
+    // 都清干净了就收工
+    const r = spawnSync('tasklist', ['/FI', 'IMAGENAME eq shadow-capture.exe'], {
+      encoding: 'utf8',
+      windowsHide: true,
+    })
+    if (!/shadow-capture\.exe/i.test(r.stdout || '')) break
+    await new Promise((r) => setTimeout(r, 800))
+  }
+  // 4) 停机完成，清掉哨兵，方便下次启动
+  try {
+    rmSync(path.join(TEMP_ROOT, 'status', 'shutdown-requested'), { force: true })
+  } catch {}
+  const stillRunning = serviceRunning() === true
+  return { ok: !stillRunning, everKilled, stillRunning, graceful }
+}
+
 function stopService() {
   try {
     const { execFileSync } = require('node:child_process')
@@ -1782,7 +1867,9 @@ function registerIpc() {
   //     拉不起来，守护几秒内也会把它拉回来。
   // 所以"重启"从一个危险操作变成了"改完 C++ 想让新 exe 生效时点一下"。
   ipcMain.handle('service:restart', async () => {
-    stopService()
+    // 走优雅停机：让服务把当前分片 Finalize 完再退。直接 taskkill 会丢掉
+    // 最后那一片（用户报过「点重启前两秒的切片全部丢失」）。
+    const stop = await stopServiceGracefully()
     // 等旧进程把互斥体放了。它是内核对象，进程一退出就没了，但也给它
     // 一点收尾时间（编码器 Finalize 分片）；等不到也照样往下走 ——
     // launchService() 自己会判断"还在跑就复用"，不会叠出第二个。
@@ -1794,7 +1881,12 @@ function registerIpc() {
     if (!started.ok) return { ok: false, error: started.error ?? '重启失败。' }
     // 新服务还没收到本机的预览帧率设置，补一次下发（它只认命令行和配置文件）。
     void pushSettingsToService()
-    return { ok: true, pid: started.pid ?? null, alreadyRunning: started.alreadyRunning === true }
+    return {
+      ok: true,
+      pid: started.pid ?? null,
+      alreadyRunning: started.alreadyRunning === true,
+      graceful: stop.graceful === true,
+    }
   })
 
   ipcMain.handle('service:reveal', () => {
@@ -1804,58 +1896,9 @@ function registerIpc() {
 
   // 停止整套（服务 + 守护）。
   //
-  // 关键：先立「停机哨兵」，再循环杀。守护每 2 秒巡检一次，若不立哨兵，杀服务的
-  // 瞬间它就把服务拉起来 —— 「停止」永远停不干净。立了哨兵后，守护下一轮要么
-  // 直接退出、要么看到哨兵不再拉起；循环里反复按 PID + 按名字补刀，直到都没了。
-  // 托盘图标的「退出」走的是原生侧的同一条逻辑。
-  ipcMain.handle('service:stop', async () => {
-    const { execFileSync, spawnSync } = require('node:child_process')
-    // 1) 立哨兵
-    try {
-      writeFileSync(path.join(TEMP_ROOT, 'status', 'shutdown-requested'), '', 'utf8')
-    } catch {}
-    // 2) 循环杀：服务 PID + 守护 PID，再按名字兜底
-    const deadline = Date.now() + 15000
-    let everKilled = false
-    const guardPid = (() => {
-      try {
-        const doc = JSON.parse(readFileSync(path.join(TEMP_ROOT, 'status', 'guardian-v1.json'), 'utf8'))
-        const p = Number(doc?.pid)
-        return Number.isFinite(p) && p > 0 ? p : null
-      } catch {
-        return null
-      }
-    })()
-    const pids = new Set([serviceChild?.pid, guardPid].filter((p) => p))
-    while (Date.now() < deadline) {
-      for (const p of pids) {
-        try {
-          execFileSync('taskkill', ['/PID', String(p), '/F'], { stdio: 'ignore', windowsHide: true })
-          everKilled = true
-        } catch {}
-      }
-      try {
-        const byName = spawnSync('taskkill', ['/IM', 'shadow-capture.exe', '/F'], {
-          stdio: 'ignore',
-          windowsHide: true,
-        })
-        if (byName.status === 0) everKilled = true
-      } catch {}
-      // 都清干净了就收工
-      const r = spawnSync('tasklist', ['/FI', 'IMAGENAME eq shadow-capture.exe'], {
-        encoding: 'utf8',
-        windowsHide: true,
-      })
-      if (!/shadow-capture\.exe/i.test(r.stdout || '')) break
-      await new Promise((r) => setTimeout(r, 800))
-    }
-    // 3) 停机完成，清掉哨兵，方便下次启动
-    try {
-      rmSync(path.join(TEMP_ROOT, 'status', 'shutdown-requested'), { force: true })
-    } catch {}
-    const stillRunning = serviceRunning() === true
-    return { ok: !stillRunning, everKilled, stillRunning }
-  })
+  // 真正的实现在 stopServiceGracefully()：先立哨兵、再请服务自己优雅退出
+  // （收尾分片），等不到才 taskkill 兜底。这里只做一层通道。
+  ipcMain.handle('service:stop', () => stopServiceGracefully())
 
   // 问服务要当前配置列表（preload 拿它决定要映射几个环）。
   // 注意服务是**常驻进程**，读它 stdout 会把它的状态流搅乱，所以这里不碰

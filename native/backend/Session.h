@@ -108,6 +108,9 @@ struct SessionStatus {
     // 这两个数报出来，界面才能回答「到底丢了多少、是不是在变速」。
     uint64_t repeatFrames = 0;
     uint64_t captureDropped = 0;
+    // 停机时从待喂队列里补写进编码器的帧数（见 SegmentRecorder::Stop）。
+    // 「点重启丢了几秒」这类问题就靠它判断：非 0 说明最后那一段救回来了。
+    uint64_t drainedOnStop = 0;
     // 采集端一共投进编码器的帧数（Feed 成功次数）。
     // 与 recordedFrames 一比就能分辨「采集端没给够」和「取槽相位错开」。
     uint64_t captureFrames = 0;
@@ -132,6 +135,17 @@ struct SessionStatus {
     uint64_t previewPublished = 0;
     uint64_t previewSkipped = 0;
     uint32_t previewFps = 0;
+    // 诊断：预览这条路上三个尺寸 —— 源多大、面板报多大、实际发进环多大。
+    //
+    // 【为什么必须分开报】「画面糊」有三种完全不同的成因，只看 published
+    // 分辨不出来：源本身就这么大（发原图也糊）、面板比源大（放大必然糊）、
+    // 服务把源砍太小（这才是能修的）。三个数一起看，一眼就知道是哪种。
+    uint32_t previewInW = 0;
+    uint32_t previewInH = 0;
+    uint32_t previewOutW = 0;
+    uint32_t previewOutH = 0;
+    uint32_t previewTargetW = 0;
+    uint32_t previewTargetH = 0;
     // 诊断：一拍里三笔大头各花多久（captureMs 只量了采集那一段）。
     // 1440p 每帧 14.7MB，采集/Publish/Feed 三份加起来 44MB/拍，
     // 120fps 就是 5.3GB/s —— fps 上不去时靠这三个数分辨卡在哪一段。

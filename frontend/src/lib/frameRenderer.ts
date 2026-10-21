@@ -62,6 +62,17 @@ export class FrameRenderer {
   private texture: WebGLTexture
   private texW = 0
   private texH = 0
+
+  /**
+   * 纹理里是不是已经装着一帧像素。
+   *
+   * 服务端会标出"这一帧和上一帧像素完全相同"，渲染侧据此跳过上传（静止画面
+   * 一秒能省下几百 MB 的 GPU 上传）。但前提是**纹理里确实有东西** —— 刚建好
+   * 还没传过任何一帧时，跳过上传就只剩一块黑布。
+   */
+  get hasFrame(): boolean {
+    return this.texW > 0 && this.texH > 0
+  }
   private disposed = false
 
   // uniform 的位置只在程序链接后变一次，**缓存起来别每帧查**。

@@ -36,7 +36,7 @@ int main() {
     std::printf("lastPublishQpc = %zu\n", offsetof(ShadowRingHeader, lastPublishQpc));
     std::printf("producedFrames = %zu\n", offsetof(ShadowRingHeader, producedFrames));
     std::printf("droppedFrames  = %zu\n", offsetof(ShadowRingHeader, droppedFrames));
-    std::printf("skippedFrames  = %zu\n", offsetof(ShadowRingHeader, skippedFrames));
+    std::printf("repeatContent  = %zu\n", offsetof(ShadowRingHeader, repeatContent));
 
     std::printf("\n-- JS RING_OFFSETS --\n");
     std::printf("slotOwners        = %zu\n", offsetof(ShadowRingHeader, slotOwners));

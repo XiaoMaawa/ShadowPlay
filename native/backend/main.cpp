@@ -579,6 +579,24 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
 
     // 一条命令行的解析（两条通道共用）。传进来时已经去掉了行尾。
     auto handleCommandLine = [&](const std::string& line) {
+        // 优雅停机：{"cmd":"shutdown"}
+        //
+        // 【为什么需要它】界面上的「重启服务」过去是直接 taskkill /F —— 进程被
+        // 立刻打死，Session::Stop() 根本没机会跑：正在写的那个分片既没有
+        // Finalize（moov/mfra 索引缺失，文件读不出来），待喂队列里已经采到的
+        // 那几帧也一起没了。用户看到的就是「点重启之前最后两秒的切片全部丢失，
+        // 而且画面在点按钮之前就断了」。
+        //
+        // 现在界面先发这一条，服务按正常路径收尾（停会话 → Finalize 当前分片 →
+        // 落状态），确认进程退了才轮到 taskkill 兜底。
+        //
+        // 必须在 "reload"/"export"/"flush" 之前判：那几个是按字样子串匹配的，
+        // 这里也按自己的字样匹配，互相不含，顺序只影响可读性。
+        if (line.find("\"shutdown\"") != std::string::npos) {
+            LogLine("{\"type\":\"shutdown_requested\"}");
+            RequestServiceStop();
+            return;
+        }
         // 预览帧率：{"cmd":"set-preview-fps","fps":60}
         //
         // 先于别的命令判：它靠 "cmd" 字段识别，而 reload/export 靠 "reload"/

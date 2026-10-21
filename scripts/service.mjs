@@ -38,7 +38,16 @@
 // ---------------------------------------------------------------------------
 
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  closeSync as fsCloseSync,
+  existsSync,
+  openSync as fsOpenSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  writeSync as fsWriteSync,
+} from 'node:fs'
 import path from 'node:path'
 import { projectRoot, tempRoot } from './electron-path.mjs'
 
@@ -200,6 +209,37 @@ function clearShutdownSentinel() {
  */
 function stopAll() {
   writeShutdownSentinel()
+
+  // 先请服务**自己**优雅退出，等不到再强杀。
+  //
+  // 【为什么】直接 taskkill /F 会把进程当场打死，`Session::Stop()` 一步都跑不到：
+  // 正在写的那个分片没有 Finalize（文件在、但索引缺失，读不出来），待喂队列里
+  // 已经采到的那几帧也一起没了。分片是 2 秒一片，丢的正好是"点停止前 0~2 秒"。
+  // 服务端收到 {"cmd":"shutdown"} 会走正常退出路径（补写队列 → Finalize → 落状态）。
+  const pid0 = readServicePid()
+  if (pid0) {
+    try {
+      const h = fsOpenSync('\\\\.\\pipe\\ShadowPlay.Cmd.v1', 'w')
+      fsWriteSync(h, JSON.stringify({ cmd: 'shutdown' }) + '\n')
+      fsCloseSync(h)
+    } catch {
+      /* 管道不在（老版本服务 / 刚起来）→ 直接走下面的强杀 */
+    }
+    const graceUntil = Date.now() + 5000
+    while (Date.now() < graceUntil) {
+      let alive = true
+      try {
+        process.kill(pid0, 0)
+      } catch {
+        alive = false
+      }
+      if (!alive) break
+      spawnSync('ping', ['-n', '1', '-w', '100', '127.0.0.1'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
+    }
+  }
 
   const deadline = Date.now() + 15000
   let everKilled = false

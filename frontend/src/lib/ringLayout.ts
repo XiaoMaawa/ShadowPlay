@@ -40,7 +40,7 @@ export const RING_U64 = {
   lastPublishQpc: 64,
   producedFrames: 88,
   droppedFrames: 96,
-  skippedFrames: 104,
+  repeatContent: 104,
 } as const
 
 /** int64 数组 / 其它。slotOwners 等数组的真实字节偏移由 offsetof 决定。 */
@@ -80,6 +80,13 @@ export interface FrameInfo {
   stride: number
   pixelOffset: number
   byteLength: number
+  /**
+   * true == 这一帧的像素和上一帧完全相同（桌面静止时服务端按帧率重发）。
+   *
+   * 拿到这样的帧不需要 `texSubImage2D`：纹理里装的就是同一张图。1440p 全
+   * 分辨率下一次上传是 14.7MB，静止画面按 60/s 重发就是 880MB/s 的纯浪费。
+   */
+  repeat: boolean
 }
 
 /** 读取当前已发布的帧。不检查槽位归属，调用方必须自己校验。 */
@@ -102,6 +109,10 @@ export function readPublishedFrame(view: DataView, info: RingInfo): FrameInfo | 
     stride,
     pixelOffset: base + info.headerSize,
     byteLength: stride * height,
+    // 服务端标记"和上一帧像素完全相同"。注意它和 counter 是分开写的两个字段，
+    // 中间可能被一次新的发布插进来 —— 所以只在"槽号和上次一样"时才敢用
+    // （槽换了说明像素确实换过），这个判断在 usePreview 里做。
+    repeat: view.getBigUint64(RING_U64.repeatContent, true) === 1n,
   }
 }
 

@@ -60,7 +60,8 @@ const RING = {
     syncVersion: 192,
     producedFrames: 88,
     droppedFrames: 96,
-    skippedFrames: 104,
+    /** 1 == 与上一帧像素完全相同（桌面静止重发），可以跳过上传 */
+    repeatContent: 104,
   },
   OFFSETS: {
     slotOwners: 112,
@@ -138,6 +139,10 @@ function readFrameInfo(conn) {
 
   return {
     syncVersion: view.getBigUint64(RING.U64.syncVersion, true).toString(),
+    // 这一帧和上一帧的像素完全一样（桌面静止时服务端按帧率重发的那类）。
+    // 渲染侧据此跳过纹理上传 —— 1440p 全分辨率下一次上传是 14.7MB，
+    // 静止画面每秒 60 次就是 880MB/s，而屏幕上一个像素都没变。
+    repeat: view.getBigUint64(RING.U64.repeatContent, true) === 1n,
     slot,
     width,
     height,

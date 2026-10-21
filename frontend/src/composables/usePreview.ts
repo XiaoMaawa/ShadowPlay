@@ -142,6 +142,14 @@ export function usePreview() {
   /** 上一次渲染过的 version（sequence lock 的版本号） */
   let lastCounter = -1n
   /**
+   * 上一次**真正上传进纹理**的那个槽号。
+   *
+   * 服务端说"这一帧和上一帧像素一样"时，只有槽号也没变才敢跳过上传 ——
+   * repeatContent 和 counter 是两个独立写入的字段，中间可能插进一次真发布
+   * （换槽 = 像素换过）。槽号对得上，才说明纹理里装的就是这张图。
+   */
+  let lastUploadedSlot = -1
+  /**
    * 每路一份帧率账本。key 是配置 id；key `''` 是没有选中任何一路时的
    * 兜底账本（旧界面/单路模式下 preload 会自动回退到第一路）。
    */
@@ -303,6 +311,7 @@ export function usePreview() {
     pixelView = null
     pixelViewOffset = -1
     lastCounter = -1n
+    lastUploadedSlot = -1
   }
 
   /** 建立到帧环的通道：直接问 preload 要那块 ArrayBuffer */
@@ -340,6 +349,7 @@ export function usePreview() {
     pixelView = null
     pixelViewOffset = -1
     lastCounter = -1n
+    lastUploadedSlot = -1
     ringInfo.value = null
     serviceHint.value = ''
     waitingService.value = false
@@ -606,21 +616,37 @@ export function usePreview() {
 
     const t0 = performance.now()
 
+    // ---- 静止画面：不上传纹理 ------------------------------------------
+    //
+    // 服务端在桌面/窗口静止时会按帧率重发同一张图（这样界面不会"看起来
+    // 卡死"，后接入的消费者也能立刻拿到画面）。以前这种情况照样每帧做一次
+    // texSubImage2D —— 1440p 全分辨率下是 14.7MB/帧，60fps 就是 880MB/s，
+    // 而屏幕上一个像素都没变。GPU 占用里很大一块就是这么白烧的。
+    //
+    // 跳过上传之后仍然要 draw()：WebGL 的 canvas 不会自己保留，重画两个
+    // 三角形几乎免费，纹理里本来就是这张图。
+    const canReuseTexture =
+      frame.repeat && frame.slot === lastUploadedSlot && renderer.hasFrame
+
     if (
-      !pixelView ||
-      pixelViewOffset !== frame.pixelOffset ||
-      pixelView.byteLength !== frame.byteLength
+      !canReuseTexture &&
+      (!pixelView ||
+        pixelViewOffset !== frame.pixelOffset ||
+        pixelView.byteLength !== frame.byteLength)
     ) {
       pixelView = new Uint8Array(current.buffer, frame.pixelOffset, frame.byteLength)
       pixelViewOffset = frame.pixelOffset
     }
 
-    const ok = renderer.upload(pixelView, {
-      width: frame.width,
-      height: frame.height,
-      stride: frame.stride,
-    })
+    const ok = canReuseTexture
+      ? true
+      : renderer.upload(pixelView as Uint8Array, {
+          width: frame.width,
+          height: frame.height,
+          stride: frame.stride,
+        })
     if (ok) renderer.draw()
+    if (ok && !canReuseTexture) lastUploadedSlot = frame.slot
 
     // sequence lock 校验：上传前后 version 必须一致。
     // texSubImage2D 是同步调用（会在返回前把像素取走），所以只要期间

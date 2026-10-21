@@ -37,7 +37,7 @@ const RING = {
     producerPid: 48,
     consumerPid: 52,
   },
-  U64: { counter: 32, syncVersion: 192, producedFrames: 88, droppedFrames: 96, skippedFrames: 104 },
+  U64: { counter: 32, syncVersion: 192, producedFrames: 88, droppedFrames: 96, repeatContent: 104 },
   OFFSETS: {
     slotOwners: 112,
     slotOwnQpc: 144,

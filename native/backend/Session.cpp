@@ -208,6 +208,7 @@ std::string Session::StatusJson() const {
                  ",\"repeatFrames\":" + std::to_string(status_.repeatFrames) +
                  ",\"captureDropped\":" + std::to_string(status_.captureDropped) +
                  ",\"captureFrames\":" + std::to_string(status_.captureFrames) +
+                 ",\"drainedOnStop\":" + std::to_string(status_.drainedOnStop) +
                  // 立刻切片完成计数：界面发完 flush 命令后轮询这个字段，
                  // 变了才说明"点按钮那一刻"的分片真的落盘了，可以开始导出。
                  // 管道是单向的，服务没法回话，这就是那条回执。
@@ -238,7 +239,7 @@ std::string Session::StatusJson() const {
     }
 
     const SessionStatus s = Status();
-    char buf[1024];
+    char buf[1400];
     std::snprintf(buf, sizeof(buf),
                   "{\"type\":\"session\",\"id\":\"%s\",\"name\":\"%s\","
                   "\"state\":\"%s\",\"detail\":\"%s\",\"enabled\":%s,"
@@ -247,6 +248,9 @@ std::string Session::StatusJson() const {
                   "\"actualFps\":%.2f,\"gapMs\":%.2f,\"captureMs\":%.2f,"
                   "\"produced\":%llu,\"dropped\":%llu,\"consumerPid\":%u,"
                   "\"previewFps\":%u,\"previewPublished\":%llu,\"previewSkipped\":%llu,"
+                  "\"previewInW\":%u,\"previewInH\":%u,"
+                  "\"previewOutW\":%u,\"previewOutH\":%u,"
+                  "\"previewTargetW\":%u,\"previewTargetH\":%u,"
                   "\"publishMs\":%.2f,\"feedMs\":%.2f",
                   JsonEscape(s.id).c_str(), JsonEscape(s.name).c_str(),
                   ToString(s.state), JsonEscape(s.detail).c_str(),
@@ -262,6 +266,8 @@ std::string Session::StatusJson() const {
                   s.previewFps,
                   static_cast<unsigned long long>(s.previewPublished),
                   static_cast<unsigned long long>(s.previewSkipped),
+                  s.previewInW, s.previewInH, s.previewOutW, s.previewOutH,
+                  s.previewTargetW, s.previewTargetH,
                   s.publishMs, s.feedMs);
     return std::string(buf) + cap + record + expo + "}";
 }
@@ -301,20 +307,26 @@ uint32_t Session::RingCapHeight(uint32_t h) {
 // 砍成 1280×720 之后，界面把它铺到 1400~2400 设备像素宽的面板上，等于先丢一半
 // 细节再放大 —— 文字边缘全是糊的，用户一眼就能看出来。
 //
-// 现在界面会把自己的 canvas 设备像素尺寸报上来，判据变成"源是不是明显比面板大"：
-//   * 源宽 <= 面板宽 × 1.15  -> 发原分辨率（1:1，最清楚，且没有一像素是白花的）
-//   * 源宽 >  面板宽 × 1.15  -> 砍半（面板用不上那么多像素，省一半带宽）
-// 1.15 的余量是为了避免"面板 1250 / 源 1280"这种边界上为了 30 个像素发全尺寸，
-// 也避免面板一拖动就在 1:1 和 1:2 之间来回抖。
+// 现在界面会把自己的 canvas 设备像素尺寸报上来，判据变成"**砍半之后还够不够
+// 面板用**"：
+//   * 够（半宽 >= 面板宽 × 0.9）-> 砍半发（省 3/4 上传量，面板上仍是 1:1 附近）
+//   * 不够                     -> 发原分辨率（面板大就别硬砍，砍了就是放大）
+//
+// 【这里踩过一次，必须记下来】上一版写的是"源比面板大就砍半"，看起来天经地义，
+// 实际上**砍过头了**：源 2560 / 面板 2000 时，砍半只剩 1280，界面把 1280 拉
+// 到 2000 宽显示 —— 放大 1.56 倍，比不砍还糊，而省下的带宽只有 40%。
+// 用户的原话是「还算是好糊」。真正的判据不是"谁更大"，而是"砍完还剩多少"。
+//
+// 0.9 的容差：1280 的面板给 1280，1400 的面板也给 1280（放大 1.09 倍，肉眼
+// 看不出），但 2000 的面板必须给原图。
 //
 // 界面还没报过尺寸（老版本界面 / 刚启动）时退回旧阈值，行为与以前一致。
 bool Session::PreviewNeedsHalf(uint32_t srcW, uint32_t srcH) const {
     if (srcW < 2 || srcH < 2) return false;
     const uint32_t targetW = previewTargetW_.load(std::memory_order_relaxed);
     if (targetW == 0) return srcW > kPreviewDownscaleAboveWidth;
-    // 面板宽度的 115% 作为"够用"的上界。
-    const uint32_t enough = targetW + targetW / 8u + targetW / 16u;
-    return srcW > enough;
+    const uint32_t halfW = srcW / 2u;
+    return halfW * 10u >= targetW * 9u;
 }
 
 // 全分辨率预览的帧率硬上限。
@@ -535,6 +547,7 @@ void Session::RefreshRecordStatus() {    if (!recorder_) return;
     status_.repeatFrames = rs.repeatFrames;
     status_.captureDropped = rs.captureDropped;
     status_.captureFrames = rs.captureFrames;
+    status_.drainedOnStop = rs.drainedOnStop;
 }
 
 bool Session::ResolveSource() {
@@ -775,6 +788,9 @@ void Session::ThreadMain() {
         // 这俩只在状态上报里露出来，方便分辨"限流没生效"和"界面没画"。
         uint64_t previewPublished_ = 0;
         uint64_t previewSkipped_ = 0;
+        // 最近一次发布的三档尺寸（源 / 面板目标 / 实际发进环）。
+        // 只在采集线程里读写，跟着 status_ 一起上报（见 SessionStatus 的注释）。
+        uint32_t pvInW_ = 0, pvInH_ = 0, pvOutW_ = 0, pvOutH_ = 0;
         // 预览降采样的目标缓冲（见文件上方 DownsampleHalfBgra 的说明）。
         // 只被采集线程自己碰，不用加锁；resize 之后一直复用，不会每帧分配。
         std::vector<uint8_t> previewBuf;
@@ -1242,6 +1258,12 @@ void Session::ThreadMain() {
                             lastPreviewPublish_ = publishedNow;
                             ++previewPublished_;
                         }
+                        // 尺寸链路记下来（不管 Publish 成没成功：失败了更需要
+                        // 知道当时打算发多大）。
+                        pvInW_ = pubW;
+                        pvInH_ = pubH;
+                        pvOutW_ = outW;
+                        pvOutH_ = outH;
                         publishNsInWindow += static_cast<uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - pubT0).count());
@@ -1429,29 +1451,59 @@ void Session::ThreadMain() {
                 }
                 if (allowRepublish && actStart - lastRepublish >= republishInterval &&
                     snapW_ > 0 && !snap_.empty()) {
-                    const uint32_t snapStride = snapW_ * 4u;
-                    const uint8_t* src = snap_.data();
-                    // 和上面那条 Publish 走同一套降采样：这两处尺寸必须一致，
-                    // 否则重发的一帧尺寸突然变回 2560x1440，界面会重建纹理（闪）。
-                    uint32_t rpW = snapW_;
-                    uint32_t rpH = snapH_;
-                    const uint8_t* rpSrc = src;
-                    uint32_t rpStride = snapStride;
-                    if (PreviewNeedsHalf(snapW_, snapH_)) {
-                        rpW = snapW_ / 2;
-                        rpH = snapH_ / 2;
-                        previewBuf.resize(static_cast<size_t>(rpW) * rpH * 4u);
-                        DownsampleHalfBgra(src, snapStride, snapW_, snapH_, previewBuf.data());
-                        rpSrc = previewBuf.data();
-                        rpStride = rpW * 4u;
-                    }
-                    published = ring_.RepublishLast(rpSrc, rpStride, rpW, rpH);
-                    // 桌面静止也算一帧：录像要连续帧流，缺帧会让时间轴变短。
-                    frameAction = true;
-                    lastRepublish = actStart;
-                    if (published) {
-                        lastPreviewPublish_ = actStart;
-                        ++previewPublished_;
+                    published = false;
+                    // ---- 静止：一个字节都不拷 ---------------------------------
+                    //
+                    // 【为什么这里不能只"重发同一份像素"】以前即使桌面一动不动，
+                    // 也会把 snap_ 整份再拷进另一个槽（1440p 是 14.7MB/次，
+                    // 按帧率来），界面拿到之后还要再上传一次纹理。画面一像素都
+                    // 没变，两笔开销全是白烧 —— 全分辨率预览下这就是 880MB/s。
+                    //
+                    // 现在：不换槽、不拷贝，只把发布序号推进并打上 repeatContent
+                    // 标记。addon 看到标记跳过 memcpy，渲染侧跳过 texSubImage2D，
+                    // 只重画已有的纹理。
+                    //
+                    // 【只在真的没新帧时这么做】isNew 为真说明这一拍采到了新画面，
+                    // 只是被预览限流挡下了 —— 那种情况必须老实拷，否则界面会把
+                    // 旧画面当成"没变"，要等下一拍才纠正（表现为慢半拍）。
+                    const bool sameContent = !isNew && pvOutW_ > 0 && pvOutH_ > 0;
+                    if (sameContent) {
+                        published = ring_.RepublishLast(nullptr, pvOutW_, pvOutH_, true);
+                        lastRepublish = actStart;
+                        if (published) {
+                            lastPreviewPublish_ = actStart;
+                            ++previewPublished_;
+                        }
+                        frameAction = true;
+                    } else {
+                        const uint32_t snapStride = snapW_ * 4u;
+                        const uint8_t* src = snap_.data();
+                        // 和上面那条 Publish 走同一套降采样：这两处尺寸必须一致，
+                        // 否则重发的一帧尺寸突然变回 2560x1440，界面会重建纹理（闪）。
+                        uint32_t rpW = snapW_;
+                        uint32_t rpH = snapH_;
+                        const uint8_t* rpSrc = src;
+                        uint32_t rpStride = snapStride;
+                        if (PreviewNeedsHalf(snapW_, snapH_)) {
+                            rpW = snapW_ / 2;
+                            rpH = snapH_ / 2;
+                            previewBuf.resize(static_cast<size_t>(rpW) * rpH * 4u);
+                            DownsampleHalfBgra(src, snapStride, snapW_, snapH_, previewBuf.data());
+                            rpSrc = previewBuf.data();
+                            rpStride = rpW * 4u;
+                        }
+                        published = ring_.RepublishLast(rpSrc, rpStride, rpW, rpH);
+                        // 桌面静止也算一帧：录像要连续帧流，缺帧会让时间轴变短。
+                        frameAction = true;
+                        lastRepublish = actStart;
+                        if (published) {
+                            lastPreviewPublish_ = actStart;
+                            ++previewPublished_;
+                        }
+                        pvInW_ = snapW_;
+                        pvInH_ = snapH_;
+                        pvOutW_ = rpW;
+                        pvOutH_ = rpH;
                     }
                 }
             } else {

@@ -92,8 +92,14 @@ public:
      */
     // w/h 为 0 时沿用上一次发布的尺寸。传了就以它为准：调用方手上的像素
     // 就是按这个尺寸降采样好的，让环照着写槽头才不会和像素对不上。
+    //
+    // 【repeatContent 是给前端省 GPU 的】桌面静止时这一帧的像素和上一帧
+    // 一模一样，前端拿到它要做的 memcpy + gl.texSubImage2D 全是白烧：
+    // 1440p 全分辨率下每帧 14.7MB，60/s 就是 880MB/s 的上传，而画面一像素
+    // 都没变。置位之后 addon 跳过像素拷贝、渲染侧跳过纹理上传，只重画一次
+    // 已有的纹理（两个三角形，几乎免费）。
     bool RepublishLast(const uint8_t* src = nullptr, uint32_t srcStride = 0, uint32_t w = 0,
-                       uint32_t h = 0);
+                       uint32_t h = 0, bool repeatContent = false);
 
     /** 最近一帧的发布时间（QPC），没有则为 0 */
     int64_t LastPublishQpc() const { return lastPublishedQpc_; }
@@ -118,7 +124,7 @@ private:
     void  CloseAll();
     int   AcquireConsumerSlot();
     void  PublishInternal(int slot, uint32_t width, uint32_t height, uint32_t stride,
-                          uint64_t presentQpc);
+                          uint64_t presentQpc, bool repeatContent = false);
     bool  ValidateHeader() const;
 
     ShadowRingHeader* Header() const { return header_; }

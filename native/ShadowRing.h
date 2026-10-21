@@ -74,7 +74,13 @@ typedef struct ShadowRingHeader {
 
     volatile uint64_t producedFrames;
     volatile uint64_t droppedFrames;   // 保留字段（当前不再递增，见上方同步模型说明）
-    volatile uint64_t skippedFrames;   // 保留字段
+    // 1 == 这一帧的像素与上一帧**完全相同**（桌面静止时按帧率重发的那一类）。
+    //
+    // 字段位置是从原来的 skippedFrames 沿用下来的（那个字段一直没被使用），
+    // 所以布局没变、SHADOW_RING_VERSION 不用动：老生产者不写它（恒 0），
+    // 消费者照常拷贝像素；新生产者写 1 时，消费者可以跳过像素 memcpy 和
+    // GPU 纹理上传 —— 画面一像素都没变，重传纯属白烧带宽。
+    volatile uint64_t repeatContent;
 
     volatile int64_t  slotOwners[SHADOW_SLOT_COUNT]; // -1 空闲，否则是占用它的 PID
     volatile int64_t  slotOwnQpc[SHADOW_SLOT_COUNT]; // 占用时刻（QPC），用于回收
