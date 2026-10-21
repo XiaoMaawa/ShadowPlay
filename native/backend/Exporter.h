@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace shadow {
 
@@ -40,6 +41,29 @@ struct ExportStatus {
     uint64_t    bytes = 0;          // 产物字节数
     double      elapsedMs = 0.0;
     uint64_t    jobId = 0;          // 递增；界面靠它区分"这是不是新的一次"
+};
+
+/**
+ * 「拍照」拍下来的一张分片清单里的一个分片（见 Exporter::CaptureSnapshot）。
+ *
+ * 【为什么要有这个结构，而不是在导出线程里现扫目录】
+ * 用户点导出之后，录制还在继续写新分片、槽位还在环形覆盖旧的。如果导出线程
+ * "边扫边干"（扫目录 → 逐片探时长 → 裁剪 → 才开始复制），这几百毫秒里
+ *   ① 新写出来的分片有可能被扫进去（用户看到"点了导出之后录的画面也进了视频"）；
+ *   ② 最老的那几片可能正好被槽位轮转删掉（复制时才发现，只能跳过，成片缺段）。
+ * 所以清单在**点击那一刻**同步取好（Start() 里做，只读目录和 index.csv，几毫秒），
+ * 之后导出线程只认这张清单 —— 这就是"给目录拍了张照"。
+ */
+struct SnapshotEntry {
+    std::string srcPath;      // 源文件绝对路径（只读，导出绝不删它）
+    std::string name;         // 唯一名字：`<轮次名>__<文件名>` 或平铺时的文件名
+    uint64_t    bytes = 0;    // 拍照那一刻的字节数
+    // 源文件的 mtime（fs::file_time_type 原生刻度）。只有 index.csv 里没有墙钟
+    // 的老分片才用得上它 —— 副本自己的 mtime 是"复制时刻"，拿它排序会全乱。
+    int64_t     writeTime = 0;
+    int64_t     startUnixMs = 0; // 墙钟起点（index.csv 第四列），0 = 老数据
+    uint32_t    contentW = 0;    // 真实画面宽（index.csv 第五列），0 = 不知道
+    uint32_t    contentH = 0;
 };
 
 /**
@@ -79,6 +103,18 @@ private:
     void Finish(bool ok, const std::string& detail, const std::string& outPath,
                 const std::string& segmentsDirUsed, const std::string& listFile);
 
+    /**
+     * 在**调用线程**里（也就是用户点导出、FlushSegment 刚把当前片收尾的那一刻）
+     * 把分片清单拍下来，存进 snapshot_。
+     *
+     * 只做两件事：扫目录 + 读各轮次的 index.csv，再按墙钟做一次粗筛（纯算术，
+     * 不打开任何分片文件，所以是毫秒级）。真实时长、能不能解码，都留到导出线程
+     * 在**隔离副本**上做 —— 那时源目录再怎么滚都与这次导出无关了。
+     *
+     * 返回 false 表示没有可导的片（原因写进 snapshotErr_）。
+     */
+    bool CaptureSnapshot();
+
     std::string segmentsDir_;   // 源：正在录的分片目录
     std::string exportDir_;     // 目标：预设导出目录
     std::string prefix_;        // 文件名前缀（配置名）
@@ -102,6 +138,14 @@ private:
     ExportStatus       status_;
     uint64_t           lastJobId_ = 0;
     std::thread        worker_;
+
+    // ---- 点击那一刻的「照片」------------------------------------------------
+    //
+    // Start() 里同步填好，Run() 开头取走（std::move）。导出线程从头到尾**只认
+    // 这张清单**：不再扫源目录，所以导出期间新写出来的分片无论如何都进不了视频。
+    std::mutex                 snapMu_;
+    std::vector<SnapshotEntry> snapshot_;
+    std::string                snapshotErr_;  // 拍照失败的原因（清单为空时给用户看）
 };
 
 /** 导出文件名里的时间戳：`2026.10.16_18-03-12`。

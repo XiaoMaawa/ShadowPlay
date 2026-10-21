@@ -712,6 +712,103 @@ bool Exporter::WaitIdle(uint32_t timeoutMs) const {
     }
 }
 
+// 「拍照」：在**点击那一刻**把要导的分片清单定格下来（见 Exporter.h 的 SnapshotEntry）。
+//
+// 用户的原话（这一版的需求）：
+//   「点击导出后，应该立刻进行切片拷贝，立刻把当前目录的切片进行隔离，不要让新
+//     切片写进来……你可以理解给目录拍了个照，导出的视频有哪些切片已经定下来了。
+//     后面新加入的切片不能导出到视频中了，还有切片也不能删掉，因为拍了照。」
+//
+// 所以这件事必须发生在**调用线程**（Session 的命令线程，紧接在 FlushSegment 之后），
+// 而不是导出线程里"顺手扫一下"：线程起来再扫，中间那几毫秒就已经可能有新片了。
+// 这里只做两件很轻的事 —— 扫目录（ListSegments）和按墙钟粗筛（纯算术，不打开
+// 任何分片文件），所以是毫秒级，不会卡住命令线程。
+bool Exporter::CaptureSnapshot() {
+    std::vector<SegmentFile> live;
+    std::string err;
+
+    auto giveUp = [&](const std::string& why) {
+        std::lock_guard<std::mutex> lk(snapMu_);
+        snapshot_.clear();
+        snapshotErr_ = why;
+        return false;
+    };
+
+    if (segmentsDir_.empty()) {
+        return giveUp("这一路还没有录像目录（窗口没匹配到过，或者还没开始录）。");
+    }
+    if (!ListSegments(fs::u8path(segmentsDir_), live, err,
+                      static_cast<double>(segmentSeconds_))) {
+        return giveUp(err);
+    }
+    if (live.empty()) {
+        return giveUp("分片目录里还没有可导出的完整分片。");
+    }
+
+    // ---- 粗筛：只按 index.csv 里的墙钟 + 标称片长算，不打开分片 --------------
+    //
+    // 为什么要筛：环形缓冲里可能躺着几十片（改帧率留下的旧轮次、拖窗口切出的
+    // 零点几秒的过渡片），全搬一份纯属浪费磁盘和复制时间。
+    //
+    // 【为什么用标称片长而不是真实时长】真实时长要打开每个分片问 MF（每片
+    // 十几毫秒），那就不是"立刻"了。这里只需要一个**宽松**的边界：多留几片
+    // 无所谓，精确裁剪留到隔离副本上做（那时已经是定格的东西，慢慢算不要紧）。
+    // 少留才是错的 —— 所以余量给到 4 片。
+    if (maxSeconds_ > 0) {
+        double latestStart = 0.0;
+        for (const SegmentFile& s : live) {
+            const double st = StartWallSec(s);
+            if (st > latestStart) latestStart = st;
+        }
+        if (latestStart > 0.0) {
+            const double nominal =
+                static_cast<double>(segmentSeconds_ > 0 ? segmentSeconds_ : 2u);
+            const double earliest =
+                (latestStart + nominal) - (static_cast<double>(maxSeconds_) + nominal * 4.0 + 2.0);
+            live.erase(std::remove_if(live.begin(), live.end(),
+                                      [&](const SegmentFile& s) {
+                                          const double st = StartWallSec(s);
+                                          return st > 0.0 && st < earliest;
+                                      }),
+                       live.end());
+            if (live.empty()) {
+                return giveUp("回放窗口内的分片都已经过期了（目录里只有更早录制的内容）。");
+            }
+        }
+    }
+
+    std::vector<SnapshotEntry> snap;
+    snap.reserve(live.size());
+    for (const SegmentFile& s : live) {
+        SnapshotEntry e;
+        e.srcPath = PathToUtf8(s.path);
+        e.name = s.name;
+        e.bytes = s.bytes;
+        e.writeTime = s.writeTime;
+        e.startUnixMs = s.startUnixMs;
+        e.contentW = s.contentW;
+        e.contentH = s.contentH;
+        snap.push_back(std::move(e));
+    }
+
+    // 【诊断】把这张"照片"记一笔。日志里能看出这次定格了几片、时间范围到哪；
+    // 导出结束时目录里通常又多了几片（录制没停），两边一对照就知道新片确实
+    // 没混进来 —— 用户报的问题全在这条线附近，留一行日志比事后猜便宜得多。
+    {
+        std::string dump = "export_snapshot n=" + std::to_string(snap.size()) +
+                           " window=" + std::to_string(maxSeconds_);
+        for (const SnapshotEntry& e : snap) {
+            dump += " | " + e.name + "@" + std::to_string(e.startUnixMs);
+        }
+        LogExportPlan(dump);
+    }
+
+    std::lock_guard<std::mutex> lk(snapMu_);
+    snapshot_ = std::move(snap);
+    snapshotErr_.clear();
+    return true;
+}
+
 bool Exporter::Start() {
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -719,8 +816,10 @@ bool Exporter::Start() {
         status_ = ExportStatus{};
         status_.running = true;
         status_.jobId = ++lastJobId_;
-        status_.phase = "准备";
+        status_.phase = "快照";
     }
+    // 拍照要在这个线程做（理由见 CaptureSnapshot 上面那段）。
+    CaptureSnapshot();
     if (worker_.joinable()) worker_.join(); // 收上一轮的僵尸线程
     worker_ = std::thread(&Exporter::Run, this);
     return true;
@@ -827,21 +926,114 @@ void Exporter::Run() {
         return;
     }
 
-    // ---- 1. 快照分片 ------------------------------------------------------
-    SetPhase("快照分片");
-    std::vector<SegmentFile> segs;
-    std::string err;
-    if (!ListSegments(fs::u8path(segmentsDir_), segs, err,
-                      static_cast<double>(segmentSeconds_))) {
+    // ---- 1. 取出点击那一刻拍的「照片」 -------------------------------------
+    //
+    // 清单是 Start() 在**用户点导出的那个线程**里拍好的（见 CaptureSnapshot）。
+    // 这里开始，导出线程**不再扫源目录**，新写出来的分片不可能混进视频。
+    SetPhase("快照");
+    std::vector<SnapshotEntry> snap;
+    std::string snapErr;
+    {
+        std::lock_guard<std::mutex> lk(snapMu_);
+        snap = std::move(snapshot_);
+        snapshot_.clear();
+        snapErr = snapshotErr_;
+    }
+    if (snap.empty()) {
         MfRelease();
-        fail(err);
+        fail(snapErr.empty() ? "分片目录里还没有可导出的完整分片。" : snapErr);
         return;
+    }
+
+    // ---- 2. 立刻整份复制到隔离目录（这就是"拍照"，也是"隔离"） -----------------
+    //
+    // 为什么复制必须排在最前面，而不是像以前那样"扫完、逐片探完时长、裁完再复制"：
+    // 那几百毫秒里录制还在写，槽位还在环形覆盖 —— 最老的那几片可能就在这期间
+    // 被删掉（复制时只能跳过，成片缺段），而正在写的那片还在长（复制到的内容
+    // 比"点击那一刻"多）。用户的原话：「点击导出后，应该立刻进行切片拷贝，立刻
+    // 把当前目录的切片进行隔离，不要让新切片写进来」。
+    //
+    // 现在：清单在点击那一刻定格 → 复制立刻开始 → 之后所有判断（时长、尺寸、
+    // 排序、裁剪、补齐计划）全部在这份**定格副本**上做。源目录再怎么滚，都和
+    // 这次导出无关；反过来，导出也**从不删、不移动**源分片 —— 下一次导出只要
+    // 那些片还在回放窗口里，照样能导进去（"拍了照，片子不能删"）。
+    std::error_code ec2;
+    std::string tmpDir2 = PathToUtf8(MakeExportTempDir());
+    fs::remove_all(fs::u8path(tmpDir2), ec2);
+    ec2.clear();
+    fs::create_directories(fs::u8path(tmpDir2), ec2);
+    if (ec2) {
+        MfRelease();
+        fail("建不了导出临时目录：" + ec2.message());
+        return;
+    }
+    // 复制这一步失败要清场，所以先埋一个只做清理的 lambda（tmpDir 变量在下面
+    // 还会被复用给 Finish()，这里先赋上）。
+    tmpDir = tmpDir2;
+
+    std::vector<SegmentFile> segs;
+    segs.reserve(snap.size());
+    size_t skippedCopy = 0;
+    for (const SnapshotEntry& e : snap) {
+        // 临时文件名必须唯一：各轮次的分片都叫 000000.mp4。
+        char leaf[64];
+        std::snprintf(leaf, sizeof(leaf), "%05u_", static_cast<unsigned>(segs.size()));
+        const fs::path dst = fs::u8path(tmpDir) / fs::u8path(std::string(leaf) + e.name);
+
+        bool copied = false;
+        std::string copyErr;
+        for (int attempt = 0; attempt < 3 && !copied; ++attempt) {
+            if (attempt > 0) Sleep(static_cast<DWORD>(80 * attempt));
+            copyErr.clear();
+            copied = CopyChecked(fs::u8path(e.srcPath), dst, e.bytes, copyErr);
+        }
+        if (!copied) {
+            // 极端情况：拍照到复制之间源文件被环形覆盖删掉了（窗口只有几十毫秒，
+            // 正常碰不上）。宁可少一片，不让整次导出失败。
+            ++skippedCopy;
+            std::error_code ecd;
+            fs::remove(dst, ecd);
+            continue;
+        }
+
+        SegmentFile f;
+        f.path = dst;              // 下游一律读副本，绝不回源目录
+        f.name = e.name;
+        f.bytes = static_cast<uint64_t>(fs::file_size(dst, ec2));
+        if (ec2) f.bytes = e.bytes;
+        f.startUnixMs = e.startUnixMs;
+        f.contentW = e.contentW;
+        f.contentH = e.contentH;
+        // 【不能留 0】没有墙钟的老分片靠 mtime 排序/兜底；副本自己的 mtime 是
+        // "复制时刻"，用它会把顺延关系搞乱，所以带的是源文件的 mtime。
+        f.writeTime = e.writeTime;
+        segs.push_back(std::move(f));
     }
     if (segs.empty()) {
+        std::error_code ecd;
+        fs::remove_all(fs::u8path(tmpDir), ecd);
         MfRelease();
-        fail("分片目录里还没有可导出的完整分片。");
+        fail("分片正在被录制覆盖，这一瞬间没有可读取的完整分片，请稍后重试。");
         return;
     }
+
+    // 把这张「照片」写进隔离目录（排查时能一眼看出这次到底定格了哪几片）。
+    {
+        std::ofstream mf(fs::u8path(tmpDir) / fs::u8path("manifest.txt"),
+                         std::ios::binary | std::ios::trunc);
+        if (mf) {
+            mf << "# 点击导出那一刻定格的分片清单（复制自源目录，源文件未改动）\n";
+            mf << "# 序号,墙钟起点(ms),字节数,副本名,源路径\n";
+            for (size_t i = 0; i < segs.size(); ++i) {
+                mf << i << ',' << segs[i].startUnixMs << ',' << segs[i].bytes << ','
+                   << segs[i].name << ',' << PathToUtf8(segs[i].path) << '\n';
+            }
+        }
+    }
+
+    // 拍照时刻之后才出现的分片：清单里根本没有它们，物理上进不来。上面循环里
+    // 唯一可能少的是"拍照后被环形覆盖删掉"的极端情况，记在 skippedCopy 里，
+    // 收尾时写进摘要。
 
     // ---- 1b. 按墙钟剔掉"上一辈子的分片" -----------------------------------
     //
@@ -1001,73 +1193,25 @@ void Exporter::Run() {
         }
     }
 
-    // 临时目录放到系统 temp 里（见 MakeExportTempDir 的注释）—— 绝不能放在
-    // 导出目录下，否则用户打开 export/ 会看到一堆中间文件。
-    ec.clear();
-    tmpDir = PathToUtf8(MakeExportTempDir());
-    fs::remove_all(fs::u8path(tmpDir), ec);
-    ec.clear();
-    fs::create_directories(fs::u8path(tmpDir), ec);
-    if (ec) {
-        MfRelease();
-        fail("建不了导出临时目录：" + ec.message());
-        return;
-    }
-    // tmpDir 先赋给成员之外的地方，fail() 才能清掉它 —— 这里直接返回前
-    // 手动清一次，避免临时目录残留。
+    // 隔离目录和副本已经在步骤 2 做好了。这里只留一个"清场再失败"的收尾工具
+    // —— tmpDir 里全是副本和 manifest.txt，出错就整棵删掉，别留在 temp 里。
+    //
+    // 【为什么复制失败要"跳过"而不是"整次放弃"】见 DESIGN.md 9.7。
+    // 拍照到复制之间只有几毫秒，理论上碰不到轮转；但槽位轮转的一瞬间，文件被
+    // remove 之后、SinkWriter 写出第一块之前，它在磁盘上就是 0 字节。真撞上了
+    // 就少一片、把这件事记进摘要（skippedCopy），不让整次导出失败。
     auto giveUp = [&](const std::string& why) {
         std::error_code ec9;
         fs::remove_all(fs::u8path(tmpDir), ec9);
         MfRelease();
         fail(why);
     };
+    (void)giveUp;
 
-    // 复制到临时目录。
-    //
-    // 为什么必须复制：录制还在跑，分片的槽位是**覆盖写**的（MfEncoder 会
-    // 删掉旧文件重新建）。我们正读着的那片可能下一秒就被换掉，导出的视频
-    // 就会出现花屏或者时长变短。复制一份虽然多花一次磁盘 IO，但换来
-    // "导出内容前后自洽"，而且复制时校验字节数，能把正被写坏的片挑出来重试。
-    //
-    // 【为什么复制失败要"跳过"而不是"整次放弃"】见 DESIGN.md 9.7。
-    // 槽位轮转的一瞬间，文件被 remove 之后、SinkWriter 写出第一块之前，
-    // 它在磁盘上就是 0 字节。用户报的
-    // 「复制分片后字节数不对（期望 479005，实际 0）」正是撞上这个窗口。
-    // 老实现直接 giveUp，于是"清理过 temp 目录之后导出必失败"——因为清理
-    // 之后槽位全是新文件，轮转撞车概率最高。现在重试三次，还不行就把这一
-    // 片排除掉、继续导出其余部分，并在摘要里说清少了几片。
+    // 隔离副本清单（与 segs 同下标）。下面所有探测、拼装只认它。
     std::vector<fs::path> copies;
-    std::vector<SegmentFile> kept;
     copies.reserve(segs.size());
-    kept.reserve(segs.size());
-    size_t skippedCopy = 0;
-    for (size_t i = 0; i < segs.size(); ++i) {
-        // 临时文件名必须唯一：各轮次的分片都叫 000000.mp4。
-        char leaf[64];
-        std::snprintf(leaf, sizeof(leaf), "%05u_", static_cast<unsigned>(kept.size()));
-        const fs::path dst = fs::u8path(tmpDir) / fs::u8path(std::string(leaf) + segs[i].name);
-        std::string copyErr;
-        bool copied = false;
-        for (int attempt = 0; attempt < 3 && !copied; ++attempt) {
-            if (attempt > 0) Sleep(static_cast<DWORD>(80 * attempt));
-            copyErr.clear();
-            copied = CopyChecked(segs[i].path, dst, segs[i].bytes, copyErr);
-        }
-        if (!copied) {
-            // 这一片正在被重写（或已经被删）。排除它，别让整次导出失败。
-            ++skippedCopy;
-            std::error_code ecd;
-            fs::remove(dst, ecd);
-            continue;
-        }
-        copies.push_back(dst);
-        kept.push_back(segs[i]);
-    }
-    segs = kept;
-    if (segs.empty()) {
-        giveUp("分片正在被录制覆盖，这一瞬间没有可读取的完整分片，请稍后重试。");
-        return;
-    }
+    for (const SegmentFile& s : segs) copies.push_back(s.path);
 
     // ---- 3. 合并 ----------------------------------------------------------
     //
