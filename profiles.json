@@ -6,7 +6,7 @@
     {
       "id": "p-desk",
       "num": 1,
-      "name": "整屏桌面",
+      "name": "显示器捕获",
       "enabled": true,
       "source": {
         "kind": "monitor",
@@ -15,7 +15,7 @@
         "wgc": true
       },
       "video": {
-        "fps": 30,
+        "fps": 120,
         "bitrateMbps": 10,
         "replaySeconds": 20,
         "segmentSeconds": 2,
@@ -25,9 +25,9 @@
       "createdAt": "2026-01-01T00:00:00.000Z"
     },
     {
-      "id": "p-win",
+      "id": "p-tftolk",
       "num": 2,
-      "name": "资源管理器",
+      "name": "配置 2",
       "enabled": true,
       "source": {
         "kind": "window",
@@ -37,25 +37,25 @@
       },
       "video": {
         "fps": 60,
-        "bitrateMbps": 10,
-        "replaySeconds": 20,
+        "bitrateMbps": 20,
+        "replaySeconds": 120,
         "segmentSeconds": 2,
         "scaleWidth": 0,
         "scaleHeight": 0
       },
-      "createdAt": "2026-01-01T00:00:00.000Z",
+      "createdAt": "2026-10-21T18:44:40.229Z",
       "match": {
-        "rule": "class+process",
-        "by": "class",
+        "rule": "title+process",
+        "by": "title",
         "mode": "contains",
-        "pattern": "王源模仿者王扁被爆头，复制人圈传来噩耗",
+        "pattern": "Ailee《像初雪一样靠近你（《孤单又灿烂的神－鬼怪O.S.T ",
         "pick": "largest",
-        "pollMs": 2000,
+        "pollMs": 1000,
         "requireVisible": true,
-        "title": "王源模仿者王扁被爆头，复制人圈传来噩耗",
+        "title": "Ailee《像初雪一样靠近你（《孤单又灿烂的神－鬼怪O.S.T ",
         "className": "Chrome_WidgetWin_1",
         "process": "哔哩哔哩.exe",
-        "hwnd": 460742
+        "hwnd": 42339004
       }
     }
   ]

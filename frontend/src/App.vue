@@ -2,23 +2,19 @@
   <div class="app">
     <!-- 顶栏：只留状态，不放日志 -->
     <header class="bar">
-      <span class="dot" :class="statusClass" />
-      <strong class="name">ShadowPlay 即时重放</strong>
-
-      <span v-if="running" class="meta">
-        <b>{{ fpsShown }}</b> fps
-      </span>
-
       <!-- 录制状态：只留一个圆点 + 是否在录。分片数、磁盘占用这些是给排查用的
            内部数字，对用户没有意义，所以不再展示（需要时看服务日志或导出按钮）。 -->
       <span
-        v-if="activeLive"
         class="meta rec"
-        :class="{ bad: activeLive.recordFailed, off: !activeLive.recording }"
+        :class="{ bad: activeLive && activeLive.recordFailed, off: !activeLive || !activeLive.recording }"
         :title="recordTitle"
       >
         <span class="recdot" />
-        {{ activeLive.recording ? '录制中' : activeLive.recordFailed ? '录制失败' : '未录制' }}
+        {{ activeLive && activeLive.recording ? '录制中' : activeLive && activeLive.recordFailed ? '录制失败' : '未录制' }}
+      </span>
+
+      <span v-if="running" class="meta">
+        <b>{{ fpsShown }}</b> fps
       </span>
 
       <span class="spacer" />
@@ -42,9 +38,6 @@
       >
         <span class="svcdot" />
         服务运行中
-        <em v-if="live.profilesMismatch">（配置不同）</em>
-        <em v-else-if="live.source === 'file'">（状态文件）</em>
-        <em v-else-if="!live.owned">（外部）</em>
       </span>
       <span v-else class="meta warn" :title="serviceStatusTitle">服务未启动</span>
 
@@ -94,6 +87,22 @@
             </span>
           </label>
 
+          <label class="row row-inline">
+            <span class="row-label">点击关闭窗口时的行为</span>
+            <span class="row-ctl">
+              <select
+                :value="closeBehaviorDraft ?? 'ask'"
+                :disabled="settingsSaving"
+                class="row-select"
+                @change="onCloseBehaviorChange"
+              >
+                <option value="ask">每次询问</option>
+                <option value="minimize">最小化到托盘</option>
+                <option value="quit">退出程序</option>
+              </select>
+            </span>
+          </label>
+
           <!-- 重启服务：改了 native 代码、或者服务状态不对劲时用它。
                分片留在磁盘上不会丢，重启后会接着录（回放窗口是滚动覆盖的）。
                守护进程会把服务拉回来，所以就算重启失败也不用手动去命令行起。 -->
@@ -131,7 +140,7 @@
                放远一点，手滑点到的不会是它 -->
           <span class="head-btns">
             <button class="mini" :disabled="!selectedProfile || saving" @click="startEdit()">
-              {{ editing ? '编辑中' : '编辑' }}
+              <span class="pencil" aria-hidden="true">✏️</span>{{ editing ? '编辑中' : '编辑' }}
             </button>
             <button class="mini" :disabled="saving" @click="addProfile">＋ 新建</button>
           </span>
@@ -638,6 +647,11 @@ const selectedLive = computed(() => activeLive.value)
  */
 const staleReason = computed<{ title: string; detail: string } | null>(() => {
   if (waitingService.value || fatal.value) return null
+  // 选中的配置被左侧开关关掉了：直接盖 NO SIGNAL，不等服务端把 state 切到
+  // disabled。否则服务端回执之前的几百毫秒里画面会定格在最后一帧，像卡死。
+  if (selectedProfile.value && !selectedProfile.value.enabled) {
+    return { title: '当前配置没有画面', detail: '该配置已停用，打开左侧开关即恢复录制。' }
+  }
   const l = activeLive.value
   if (!l) return null
   // 服务不在报状态时（崩了 / 卡住 / 被杀了），手里这份 live 是**过期**的：
@@ -689,7 +703,7 @@ const selectedExport = computed(() =>
  * 队列对用户是不可见的：点了就是"导出中…"，不管现在是真在导还是排在前一路
  * 后面。把"排队中"露出来只会让人以为卡住了、或者以为自己点错了地方。
  */
-const exportButtonText = computed(() => (selectedExport.value ? '导出中…' : '导出回放'))
+const exportButtonText = computed(() => (selectedExport.value ? '保存中…' : '保存'))
 
 const canExport = computed(() => {
   const s = activeLive.value
@@ -779,9 +793,9 @@ const serviceStatusTitle = computed(() => {
     }
     if (l.source === 'file') {
       const age = l.mirrorAgeMs === null ? '刚刚' : `${(l.mirrorAgeMs / 1000).toFixed(1)} 秒前`
-      return `服务在运行（不是本界面启动的，状态来自状态文件，${age}更新）\n${file}`
+      return `服务在运行（不是本界面启动的，${age}更新）\n${file}`
     }
-    if (!l.owned) return `服务在运行（外部启动，状态来自它的输出）\n${file}`
+    if (!l.owned) return `服务在运行（外部启动）\n${file}`
     return '服务在运行（本界面启动，状态来自它的输出）'
   }
   return `没有读到服务状态。\n状态文件：${file}`
@@ -794,7 +808,7 @@ const serviceStatusTitle = computed(() => {
 onMounted(() => {
   const pp = api() as {
     onPreviewFps?: (cb: (fps: number) => void) => () => void
-    getSettings?: () => Promise<{ ok: boolean; settings?: { previewMaxFps: number } }>
+    getSettings?: () => Promise<{ ok: boolean; settings?: { previewMaxFps: number; closeBehavior?: 'minimize' | 'quit' | null } }>
   }
   const off = pp?.onPreviewFps?.((fps) => {
     if (typeof fps === 'number' && Number.isFinite(fps)) previewMaxFps.value = fps
@@ -813,6 +827,9 @@ onMounted(() => {
       const res = (await pp?.getSettings?.()) ?? null
       const fps = res?.settings?.previewMaxFps
       if (typeof fps === 'number' && Number.isFinite(fps)) previewMaxFps.value = fps
+      const cb = res?.settings?.closeBehavior
+      if (cb === 'minimize' || cb === 'quit') closeBehavior.value = cb
+      else closeBehavior.value = null
     } catch {
       /* 主进程还没就绪，保持默认值 */
     }
@@ -858,6 +875,13 @@ const previewStepIndex = computed(() => {
 const previewMaxFpsDraft = ref(60)
 
 /**
+ * 点窗口「×」时的行为：'minimize'（最小化到托盘）| 'quit'（退出程序）。
+ * null = 还没选过，第一次叉掉会弹窗问一次（带「下次不再提示」）。
+ */
+const closeBehavior = ref<'minimize' | 'quit' | null>(null)
+const closeBehaviorDraft = ref<'minimize' | 'quit' | null>(null)
+
+/**
  * 帧率硬上限：120fps。录制与预览共用这一个数，后端
  * `MfEncoder::kMaxFps` 也是 120（老配置里手写的 240 会被它夹回来）。
  *
@@ -890,19 +914,36 @@ function onPreviewStepInput(e: Event) {
   previewMaxFpsDraft.value = previewFpsSteps.value[i] ?? 0
 }
 
+/** 关闭行为下拉：'ask' 只存在于界面（= 还没选过），落盘前转成 null。 */
+function onCloseBehaviorChange(e: Event) {
+  const el = e.target as HTMLSelectElement | null
+  if (!el) return
+  const v = el.value
+  closeBehaviorDraft.value = v === 'ask' ? null : (v as 'minimize' | 'quit')
+}
+
 async function openSettings() {
   settingsError.value = ''
   previewMaxFpsDraft.value = previewMaxFps.value
+  closeBehaviorDraft.value = closeBehavior.value
   settingsOpen.value = true
   // 打开时再问一次主进程：设置文件可能被手动改过，也可能主进程这边还记着
   // 一个界面没收到过的值。
   try {
-    const res = (await (api() as { getSettings?: () => Promise<{ ok: boolean; settings?: { previewMaxFps: number } }> })
+    const res = (await (api() as { getSettings?: () => Promise<{ ok: boolean; settings?: { previewMaxFps: number; closeBehavior?: 'minimize' | 'quit' | null } }> })
       ?.getSettings?.()) ?? null
     const fps = res?.settings?.previewMaxFps
     if (typeof fps === 'number') {
       previewMaxFps.value = fps
       previewMaxFpsDraft.value = fps
+    }
+    const cb = res?.settings?.closeBehavior
+    if (cb === 'minimize' || cb === 'quit') {
+      closeBehavior.value = cb
+      closeBehaviorDraft.value = cb
+    } else {
+      closeBehavior.value = null
+      closeBehaviorDraft.value = null
     }
   } catch {
     /* 读不到就用内存里的值，不影响保存 */
@@ -921,13 +962,14 @@ async function saveSettings() {
   settingsError.value = ''
   try {
     const res = (await (
-      api() as { setSettings?: (p: { previewMaxFps: number }) => Promise<{ ok: boolean; error?: string; applied?: boolean }> }
-    )?.setSettings?.({ previewMaxFps: fps })) ?? null
+      api() as { setSettings?: (p: { previewMaxFps: number; closeBehavior: 'minimize' | 'quit' | null }) => Promise<{ ok: boolean; error?: string; applied?: boolean }> }
+    )?.setSettings?.({ previewMaxFps: fps, closeBehavior: closeBehaviorDraft.value })) ?? null
     if (!res || !res.ok) {
       settingsError.value = res?.error ?? '保存失败：界面版本和服务对不上。'
       return false
     }
     previewMaxFps.value = fps
+    closeBehavior.value = closeBehaviorDraft.value
     // 主人要的是"点确认就关"：不再弹一句"已生效"再等半秒，成功即关。
     // 真失败（res.ok 为假）才留在弹窗里显示错误，让人能重试。
     settingsOpen.value = false
@@ -1772,11 +1814,6 @@ async function launchService() {
 }
 
 // ---- 其它 -----------------------------------------------------------------
-const statusClass = computed(() => {
-  if (fatal.value) return 'bad'
-  if (running.value && stats.value.rendered > 0) return 'ok'
-  return 'wait'
-})
 
 // ---- 顶栏帧率显示 ---------------------------------------------------------
 //
@@ -1882,11 +1919,6 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid #1b2231;
 }
 
-.name {
-  font-size: 12.5px;
-  font-weight: 600;
-}
-
 .meta {
   color: #7c879b;
   font-size: 12px;
@@ -1941,7 +1973,7 @@ onBeforeUnmount(() => {
   animation: pulse 1.6s ease-in-out infinite;
 }
 .rec.off .recdot {
-  background: #48526a;
+  background: #e0a83c;
   box-shadow: none;
   animation: none;
 }
@@ -2043,6 +2075,9 @@ onBeforeUnmount(() => {
 }
 
 .sheet-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
   padding: 16px;
   overflow: auto;
 }
@@ -2073,6 +2108,13 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 10px;
 }
+/* 设置页里 label 和控件并排的行（关闭行为下拉），跟"重启服务"行风格一致 */
+.row-inline {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
 .row-label {
   display: block;
   color: #cdd6e8;
@@ -2102,6 +2144,21 @@ onBeforeUnmount(() => {
   text-align: right;
   color: #9fd0ff;
   font-variant-numeric: tabular-nums;
+}
+.row-select {
+  flex: 0 0 auto;
+  min-width: 150px;
+  padding: 5px 8px;
+  border: 1px solid #2a3550;
+  border-radius: 5px;
+  background: #1a2130;
+  color: #cdd6e8;
+  font-size: 12px;
+  cursor: pointer;
+}
+.row-select:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 
@@ -2173,25 +2230,6 @@ onBeforeUnmount(() => {
   margin-top: 4px;
   padding-top: 12px;
   border-top: 1px solid #232c42;
-}
-
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #48526a;
-  flex: 0 0 auto;
-}
-.dot.ok {
-  background: #35d07f;
-  box-shadow: 0 0 8px #35d07f88;
-}
-.dot.wait {
-  background: #e0a83c;
-  box-shadow: 0 0 8px #e0a83c88;
-}
-.dot.bad {
-  background: #ef5350;
 }
 
 .retry,
@@ -2309,6 +2347,10 @@ onBeforeUnmount(() => {
 .mini:disabled {
   opacity: 0.5;
   cursor: default;
+}
+.mini .pencil {
+  margin-right: 4px;
+  font-size: 11px;
 }
 .mini.wide {
   width: 100%;

@@ -246,6 +246,10 @@ const DEFAULT_SETTINGS = {
   // **只管预览**：录制照旧按每路配置的帧率喂编码器，导出也照旧按配置帧率，
   // 这个值对成片没有任何影响。
   previewMaxFps: 60,
+
+  // 点窗口右上角「×」时的行为。可选 'minimize'（最小化到托盘）| 'quit'（退出）。
+  // undefined = 还没选过，第一次叉掉时弹窗问一次（带「下次不再提示」）。
+  closeBehavior: undefined,
 }
 
 function settingsPath() {
@@ -267,6 +271,12 @@ function loadSettings() {
     // 夹到 0..MAX_FPS：0 表示不限，负数/NaN/离谱的大数都当没填。
     // 上限跟录制侧一致（120）—— 预览再高也没有更多新帧可画。
     if (Number.isFinite(fps)) out.previewMaxFps = Math.max(0, Math.min(MAX_FPS, Math.round(fps)))
+    // 关闭行为只认两个合法值；别的（包括缺省）一律 undefined = 还没选过。
+    if (raw.closeBehavior === 'minimize' || raw.closeBehavior === 'quit') {
+      out.closeBehavior = raw.closeBehavior
+    } else {
+      out.closeBehavior = undefined
+    }
   }
   return out
 }
@@ -278,6 +288,15 @@ function saveSettings(patch) {
     if (patch.previewMaxFps !== undefined) {
       const fps = Number(patch.previewMaxFps)
       if (Number.isFinite(fps)) next.previewMaxFps = Math.max(0, Math.min(MAX_FPS, Math.round(fps)))
+    }
+    if (patch.closeBehavior !== undefined) {
+      if (patch.closeBehavior === 'minimize' || patch.closeBehavior === 'quit') {
+        next.closeBehavior = patch.closeBehavior
+      } else if (patch.closeBehavior === null) {
+        // 显式传 null = 用户选了「每次询问」，清掉已记住的行为。
+        next.closeBehavior = undefined
+      }
+      // 传了别的非法值就忽略；不传（undefined）表示"保持现状"。
     }
   }
   try {
@@ -1464,6 +1483,16 @@ function listMonitors() {
 // ---------------------------------------------------------------------------
 let mainWindow = null
 
+// 是否正在「真的退出」（app.quit / 托盘退出 / 服务退出 / 用户已选好关闭行为）。
+// 为 true 时 close 事件不再拦截。这个标志只在"这次关闭是被允许的"时才置位，
+// 弹窗「取消」绝不动它 —— 上一版把它和弹窗流程纠缠在一起，出现了"点取消
+// 界面也退、点最小化服务也退"的连锁 bug。
+let isQuitting = false
+
+// 是否正在等用户回答"关闭窗口后怎么做"的弹窗。弹窗期间窗口的 close 请求可能
+// 重入（用户又点一次 × / Alt+F4），用这个挡住重入，避免弹窗叠弹窗。
+let closePromptOpen = false
+
 /**
  * 界面产物缺失时自己补一次构建。
  *
@@ -1515,7 +1544,7 @@ function createWindow() {
     backgroundColor: '#07090f',
     show: true,
     autoHideMenuBar: true,
-    title: 'ShadowPlay 预览',
+    title: '即时重放',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       // contextIsolation 必须关掉。
@@ -1539,6 +1568,38 @@ function createWindow() {
       sandbox: false,
       backgroundThrottling: false,
     },
+  })
+
+  // 点「×」时：按设置决定是「只退界面（服务继续录）」还是「连服务一起退」；
+  // 没设置过就弹窗问一次。
+  //
+  // 为什么在这里拦而不是交给 window-all-closed：window-all-closed 是「所有
+  // 窗口都关了」之后才触发，那时候窗口已经没了，想先停服务再退也来不及 ——
+  // 只能在这里 preventDefault() 掉真正的关闭，先把服务停干净。
+  mainWindow.on('close', (e) => {
+    // 真退出 / 用户已经选好「最小化到托盘」：放行。
+    if (isQuitting) return
+
+    const behavior = loadSettings().closeBehavior
+
+    // 「最小化到托盘」= 只退界面，服务继续录。直接放行（不 preventDefault），
+    // 窗口正常关 → window-all-closed → app.quit()，服务 detached 不受影响。
+    if (behavior === 'minimize') return
+
+    // 下面两种情况都要先拦下来：退出程序要先停服务；未设置要弹窗问。
+    e.preventDefault()
+
+    // 弹窗还没关（用户上次点的 × 正在等回答），这次 × 直接忽略，别叠弹窗。
+    if (closePromptOpen) return
+
+    if (behavior === 'quit') {
+      // 已选「退出程序」：先优雅停掉采集服务，再退界面。
+      void quitEverything()
+      return
+    }
+
+    // 还没选过：弹窗问一次，带「下次不再提示」。
+    void promptCloseBehavior()
   })
 
   mainWindow.on('closed', () => {
@@ -1756,8 +1817,98 @@ function showMainWindow() {
   }
 }
 
+/**
+ * 「退出程序」= 界面 + 采集服务一起退出。
+ *
+ * 先优雅停掉采集服务（stopServiceGracefully：立哨兵 → 管道发 shutdown →
+ * 等服务把当前分片 Finalize → 超时才强杀），服务停了之后才关界面。
+ */
+async function quitEverything() {
+  // 防止重复触发（close 事件里已经挡了 closePromptOpen，这里再挡一层）。
+  if (isQuitting) return
+  try {
+    await stopServiceGracefully()
+  } catch (err) {
+    log('[quit] 停服失败，仍继续退出界面：', err?.message ?? err)
+  }
+  isQuitting = true
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close()
+    else app.quit()
+  } catch {
+    app.quit()
+  }
+}
+
+/**
+ * 第一次点「×」时弹窗问：最小化到托盘（只退界面），还是退出程序（连服务一起退）。
+ *
+ * 勾了「下次不再提示」就把选择写进 settings.json 的 closeBehavior，之后点
+ * 「×」直接按记住的行为走，不再弹。
+ *
+ * 用**异步** showMessageBox（不是 Sync）：Sync 版本在 close 事件（已
+ * preventDefault）里跑，会重入消息循环，实测会引发"点取消界面也退"的连锁 bug。
+ * 异步版把选择放到下一个事件循环里处理，close 事件回调干净返回。
+ */
+async function promptCloseBehavior() {
+  const w = mainWindow
+  if (!w || w.isDestroyed()) {
+    isQuitting = true
+    app.quit()
+    return
+  }
+  if (closePromptOpen) return
+  closePromptOpen = true
+
+  try {
+    // 对话框是主进程模态，先把它临时提到最前，确保不会被别的窗口挡住。
+    showMainWindow()
+
+    const choice = await dialog.showMessageBox(w, {
+      type: 'question',
+      title: '关闭窗口',
+      message: '关闭窗口后你想怎么做？',
+      detail:
+        '最小化到托盘：关闭界面，录制继续在后台进行。\n' +
+        '退出程序：界面和采集服务一起退出，录制停止。',
+      buttons: ['最小化到托盘', '退出程序', '取消'],
+      defaultId: 0,
+      cancelId: 2,
+      checkboxLabel: '下次不再提示',
+      checkboxChecked: false,
+      noLink: true,
+    })
+
+    // 取消（点按钮 2 / 按 Esc / 点对话框 ×）：什么都不做，窗口继续开着。
+    if (choice.response === 2) return
+
+    const remember = choice.checkboxChecked
+    const behavior = choice.response === 0 ? 'minimize' : 'quit'
+    if (remember) {
+      // 勾了「下次不再提示」才落盘；没勾就保持"未设置"，下次还问。
+      saveSettings({ closeBehavior: behavior })
+    }
+
+    if (behavior === 'minimize') {
+      // 只退界面：放行关闭（服务继续）。
+      isQuitting = true
+      try {
+        w.close()
+      } catch {
+        app.quit()
+      }
+    } else {
+      // 连服务一起退。
+      void quitEverything()
+    }
+  } finally {
+    closePromptOpen = false
+  }
+}
+
 /** 服务请求退出：走正常退出路径（close → window-all-closed → app.quit）。 */
 function shutdownFromService() {
+  isQuitting = true
   try {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.close()
@@ -2980,6 +3131,12 @@ if (!app.requestSingleInstanceLock()) {
     // 采集服务是 detached 的常驻进程：界面退出**不**停服、不杀它。
     // 停服走界面里的「停止采集服务」或 npm run service:stop。
     app.quit()
+  })
+
+  // 任何"真的退出"都会先经过 before-quit：在这里把标志立起来，保证随后的
+  // close 事件不再拦截（否则"最小化到托盘"会把退出流程也拦掉）。
+  app.on('before-quit', () => {
+    isQuitting = true
   })
 
   // 退出时摘掉自己的 pid 文件：托盘下次点击才知道"界面已经不在了，该拉一个"。
