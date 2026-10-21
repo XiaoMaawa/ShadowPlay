@@ -60,10 +60,10 @@
     </div>
 
     <!-- 设置弹窗 ------------------------------------------------------------
-         点击遮罩或右上角 × 关闭；Esc 也能关（见 settingsKeydown）。
+         右上角 × 关闭；Esc 也能关（见 settingsKeydown）。点击框外不关闭（防误触）。
          刻意做成"覆盖层"而不是新窗口：新开 BrowserWindow 要另写一份 preload
          和 IPC，为一个滑杆不值当。 -->
-    <div v-if="settingsOpen" class="sheet-mask" @click.self="closeSettings">
+    <div v-if="settingsOpen" class="sheet-mask">
       <div class="sheet" role="dialog" aria-modal="true" aria-label="设置">
         <div class="sheet-head">
           <strong>设置</strong>
@@ -140,7 +140,13 @@
                放远一点，手滑点到的不会是它 -->
           <span class="head-btns">
             <button class="mini" :disabled="!selectedProfile || saving" @click="startEdit()">
-              <span class="pencil" aria-hidden="true">✏️</span>{{ editing ? '编辑中' : '编辑' }}
+              <svg class="pencil" viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168l10-10zM11.207 2.5 13.5 4.793 12.5 5.793 10.207 3.5l1-1zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293l6.5-6.5zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325z"
+                  fill="currentColor"
+                />
+              </svg>
+              {{ editing ? '编辑中' : '编辑' }}
             </button>
             <button class="mini" :disabled="saving" @click="addProfile">＋ 新建</button>
           </span>
@@ -210,7 +216,7 @@
 
       <!-- 编辑弹窗：参数单独一个窗口调。侧栏只留列表和"当前配置"，
            列表一多也不会把编辑表单顶到视野外 -->
-      <div v-if="editing && (selectedProfile || editingNew)" class="sheet-mask editor-mask" @click.self="cancelEdit">
+      <div v-if="editing && (selectedProfile || editingNew)" class="sheet-mask editor-mask">
         <div class="sheet editor-sheet" role="dialog" aria-modal="true">
           <div class="sheet-head">
             <strong>{{ editingNew ? '新建配置' : '编辑配置' }}</strong>
@@ -2349,8 +2355,10 @@ onBeforeUnmount(() => {
   cursor: default;
 }
 .mini .pencil {
+  width: 11px;
+  height: 11px;
   margin-right: 4px;
-  font-size: 11px;
+  vertical-align: -1px;
 }
 .mini.wide {
   width: 100%;

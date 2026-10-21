@@ -15,48 +15,14 @@
         "wgc": true
       },
       "video": {
-        "fps": 120,
-        "bitrateMbps": 10,
+        "fps": 60,
+        "bitrateMbps": 25,
         "replaySeconds": 20,
         "segmentSeconds": 2,
         "scaleWidth": 0,
         "scaleHeight": 0
       },
       "createdAt": "2026-01-01T00:00:00.000Z"
-    },
-    {
-      "id": "p-tftolk",
-      "num": 2,
-      "name": "配置 2",
-      "enabled": true,
-      "source": {
-        "kind": "window",
-        "monitorIndex": 0,
-        "clientAreaOnly": false,
-        "wgc": true
-      },
-      "video": {
-        "fps": 60,
-        "bitrateMbps": 20,
-        "replaySeconds": 120,
-        "segmentSeconds": 2,
-        "scaleWidth": 0,
-        "scaleHeight": 0
-      },
-      "createdAt": "2026-10-21T18:44:40.229Z",
-      "match": {
-        "rule": "title+process",
-        "by": "title",
-        "mode": "contains",
-        "pattern": "Ailee《像初雪一样靠近你（《孤单又灿烂的神－鬼怪O.S.T ",
-        "pick": "largest",
-        "pollMs": 1000,
-        "requireVisible": true,
-        "title": "Ailee《像初雪一样靠近你（《孤单又灿烂的神－鬼怪O.S.T ",
-        "className": "Chrome_WidgetWin_1",
-        "process": "哔哩哔哩.exe",
-        "hwnd": 42339004
-      }
     }
   ]
 }
