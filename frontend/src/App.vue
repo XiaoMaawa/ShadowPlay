@@ -146,9 +146,9 @@
         <div class="sheet-foot">
           <span v-if="settingsError" class="sheet-err">{{ settingsError }}</span>
           <span class="spacer" />
-          <button class="sheet-btn primary" :disabled="settingsSaving" @click="saveSettings">
-            {{ settingsSaving ? '保存中…' : '确认' }}
-          </button>
+          <button class="sheet-btn" :disabled="settingsSaving" @click="saveSettings">应用</button>
+          <button class="sheet-btn primary" :disabled="settingsSaving" @click="confirmSettings">确定</button>
+          <button class="sheet-btn" :disabled="settingsSaving" @click="closeSettings">取消</button>
         </div>
       </div>
     </div>
@@ -384,23 +384,24 @@
                    同一个开关摆两处只会让人搞不清哪次点击才算数。 -->
 
               <div class="actions">
-                <button type="submit" class="primary" :disabled="saving">
-                  {{ saving ? '保存中…' : editingNew ? '确定' : '保存' }}
-                </button>
-                <button type="button" class="mini" @click="cancelEdit">取消</button>
                 <!-- 删除：删的是**这一路配置**，已录好的分片不动（那是用户的素材）。
-                     放在最右边，跟保存/取消拉开距离，免得手滑点到。
+                     放在左下角，跟右边的保存/取消拉开距离，免得手滑点到。
                      新建模式没有这一路可删，不显示。 -->
                 <button
                   v-if="!editingNew"
                   type="button"
-                  class="mini danger"
+                  class="sheet-btn danger"
                   :disabled="deleting"
                   :title="`删除配置「${selectedProfile?.name || selectedProfile?.id}」`"
                   @click="deleteProfile"
                 >
                   {{ deleting ? '删除中…' : '删除' }}
                 </button>
+                <span class="spacer" />
+                <button type="submit" class="primary" :disabled="saving">
+                  {{ editingNew ? '确定' : '保存' }}
+                </button>
+                <button type="button" class="sheet-btn" @click="cancelEdit">取消</button>
               </div>
               <p v-if="saveError" class="bad">{{ saveError }}</p>
               <p v-if="saveNotice" class="hint">{{ saveNotice }}</p>
@@ -1014,6 +1015,7 @@ function closeSettings() {
   settingsOpen.value = false
 }
 
+// 只保存，不关弹窗（「应用」按钮）。成功返回 true，失败把错误留在弹窗里。
 async function saveSettings() {
   const fps = normaliseFps(previewMaxFpsDraft.value)
   previewMaxFpsDraft.value = fps
@@ -1030,9 +1032,6 @@ async function saveSettings() {
     previewMaxFps.value = fps
     closeBehavior.value = closeBehaviorDraft.value
     continueAfterSave.value = continueAfterSaveDraft.value
-    // 主人要的是"点确认就关"：不再弹一句"已生效"再等半秒，成功即关。
-    // 真失败（res.ok 为假）才留在弹窗里显示错误，让人能重试。
-    settingsOpen.value = false
     return true
   } catch (err) {
     settingsError.value = `保存出错：${(err as Error).message}`
@@ -1040,6 +1039,12 @@ async function saveSettings() {
   } finally {
     settingsSaving.value = false
   }
+}
+
+// 保存并关闭（「确定」按钮）。保存失败就不关，让人能看到错误重试。
+async function confirmSettings() {
+  const ok = await saveSettings()
+  if (ok) settingsOpen.value = false
 }
 
 // ---- 重启采集服务 ---------------------------------------------------------
@@ -2318,7 +2323,9 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 .sheet-btn {
-  padding: 5px 14px;
+  flex: 0 0 auto;
+  min-width: 56px;
+  padding: 4px 12px;
   border: 1px solid #2a3550;
   border-radius: 5px;
   background: #1a2130;
@@ -2330,6 +2337,9 @@ onBeforeUnmount(() => {
   border-color: #3a4a6d;
 }
 .sheet-btn.primary {
+  /* 文件后面有个通用的 .primary（flex:1 1 auto，给编辑面板的动作条用的），
+     会把这里的确定按钮撑满整行 —— 明确盖回去，三个按钮保持一样宽。 */
+  flex: 0 0 auto;
   background: #1c4e80;
   border-color: #2b6cb0;
   color: #fff;
@@ -2723,8 +2733,11 @@ onBeforeUnmount(() => {
   margin-top: 2px;
 }
 .primary {
-  flex: 1 1 auto;
-  padding: 5px 10px;
+  /* 和设置弹窗的按钮统一大小：不自动撑满、同样的内边距和最小宽度。
+     （启动服务那条全宽按钮在 .overlay-actions .primary 里单独用 width:100% 拉伸。） */
+  flex: 0 0 auto;
+  min-width: 56px;
+  padding: 4px 12px;
   border: 1px solid #2b6cb0;
   border-radius: 4px;
   background: #1c4e80;
