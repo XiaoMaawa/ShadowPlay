@@ -103,6 +103,28 @@
             </span>
           </label>
 
+          <!-- 「从上次保存处继续」：改变"保存"的内容范围（录制照常滚动，不受影响）。
+               开关样式复用侧栏那套 CSS 画出来的滑块，两处长得一样用户才不会愣。 -->
+          <div class="row">
+            <span class="row-label">
+              从上次保存处继续
+              <em class="row-hint">
+                打开后，每次保存都会把那一刻当作新的起点：下次保存只包含这之后录到的画面。
+              </em>
+            </span>
+            <span class="row-ctl">
+              <label class="switch" title="从上次保存处继续">
+                <input
+                  type="checkbox"
+                  :checked="continueAfterSaveDraft"
+                  :disabled="settingsSaving"
+                  @change="onContinueChange"
+                />
+                <span class="switch-track"><span class="switch-knob" /></span>
+              </label>
+            </span>
+          </div>
+
           <!-- 重启服务：改了 native 代码、或者服务状态不对劲时用它。
                分片留在磁盘上不会丢，重启后会接着录（回放窗口是滚动覆盖的）。
                守护进程会把服务拉回来，所以就算重启失败也不用手动去命令行起。 -->
@@ -899,6 +921,16 @@ const closeBehavior = ref<'minimize' | 'quit' | null>(null)
 const closeBehaviorDraft = ref<'minimize' | 'quit' | null>(null)
 
 /**
+ * 「从上次保存处继续」。
+ *
+ * 打开后每次成功保存都会把那一刻记成新起点：下次保存只包含这之后录到的
+ * 画面，也不再补 NO SIGNAL —— 录到多少就存多少，不足设定的回放时长就短一些。
+ * 关闭时（默认）每次保存都是完整的回放窗口。
+ */
+const continueAfterSave = ref(false)
+const continueAfterSaveDraft = ref(false)
+
+/**
  * 帧率硬上限：120fps。录制与预览共用这一个数，后端
  * `MfEncoder::kMaxFps` 也是 120（老配置里手写的 240 会被它夹回来）。
  *
@@ -939,15 +971,23 @@ function onCloseBehaviorChange(e: Event) {
   closeBehaviorDraft.value = v === 'ask' ? null : (v as 'minimize' | 'quit')
 }
 
+/** 「从上次保存处继续」开关：checkbox 的勾选状态进草稿（点确认才落盘）。 */
+function onContinueChange(e: Event) {
+  const el = e.target as HTMLInputElement | null
+  if (!el) return
+  continueAfterSaveDraft.value = el.checked
+}
+
 async function openSettings() {
   settingsError.value = ''
   previewMaxFpsDraft.value = previewMaxFps.value
   closeBehaviorDraft.value = closeBehavior.value
+  continueAfterSaveDraft.value = continueAfterSave.value
   settingsOpen.value = true
   // 打开时再问一次主进程：设置文件可能被手动改过，也可能主进程这边还记着
   // 一个界面没收到过的值。
   try {
-    const res = (await (api() as { getSettings?: () => Promise<{ ok: boolean; settings?: { previewMaxFps: number; closeBehavior?: 'minimize' | 'quit' | null } }> })
+    const res = (await (api() as { getSettings?: () => Promise<{ ok: boolean; settings?: { previewMaxFps: number; closeBehavior?: 'minimize' | 'quit' | null; continueAfterSave?: boolean } }> })
       ?.getSettings?.()) ?? null
     const fps = res?.settings?.previewMaxFps
     if (typeof fps === 'number') {
@@ -962,6 +1002,8 @@ async function openSettings() {
       closeBehavior.value = null
       closeBehaviorDraft.value = null
     }
+    continueAfterSave.value = res?.settings?.continueAfterSave === true
+    continueAfterSaveDraft.value = continueAfterSave.value
   } catch {
     /* 读不到就用内存里的值，不影响保存 */
   }
@@ -979,14 +1021,15 @@ async function saveSettings() {
   settingsError.value = ''
   try {
     const res = (await (
-      api() as { setSettings?: (p: { previewMaxFps: number; closeBehavior: 'minimize' | 'quit' | null }) => Promise<{ ok: boolean; error?: string; applied?: boolean }> }
-    )?.setSettings?.({ previewMaxFps: fps, closeBehavior: closeBehaviorDraft.value })) ?? null
+      api() as { setSettings?: (p: { previewMaxFps: number; closeBehavior: 'minimize' | 'quit' | null; continueAfterSave: boolean }) => Promise<{ ok: boolean; error?: string; applied?: boolean }> }
+    )?.setSettings?.({ previewMaxFps: fps, closeBehavior: closeBehaviorDraft.value, continueAfterSave: continueAfterSaveDraft.value })) ?? null
     if (!res || !res.ok) {
       settingsError.value = res?.error ?? '保存失败：界面版本和服务对不上。'
       return false
     }
     previewMaxFps.value = fps
     closeBehavior.value = closeBehaviorDraft.value
+    continueAfterSave.value = continueAfterSaveDraft.value
     // 主人要的是"点确认就关"：不再弹一句"已生效"再等半秒，成功即关。
     // 真失败（res.ok 为假）才留在弹窗里显示错误，让人能重试。
     settingsOpen.value = false

@@ -250,6 +250,10 @@ const DEFAULT_SETTINGS = {
   // 点窗口右上角「×」时的行为。可选 'minimize'（最小化到托盘）| 'quit'（退出）。
   // undefined = 还没选过，第一次叉掉时弹窗问一次（带「下次不再提示」）。
   closeBehavior: undefined,
+
+  // 「从上次保存处继续」：打开后每次成功导出都会记下那一刻，下一次导出只
+  // 包含这之后录到的画面，也不再补 NO SIGNAL —— 录到多少就存多少。
+  continueAfterSave: false,
 }
 
 function settingsPath() {
@@ -277,6 +281,8 @@ function loadSettings() {
     } else {
       out.closeBehavior = undefined
     }
+    // 布尔开关只认 true，其它一律回到默认的 false。
+    out.continueAfterSave = raw.continueAfterSave === true
   }
   return out
 }
@@ -298,6 +304,9 @@ function saveSettings(patch) {
       }
       // 传了别的非法值就忽略；不传（undefined）表示"保持现状"。
     }
+    if (patch.continueAfterSave !== undefined) {
+      next.continueAfterSave = patch.continueAfterSave === true
+    }
   }
   try {
     mkdirSync(path.dirname(settingsPath()), { recursive: true })
@@ -306,6 +315,42 @@ function saveSettings(patch) {
     return { ok: false, error: `写入设置失败：${err.message}` }
   }
   return { ok: true, settings: next }
+}
+
+// ---------------------------------------------------------------------------
+// 「从上次保存处继续」的切点记录（settings.json 同目录的 export-cuts.json）
+//
+// 每次导出**成功**后记下"点击保存那一刻"的毫秒墙钟，按 profile id 各记一份。
+// 下一次导出时把它作为窗口起点传给导出模块，之前的内容就都不要了。
+//
+// 为什么单独一个小文件而不是塞进 profiles.json：切点是**运行状态**（随每次
+// 导出变），配置是**用户数据**（用户编辑才变），混在一起会让用户每导出一次
+// 配置文件就变一次，diff 全是噪音。放临时目录：丢了无非是"下次导出回到
+// 完整回放窗口"这个默认行为，不值得进仓库。
+// ---------------------------------------------------------------------------
+const EXPORT_CUTS_FILE = path.join(TEMP.root, 'export-cuts.json')
+
+function loadExportCuts() {
+  try {
+    if (!existsSync(EXPORT_CUTS_FILE)) return {}
+    const raw = JSON.parse(readFileSync(EXPORT_CUTS_FILE, 'utf8'))
+    return raw && typeof raw === 'object' ? raw : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveExportCut(id, ms) {
+  if (!id || !Number.isFinite(ms) || ms <= 0) return
+  const cuts = loadExportCuts()
+  cuts[id] = Math.round(ms)
+  try {
+    mkdirSync(path.dirname(EXPORT_CUTS_FILE), { recursive: true })
+    writeFileSync(EXPORT_CUTS_FILE, JSON.stringify(cuts, null, 2), 'utf8')
+  } catch (err) {
+    // 记不上切点只影响"下次从哪开始"，导出本身已经成功，别把它当失败。
+    logErr(`[export] 记录保存切点失败（${id}）：${err.message}`)
+  }
 }
 
 let serviceChild = null
@@ -1143,7 +1188,30 @@ async function runExportJob(job) {
     // 单片标称时长：导出要靠它判"最后一片写完了没"。不传就按 2 秒，而配置里
     // 这个值能改 —— 改大了会把完整的 2 秒片误判成半片丢掉，成品就短一截。
     const segSecs = Math.round(Number(profile.video?.segmentSeconds) || 0) || 2
-    const res = addon.exportStart(segmentsDir, exportDir, prefix, maxSeconds, wantFps, segSecs)
+
+    // 「从上次保存处继续」：设置打开且这一路记过切点时，把切点（上次成功保存
+    // 的点击时刻）作为窗口起点传下去。导出端据此锚定窗口、不补 NO SIGNAL，
+    // 之前录的内容一概不要。没记过切点（从来没有保存过）就照常按回放时长导。
+    //
+    // 切点在**每次导出成功后**都更新成这次的点击时刻 —— 不管开关现在开没开。
+    // 这是为了"开了开关后的第一次保存就生效"：用户先保存、再打开开关、再保存，
+    // 第二次保存的起点就应该是第一次保存那一刻，而不是要等到第三次。
+    // 导出失败不推进切点，失败那次的中间内容不会丢。
+    const clickedAt = Date.now()
+    let startUnixMs = 0
+    if (loadSettings().continueAfterSave) {
+      const cut = Number(loadExportCuts()[id]) || 0
+      if (cut > 0 && cut < clickedAt) startUnixMs = cut
+    }
+    const res = addon.exportStart(
+      segmentsDir,
+      exportDir,
+      prefix,
+      maxSeconds,
+      wantFps,
+      segSecs,
+      startUnixMs,
+    )
     if (!res?.ok) {
       failJob(res?.error ?? '导出没能开始。')
       return
@@ -1181,6 +1249,9 @@ async function runExportJob(job) {
     if (st.ok) {
       const mb = ((st.bytes ?? 0) / 1024 / 1024).toFixed(1)
       log(`[export] ${id} 完成：${st.outPath}（${(st.durationSeconds ?? 0).toFixed(1)} 秒 / ${mb} MB）`)
+      // 成功了就把切点推到这次点击的时刻。**无条件记**：开关关着的时候也记，
+      // 这样之后哪天把开关打开，起点就是"最近一次保存"，第一次保存就生效。
+      saveExportCut(id, clickedAt)
     } else {
       logErr(`[export] ${id} 失败：${st.detail ?? '原因不明'}`)
     }
@@ -2257,6 +2328,10 @@ function registerIpc() {
   ipcMain.handle('settings:set', async (_evt, patch) => {
     const saved = saveSettings(patch)
     if (!saved.ok) return saved
+
+    // 切点（export-cuts.json）在这里**不清**：每次导出成功都会无条件记切点，
+    // 所以把开关打开的那一刻，起点天然就是"最近一次保存"—— 开关后的第一次
+    // 保存就生效，不用等到第三次。
 
     // 立刻让服务生效。
     //

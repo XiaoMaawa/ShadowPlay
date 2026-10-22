@@ -235,6 +235,16 @@ int32_t GetIntArg(napi_env env, napi_value value, int32_t fallback) {
     return v;
 }
 
+// 64 位毫秒时间戳（墙钟）用 double 传：JS 的 Number 在 2^53 内是精确的，
+// 毫秒墙钟 ~1.8e12，绰绰有余。fallback 0 = 参数没给 / 不是数字。
+double GetDoubleArg(napi_env env, napi_value value, double fallback) {
+    napi_valuetype t = napi_undefined;
+    if (napi_typeof(env, value, &t) != napi_ok || t != napi_number) return fallback;
+    double v = fallback;
+    if (napi_get_value_double(env, value, &v) != napi_ok) return fallback;
+    return v;
+}
+
 napi_value Undefined(napi_env env) {
     napi_value v = nullptr;
     napi_get_undefined(env, &v);
@@ -768,7 +778,7 @@ napi_value ExportStatusToJs(napi_env env, const shadow::ExportStatus& st) {
 }
 
 // ---------------------------------------------------------------------------
-// exportStart(segmentsDir, exportDir, prefix, maxSeconds, targetFps)
+// exportStart(segmentsDir, exportDir, prefix, maxSeconds, targetFps, segmentSeconds, startUnixMs)
 //   -> {ok, error?, jobId?}
 //
 // 只是**发起**。真正的进度/结果靠 exportStatus() 轮询 —— 一次导出要几百毫秒
@@ -789,8 +799,8 @@ napi_value ExportStatusToJs(napi_env env, const shadow::ExportStatus& st) {
 // targetFps <= 0 表示"保持源帧率"，零损失、最快。
 // ---------------------------------------------------------------------------
 napi_value ExportStart(napi_env env, napi_callback_info info) {
-    napi_value argv[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-    size_t argc = 6;
+    napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    size_t argc = 7;
     napi_value thisArg = nullptr;
     if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok) {
         return ThrowError(env, "exportStart 取参失败");
@@ -801,7 +811,7 @@ napi_value ExportStart(napi_env env, napi_callback_info info) {
         !GetStringArg(env, argv[1], exportDir)) {
         return ThrowError(env, "exportStart(segmentsDir: string, exportDir: string, "
                                "prefix?: string, maxSeconds?: number, targetFps?: number, "
-                               "segmentSeconds?: number)");
+                               "segmentSeconds?: number, startUnixMs?: number)");
     }
     if (argc >= 3 && !GetStringArg(env, argv[2], prefix)) prefix.clear();
     const int32_t maxSeconds = argc >= 4 ? GetIntArg(env, argv[3], 0) : 0;
@@ -810,6 +820,9 @@ napi_value ExportStart(napi_env env, napi_callback_info info) {
     // 单片标称时长。导出时要靠它判"最后一片写完了没" —— 不传的话默认 2 秒，
     // 而配置里这个值是可以改的，改大了就会把完整的 2 秒片误判成半片。（缺省 2）
     const int32_t segmentSeconds = argc >= 6 ? GetIntArg(env, argv[5], 2) : 2;
+    // 「从指定时刻起导」的窗口起点（毫秒墙钟，0 = 不用）。> 0 时窗口锚定在
+    // 它上面、不补任何 NO SIGNAL，成片时长 = 实际录到的内容时长。
+    const double startUnixMs = argc >= 7 ? GetDoubleArg(env, argv[6], 0) : 0;
 
     std::lock_guard<std::mutex> lk(g_exportMu);
 
@@ -846,7 +859,8 @@ napi_value ExportStart(napi_env env, napi_callback_info info) {
         segmentsDir, exportDir, prefix,
         maxSeconds > 0 ? static_cast<uint32_t>(maxSeconds) : 0u,
         targetFps > 0 ? static_cast<uint32_t>(targetFps) : 0u,
-        segmentSeconds > 0 ? static_cast<uint32_t>(segmentSeconds) : 2u);
+        segmentSeconds > 0 ? static_cast<uint32_t>(segmentSeconds) : 2u,
+        startUnixMs > 0 ? static_cast<uint64_t>(startUnixMs) : 0ull);
     if (!ex->Start()) {
         const shadow::ExportStatus st = ex->Status();
         napi_value out = nullptr;

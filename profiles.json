@@ -4,9 +4,30 @@
   "exportDir": "export",
   "profiles": [
     {
+      "id": "p-1rlt6j",
+      "num": 2,
+      "name": "显示器捕获",
+      "enabled": true,
+      "source": {
+        "kind": "monitor",
+        "monitorIndex": 0,
+        "clientAreaOnly": false,
+        "wgc": true
+      },
+      "video": {
+        "fps": 60,
+        "bitrateMbps": 20,
+        "replaySeconds": 120,
+        "segmentSeconds": 2,
+        "scaleWidth": 0,
+        "scaleHeight": 0
+      },
+      "createdAt": "2026-10-22T09:49:13.157Z"
+    },
+    {
       "id": "p-desk",
       "num": 1,
-      "name": "显示器捕获",
+      "name": "窗口捕获",
       "enabled": true,
       "source": {
         "kind": "window",
@@ -36,27 +57,6 @@
         "process": "explorer.exe",
         "hwnd": 4720522
       }
-    },
-    {
-      "id": "p-1rlt6j",
-      "num": 2,
-      "name": "配置 2",
-      "enabled": true,
-      "source": {
-        "kind": "monitor",
-        "monitorIndex": 0,
-        "clientAreaOnly": false,
-        "wgc": true
-      },
-      "video": {
-        "fps": 60,
-        "bitrateMbps": 20,
-        "replaySeconds": 120,
-        "segmentSeconds": 2,
-        "scaleWidth": 0,
-        "scaleHeight": 0
-      },
-      "createdAt": "2026-10-22T09:49:13.157Z"
     }
   ]
 }

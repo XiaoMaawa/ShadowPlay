@@ -826,7 +826,8 @@ std::string ReplayFileName(const std::string& prefix, const std::string& stamp) 
 // ---------------------------------------------------------------------------
 
 Exporter::Exporter(std::string segmentsDir, std::string exportDir, std::string prefix,
-                   uint32_t maxSeconds, uint32_t targetFps, uint32_t segmentSeconds)
+                   uint32_t maxSeconds, uint32_t targetFps, uint32_t segmentSeconds,
+                   uint64_t startUnixMs)
     : segmentsDir_(std::move(segmentsDir)),
       // 展开 `%TEMP%` 这类占位符。
       //
@@ -844,7 +845,8 @@ Exporter::Exporter(std::string segmentsDir, std::string exportDir, std::string p
       targetFps_(targetFps > MfEncoder::kMaxFps ? MfEncoder::kMaxFps : targetFps),
       // 分片时长夹到合理区间：0 或者离谱的值都按 2 秒处理，否则"最后一片够
       // 不够长"那个判据就失去意义了。
-      segmentSeconds_(segmentSeconds >= 1u && segmentSeconds <= 60u ? segmentSeconds : 2u) {}
+      segmentSeconds_(segmentSeconds >= 1u && segmentSeconds <= 60u ? segmentSeconds : 2u),
+      startUnixMs_(startUnixMs) {}
 
 Exporter::~Exporter() {
     // 析构时如果还在导，等它自己收尾（强杀线程会让临时目录留在磁盘上）。
@@ -924,7 +926,9 @@ bool Exporter::CaptureSnapshot() {
     // 十几毫秒），那就不是"立刻"了。这里只需要一个**宽松**的边界：多留几片
     // 无所谓，精确裁剪留到隔离副本上做（那时已经是定格的东西，慢慢算不要紧）。
     // 少留才是错的 —— 所以余量给到 4 片。
-    if (maxSeconds_ > 0) {
+    if (maxSeconds_ > 0 || startUnixMs_ > 0) {
+        // 「从指定时刻起导」：窗口起点是锚定的墙钟，不再用 maxSeconds 往回数。
+        // 粗筛边界同样是 startSec 往前留 4 片余量 —— 多留无害，计划器会裁。
         double latestStart = 0.0;
         for (const SegmentFile& s : live) {
             const double st = StartWallSec(s);
@@ -934,7 +938,9 @@ bool Exporter::CaptureSnapshot() {
             const double nominal =
                 static_cast<double>(segmentSeconds_ > 0 ? segmentSeconds_ : 2u);
             const double earliest =
-                (latestStart + nominal) - (static_cast<double>(maxSeconds_) + nominal * 4.0 + 2.0);
+                startUnixMs_ > 0
+                    ? (static_cast<double>(startUnixMs_) / 1000.0) - nominal * 4.0 - 2.0
+                    : (latestStart + nominal) - (static_cast<double>(maxSeconds_) + nominal * 4.0 + 2.0);
             live.erase(std::remove_if(live.begin(), live.end(),
                                       [&](const SegmentFile& s) {
                                           const double st = StartWallSec(s);
@@ -942,7 +948,9 @@ bool Exporter::CaptureSnapshot() {
                                       }),
                        live.end());
             if (live.empty()) {
-                return giveUp("回放窗口内的分片都已经过期了（目录里只有更早录制的内容）。");
+                return giveUp(startUnixMs_ > 0
+                                  ? "上次保存之后还没有录到新的画面，无可导出的内容。"
+                                  : "回放窗口内的分片都已经过期了（目录里只有更早录制的内容）。");
             }
         }
     }
@@ -1263,7 +1271,18 @@ void Exporter::Run() {
         }
     }
     const double cutoffEnd = (newestEnd > 0.0 && newestEnd < nowUnix) ? newestEnd : nowUnix;
-    const double windowSec = maxSeconds_ > 0 ? static_cast<double>(maxSeconds_) : 0.0;
+    // 「从指定时刻起导」：窗口左端锚定在给定的墙钟上，右端就是内容时间轴的
+    // 最新位置 —— 窗口跨度因此是"实际录到的时长"，不再由 maxSeconds 决定。
+    // 中间隔着停录的空档也照算（那一截在计划器里直接跳过，不补 NO SIGNAL）。
+    const bool   fromCut = startUnixMs_ > 0;
+    const double cutSec   = static_cast<double>(startUnixMs_) / 1000.0;
+    const double windowSec = fromCut ? (cutoffEnd - cutSec)
+                                     : (maxSeconds_ > 0 ? static_cast<double>(maxSeconds_) : 0.0);
+    if (fromCut && windowSec < 0.05) {
+        MfRelease();
+        fail("上次保存之后还没有录到新的画面，无可导出的内容。");
+        return;
+    }
     if (windowSec > 0) {
         // 留两个分片的余量：最后一片的结尾是"起点 + 标称时长"的粗估，边界上
         // 多留一点，比少留导致回放短一截好。
@@ -1277,7 +1296,8 @@ void Exporter::Run() {
                    segs.end());
         if (segs.empty()) {
             MfRelease();
-            fail("回放窗口内的分片都已经过期了（目录里只有更早录制的内容）。");
+            fail(fromCut ? "上次保存之后还没有录到新的画面，无可导出的内容。"
+                         : "回放窗口内的分片都已经过期了（目录里只有更早录制的内容）。");
             return;
         }
     }
@@ -1322,7 +1342,9 @@ void Exporter::Run() {
     // 现在：按每片**真实时长**从最后一片往前累加，累到 maxSeconds 就停。
     // 片长用 ProbeSegment 问（这里已经要逐片探一次，成本可接受），拿不到
     // 时长时退回标称值 —— 只影响"多留半片"，不会误删。
-    if (maxSeconds_ > 0) {
+    // 「从指定时刻起导」不走这一步：上面 1b 已经把起点之前的分片裁掉了，
+    // 剩下的都是窗口内（或跨着窗口起点）的片，全部保留交给计划器裁剪。
+    if (maxSeconds_ > 0 && !fromCut) {
         const double want = static_cast<double>(maxSeconds_);
         const double nominal = static_cast<double>(segmentSeconds_);
         // 多留一片的余量：窗口起点通常落在某片中间，那一片得整片留着让
@@ -1556,8 +1578,11 @@ void Exporter::Run() {
         //
         // 用墙钟算，但有墙钟信息才敢用：老数据第四列是 0，只能退回"总共差
         // 多少"全堆片头（那时候没有更好的信息）。
+        // 「从指定时刻起导」的语义：只锚定窗口**起点**，终点是录到的最新一刻；
+        // 片头缺口、中间断录、片尾不足一律**不补**（用户明确要求），成片有多长
+        // 算多长。所以下面四处和"补齐"相关的逻辑都要让路。
         double lead = 0.0;
-        if (maxSeconds_ > 0) {
+        if (maxSeconds_ > 0 && !fromCut) {
             if (segs.front().startUnixMs > 0) {
                 const double windowStart = axisNow - windowSec;
                 lead = StartWallSec(segs.front()) - windowStart;
@@ -1571,12 +1596,14 @@ void Exporter::Run() {
 
         // 按"成品必须正好 maxSeconds 秒"铺时间轴。maxSeconds_ == 0（不限时长，
         // 预览/调试用）时退化成"把每片原样接上"，不补也不裁。
-        if (maxSeconds_ <= 0) {
+        if (maxSeconds_ <= 0 && !fromCut) {
             for (size_t si = 0; si < copies.size(); ++si) {
                 plan.push_back(PlanItem{false, si, 0.0, 0.0});
             }
         } else {
-            const double want = static_cast<double>(maxSeconds_);
+            // fromCut：不设上限（1e18 当"无穷大"用），每一片铺完为止。
+            const double want =
+                fromCut ? 1e18 : static_cast<double>(maxSeconds_);
             double placedSec = 0.0;
             for (const PlanItem& item : plan) {
                 placedSec += item.noSignal ? item.seconds : 0.0;
@@ -1589,7 +1616,7 @@ void Exporter::Run() {
             // 掉了前面）prevEndWall 就是 0，于是第一片的墙钟起点 1792…410 被
             // 当成"距离 0 点有十七亿秒的空档"，一个遮罩项吃满 20 秒，计划里
             // 再没有真实分片，导出报「分片里读不到任何可用的视频帧」。
-            const double windowStart = axisNow - windowSec;
+            const double windowStart = fromCut ? cutSec : (axisNow - windowSec);
             double prevEndWall = windowStart + lead;
             bool havePrevEnd = segs.front().startUnixMs > 0;
 
@@ -1606,7 +1633,8 @@ void Exporter::Run() {
                     segStartWall = prevEndWall;
                 }
 
-                if (havePrevEnd && segStartWall > prevEndWall) {
+                // fromCut 模式连"长缺口补遮罩"都不要：中间断录就是画面直接跳过去。
+                if (!fromCut && havePrevEnd && segStartWall > prevEndWall) {
                     const double gap = segStartWall - prevEndWall;
                     // 【门槛以下的小缺口怎么办：不补，直接把下一片接上】
                     // 尺寸每变一次就切一片，片可以短到 4 帧（kTransientFrames），
@@ -1657,7 +1685,8 @@ void Exporter::Run() {
             //
             // 真实场景：槽位轮转把最早那几片覆盖掉了（磁盘上只剩 14 秒），
             // 或者服务刚起来还没录满。不补这一段，用户设 20 秒只拿到 13 秒。
-            if (placedSec < want - 0.02) {
+            // fromCut 模式例外：录到多少算多少，绝不补。
+            if (!fromCut && placedSec < want - 0.02) {
                 plan.push_back(PlanItem{true, 0, want - placedSec, 0.0});
             }
         }

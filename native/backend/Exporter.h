@@ -76,8 +76,17 @@ void SetExporterPlanLog(std::function<void(const std::string&)> sink);
 
 class Exporter {
 public:
+    // startUnixMs：「从指定墙钟时刻起导」模式的窗口起点（毫秒，0 = 关闭）。
+    //
+    // 这是「接着上次保存继续」功能的导出端：界面在每次成功导出后记下那一刻，
+    // 下一次导出把它传进来，导出窗口就**锚定在这个时刻**而不是"往回数
+    // maxSeconds"。此模式下：
+    //   * maxSeconds 不参与（窗口右端 = 内容时间轴的最新位置）；
+    //   * 不补任何 NO SIGNAL —— 片头缺口、中间断录的缝、片尾不足，全都原样
+    //     留着，录到多少就导多少，成片因此可能比设置的回放时长短。
     Exporter(std::string segmentsDir, std::string exportDir, std::string prefix,
-             uint32_t maxSeconds, uint32_t targetFps = 0, uint32_t segmentSeconds = 2);
+             uint32_t maxSeconds, uint32_t targetFps = 0, uint32_t segmentSeconds = 2,
+             uint64_t startUnixMs = 0);
     ~Exporter();
 
     Exporter(const Exporter&) = delete;
@@ -133,6 +142,8 @@ private:
     // 以前靠 mtime 猜，把刚切完、其实完整的 2 秒整片也丢掉，于是 20 秒的缓冲
     // 导出来只有 18 秒 —— 用户报的"少两秒"就是它。
     uint32_t    segmentSeconds_ = 2;
+    // 「从指定时刻起导」模式的窗口起点（毫秒墙钟，0 = 不用这个模式）。见 ctor 注释。
+    uint64_t    startUnixMs_ = 0;
 
     mutable std::mutex mu_;
     ExportStatus       status_;
