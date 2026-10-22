@@ -142,6 +142,13 @@ export function usePreview() {
   /** 上一次渲染过的 version（sequence lock 的版本号） */
   let lastCounter = -1n
   /**
+   * 预览帧率上限（设置里的「预览画面最大帧率」，App.vue 通过 setMaxFps 喂进来）。
+   * 0 = 不限，照旧"有新帧就画"。
+   */
+  let maxPreviewFps = 0
+  /** 下一个允许绘制的时刻（performance.now 时间轴上的游标），配合 maxPreviewFps 限流 */
+  let nextDrawAt = 0
+  /**
    * 上一次**真正上传进纹理**的那个槽号。
    *
    * 服务端说"这一帧和上一帧像素一样"时，只有槽号也没变才敢跳过上传 ——
@@ -606,6 +613,25 @@ export function usePreview() {
     if (counters.syncVersion === 0n || counters.syncVersion === lastCounter) {
       skipNoNewFrame++
       return
+    }
+
+    // ---- 预览帧率上限 ---------------------------------------------------
+    // 设置里的「预览画面最大帧率」在这里生效：没到下一个允许时刻就先不画。
+    // 关键在于**不动 lastCounter** —— 这一帧仍然是"新帧"，下一轮 rAF 时刻
+    // 一到就画它，只是绘制密度被压到上限以内，帧序列不丢。
+    //
+    // 【为什么用时间轴游标而不是"距上次绘制 ≥ 间隔"】后者每次都要在 rAF 的
+    // 节拍上（高刷屏 ~4ms 一格）多等平均半个格子，长期平均只有 ~58fps，
+    // 永远差一点跑不满。前者（nextDrawAt 每次严格 +间隔）长期平均正好等于
+    // 上限，抖动被摊平；落后超过一个间隔就重置到当前时刻，避免无帧一段
+    // 时间后连发超过上限。
+    if (maxPreviewFps > 0) {
+      const now = performance.now()
+      if (now < nextDrawAt) {
+        skipNoNewFrame++
+        return
+      }
+      nextDrawAt = Math.max(nextDrawAt + 1000 / maxPreviewFps, now)
     }
 
     const frame: FrameInfo | null = readPublishedFrame(current, info)
@@ -1165,5 +1191,9 @@ export function usePreview() {
     reportStats,
     setupHistory,
     getHistory,
+    /** 设置「预览画面最大帧率」。<=0 或非法值 = 不限。 */
+    setMaxFps(n: number) {
+      maxPreviewFps = Number.isFinite(n) && n > 0 ? n : 0
+    },
   }
 }

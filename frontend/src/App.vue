@@ -458,7 +458,7 @@ import { startServiceBus, stopServiceBus, useServiceBus, clearExportNotice } fro
 // 只借它的类型：`recordActualText()` 的入参要跟服务状态那张表对上。
 import type { SessionLive } from '@/lib/serviceBus'
 
-const { canvas, running, fatal, waitingService, serviceHint, stats, start, stop, retry, switchSession, fpsOf, seedLedgerFromService, reportStats, setupHistory, getHistory } =
+const { canvas, running, fatal, waitingService, serviceHint, stats, start, stop, retry, switchSession, seedLedgerFromService, reportStats, setupHistory, getHistory, setMaxFps } =
   usePreview()
 
 const { live, lastExport, exportStates } = useServiceBus()
@@ -883,6 +883,10 @@ const settingsError = ref('')
 
 /** 当前生效的预览帧率上限（0 = 不限）。启动时从主进程读一次。 */
 const previewMaxFps = ref(60)
+
+// 「预览画面最大帧率」真正生效的地方：设置一变（含启动时从磁盘读回）就喂给
+// 预览循环（usePreview）做抽样限流。0 = 不限。
+watch(previewMaxFps, (v) => setMaxFps(v), { immediate: true })
 
 /**
  * 预览帧率滑杆可停的位置。
@@ -1947,23 +1951,14 @@ async function launchService() {
 
 // ---- 顶栏帧率显示 ---------------------------------------------------------
 //
-// 显示的是**录制实测帧率**（服务端每秒上报的 actualFps），不是预览渲染帧率。
+// 显示的是**预览真实绘制的帧率**（渲染循环里按中位数平滑过的实测值）。
 //
-// 【为什么要改】以前这里显示 fpsOf() —— 那是页面**预览**实际画出来的帧率。
-// 预览帧率被服务端按"面板大小"做限流（面板大就发全分辨率、顺带把帧率收到 60），
-// 于是"设置 120fps 录制"的显示器源，顶栏却显示 60 甚至更低；一旦面板宽度在
-// 砍半/不砍半的临界点附近抖动，预览帧率就在 60↔120 之间乱跳，用户看着就像
-// "录制的帧率坏了、随机掉"。
-//
-// 真相是录制一直稳稳跑在 120（actualFps 从未掉），乱跳的只是预览的**显示帧率**。
-// 顶栏这个数字该回答"我设置的录制帧率到底跑没跑到"，所以改读 actualFps。
-// 预览帧率仍可从 stats.renderFpsShown 拿到，只是不再占顶栏这个最显眼的位置。
-const fpsShown = computed(() => {
-  const a = selectedLive.value?.actualFps
-  if (typeof a === 'number' && Number.isFinite(a) && a > 0) return Math.round(a)
-  // 服务还没上报（刚连上）：退回预览账本垫一下，避免显示 0
-  return Math.round(fpsOf(selectedId.value))
-})
+// 【历史】这里先后放过两个值：最早是预览帧率（当时被服务端按面板大小限流，
+// 会乱跳，看着像录制坏了）；后来换成录制实测 actualFps —— 但用户设了预览
+// 上限 60 后顶栏仍显示 120，觉得数字不对。现在回到预览真实帧率：这个位置
+// 的数字就是"你眼睛看到的画面每秒刷了多少帧"，预览限流一开它就跟着掉。
+// 录制帧率不受预览影响，想看录制跑没跑到目标，看导出视频/侧栏配置即可。
+const fpsShown = computed(() => Math.round(stats.value.renderFpsShown || 0))
 
 function describeSource(p: Profile): string {
   if (p.source.kind === 'desktop') return '整屏桌面'

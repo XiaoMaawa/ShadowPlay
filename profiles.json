@@ -36,7 +36,7 @@
         "wgc": true
       },
       "video": {
-        "fps": 15,
+        "fps": 120,
         "bitrateMbps": 25,
         "replaySeconds": 20,
         "segmentSeconds": 2,
