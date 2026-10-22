@@ -619,6 +619,16 @@ const api = {
     return ipcRenderer.invoke('service:delete-profile', { id })
   },
 
+  /**
+   * 调整配置顺序（侧栏拖拽换位）。
+   *
+   * 只把排好的 id 顺序发过去，主进程按它重排磁盘上的列表；每一路的内容
+   * 原样保留，服务也不用 reload（录制行为和顺序无关）。
+   */
+  reorderProfiles(ids) {
+    return ipcRenderer.invoke('service:reorder-profiles', { ids })
+  },
+
   /** 配置文档（主进程会补齐缺省值，界面拿到的就是服务真正会用的那份） */
   serviceProfiles() {
     return ipcRenderer.invoke('service:profiles')

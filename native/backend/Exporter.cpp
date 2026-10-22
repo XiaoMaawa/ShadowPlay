@@ -32,22 +32,29 @@
 
 #include <windows.h>
 #include <codecapi.h>
+#include <d3d11.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "EnvPath.h"    // ExpandEnv：导出目录里的 %TEMP% 这类占位符
@@ -89,6 +96,170 @@ void LogExportPlan(const std::string& text) {
     if (!sink) return;
     sink("{\"type\":\"export_plan\",\"detail\":\"" + JsonEscape(text) + "\"}");
 }
+
+/** 解码线程交给主线程的一帧 NV12 裸帧（紧密排布 Y + UV）。 */
+struct DecodedFrame {
+    size_t slot = 0; // 解码任务序号（对应 segQueues 的键）
+    LONGLONG ts100ns = 0;
+    uint32_t srcW = 0, srcH = 0;
+    uint32_t contentW = 0, contentH = 0;
+    bool segEnd = false; // 本片结束标记（下一帧起属于另一片）
+    bool segOk = false;  // 本片 SourceReader 是否正常工作
+    // NV12 全帧，紧密排布（Y + UV）。用裸 new[] 而不是 vector：
+    // vector::resize 每帧先把 5.5MB 清零再被 memcpy 覆盖，纯浪费。
+    std::unique_ptr<uint8_t[]> pixels;
+};
+
+/**
+ * 异步 SourceReader 的分片解码回调。
+ *
+ * 【为什么用异步而不是同步 ReadSample】同步 SourceReader 的解码管线在本机
+ * 实测是一条 ~150 帧/s 的串行流水（i9-13900H 上 1440p 一帧 6ms 出头，两个
+ * 线程各开一个 reader 总吞吐纹丝不动）。异步回调路径走 MF 的多线程工作
+ * 队列，两个 reader 的解码任务可以真正落在线程池的不同线程上。
+ *
+ * 帧像素在回调线程里拷成紧密 NV12 再交给 emit（背压由 emit 自己控制，
+ * 允许它阻塞 —— 只会拖慢本片的解码管线，不影响别的 reader）。
+ */
+struct SegDecodeCb : IMFSourceReaderCallback {
+    SegDecodeCb(size_t slot, IMFSourceReader* reader, uint32_t w, uint32_t h, uint32_t cw,
+                uint32_t ch)
+        : slot_(slot), reader_(reader), srcW_(w), srcH_(h), contentW_(cw), contentH_(ch) {}
+
+    // 由 decodeWorker 注入：推一帧（false = 让解码管线停下），以及片尾通知。
+    std::function<bool(DecodedFrame&&)> emit;
+    std::function<void(bool ok)> finish;
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++ref_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG r = --ref_;
+        if (r == 0) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (!out) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IMFSourceReaderCallback) {
+            *out = static_cast<IMFSourceReaderCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnReadSample(HRESULT hrStatus, DWORD /*streamIndex*/,
+                                           DWORD flags, LONGLONG ts,
+                                           IMFSample* sample) override {
+        if (FAILED(hrStatus)) {
+            finish(false);
+            return S_OK;
+        }
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+            finish(true);
+            return S_OK;
+        }
+        bool wantStop = false;
+        if (sample && emit) {
+            // 锁像素：优先 2D 锁拿真实行距，退回连续缓冲。
+            const uint8_t* srcY = nullptr;
+            LONG srcPitch = static_cast<LONG>(srcW_);
+            IMF2DBuffer* mbuf2d = nullptr;
+            IMFMediaBuffer* mbuf = nullptr;
+            bool locked2d = false;
+            bool locked1d = false;
+            if (SUCCEEDED(sample->QueryInterface(IID_PPV_ARGS(&mbuf2d))) && mbuf2d) {
+                BYTE* scan0 = nullptr;
+                LONG pitch = 0;
+                if (SUCCEEDED(mbuf2d->Lock2D(&scan0, &pitch)) && scan0) {
+                    srcY = scan0;
+                    srcPitch = pitch;
+                    locked2d = true;
+                } else {
+                    mbuf2d->Release();
+                    mbuf2d = nullptr;
+                }
+            }
+            BYTE* lockedBytes = nullptr;
+            if (!locked2d) {
+                if (SUCCEEDED(sample->ConvertToContiguousBuffer(&mbuf)) && mbuf) {
+                    if (SUCCEEDED(mbuf->QueryInterface(IID_PPV_ARGS(&mbuf2d))) && mbuf2d) {
+                        BYTE* scan0 = nullptr;
+                        LONG pitch = 0;
+                        if (SUCCEEDED(mbuf2d->Lock2D(&scan0, &pitch)) && scan0) {
+                            srcY = scan0;
+                            srcPitch = pitch;
+                            locked2d = true;
+                        } else {
+                            mbuf2d->Release();
+                            mbuf2d = nullptr;
+                        }
+                    }
+                    if (!locked2d && SUCCEEDED(mbuf->Lock(&lockedBytes, nullptr, nullptr)) &&
+                        lockedBytes) {
+                        srcY = lockedBytes;
+                        srcPitch = static_cast<LONG>(srcW_);
+                        locked1d = true;
+                    }
+                }
+            }
+            if (srcY) {
+                // NV12：UV 平面紧跟 Y 平面，行数 = 高度/2，行宽 = 宽度字节。
+                const uint8_t* srcUV = srcY + static_cast<size_t>(srcPitch) * srcH_;
+
+                DecodedFrame f;
+                f.slot = slot_;
+                f.ts100ns = ts;
+                f.srcW = srcW_;
+                f.srcH = srcH_;
+                f.contentW = contentW_;
+                f.contentH = contentH_;
+                const size_t frameBytes = static_cast<size_t>(srcW_) * srcH_ * 3u / 2u;
+                f.pixels.reset(new uint8_t[frameBytes]);
+                uint8_t* dst = f.pixels.get();
+                for (uint32_t y = 0; y < srcH_; ++y) {
+                    std::memcpy(dst + static_cast<size_t>(y) * srcW_,
+                                srcY + static_cast<size_t>(y) * srcPitch, srcW_);
+                }
+                for (uint32_t y = 0; y < srcH_ / 2u; ++y) {
+                    std::memcpy(dst + static_cast<size_t>(srcH_) * srcW_ +
+                                    static_cast<size_t>(y) * srcW_,
+                                srcUV + static_cast<size_t>(y) * srcPitch, srcW_);
+                }
+                wantStop = !emit(std::move(f));
+            }
+            if (locked2d) mbuf2d->Unlock2D();
+            else if (locked1d) mbuf->Unlock();
+            if (mbuf2d) mbuf2d->Release();
+            if (mbuf) mbuf->Release();
+            if (wantStop) {
+                // emit 说停（到点了 / 全局停）：按正常收尾处理，worker 会
+                // 等到 ctxDone 再放哨兵。
+                stop_.store(true);
+                finish(true);
+            }
+        }
+        // 类型协商握手（第一条样本前的 CURRENTMEDIATYPECHANGED）不是错误，
+        // 继续读下一帧。
+        if (!stop_.load()) {
+            reader_->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0,
+                                nullptr, nullptr, nullptr, nullptr);
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnFlush(DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnEvent(DWORD, IMFMediaEvent*) override { return S_OK; }
+
+    /** 异步 reader 建好（可能晚于回调对象）之后由 worker 调一次。 */
+    void AttachReader(IMFSourceReader* reader) { reader_ = reader; }
+
+  private:
+    virtual ~SegDecodeCb() = default;
+    size_t slot_ = 0;
+    IMFSourceReader* reader_ = nullptr; // 不持引用，reader 的生命周期归 worker
+    uint32_t srcW_ = 0, srcH_ = 0, contentW_ = 0, contentH_ = 0;
+    std::atomic<bool> stop_{false};
+    ULONG ref_ = 1;
+};
 
 } // namespace
 
@@ -144,15 +315,19 @@ const uint8_t* GlyphOf(char c) {
  * 用户要的补齐语义见 DESIGN.md 9.4：回放窗口内没有录到画面的那几段，用这张
  * 遮罩填满，保证导出的成品时长整好等于设置的回放秒数。
  *
- * 灰度按亮的一档给（0xE8）：太暗在深色视频里看不出来，纯白又刺眼。
+ * 画布是 NV12：黑 = Y 全 0x10、UV 全 0x80（等价 RGB 0,0,0）。
+ * 字用 Y=0xE8 的浅灰，UV 保持 0x80（中性灰度，等价 RGB 灰）。
  */
 void FillNoSignal(uint8_t* canvas, uint32_t width, uint32_t height, size_t pitch) {
     if (!canvas || width == 0 || height == 0) return;
 
     // 整块刷成纯黑。这一步每段 NO SIGNAL 只需要做一次（同一张画布复用）。
+    // Y 平面 height 行；UV 平面 height/2 行、行宽与 Y 相同（U、V 交错）。
     for (uint32_t y = 0; y < height; ++y) {
-        std::memset(canvas + static_cast<size_t>(y) * pitch, 0, static_cast<size_t>(width) * 4u);
+        std::memset(canvas + static_cast<size_t>(y) * pitch, 0x10, width);
     }
+    uint8_t* uvPlane = canvas + pitch * static_cast<size_t>(height);
+    std::memset(uvPlane, 0x80, pitch * static_cast<size_t>(height / 2u));
 
     constexpr char kText[] = "NO SIGNAL";
     constexpr uint32_t kChars = sizeof(kText) - 1;
@@ -170,8 +345,7 @@ void FillNoSignal(uint8_t* canvas, uint32_t width, uint32_t height, size_t pitch
     const uint32_t originX = (width - textW) / 2u;
     const uint32_t originY = (height - textH) / 2u;
 
-    // 字用 BGRA 的浅灰。写 4 字节（低 3 字节是 BGR），alpha 给 0xFF 无所谓
-    // —— 这张缓冲是送给编码器的原始像素，编码器不看 alpha。
+    // 字是灰度图案：只写 Y 平面（每像素 1 字节），UV 保持中性灰不动。
     constexpr uint8_t kTone = 0xE8;
 
     for (uint32_t ci = 0; ci < kChars; ++ci) {
@@ -188,11 +362,7 @@ void FillNoSignal(uint8_t* canvas, uint32_t width, uint32_t height, size_t pitch
                 for (uint32_t sy = 0; sy < scale; ++sy) {
                     uint8_t* row = canvas + static_cast<size_t>(py0 + sy) * pitch;
                     for (uint32_t sx = 0; sx < scale; ++sx) {
-                        uint8_t* p = row + static_cast<size_t>(px0 + sx) * 4u;
-                        p[0] = kTone;
-                        p[1] = kTone;
-                        p[2] = kTone;
-                        p[3] = 0xFF;
+                        row[px0 + sx] = kTone;
                     }
                 }
             }
@@ -887,6 +1057,19 @@ void Exporter::Run() {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
             .count();
     };
+
+    // 【别被调度进能效核】shadow-capture 是无窗口的后台进程，Windows 会给它
+    // 打 EcoQoS（能效核 + 降频）。实测导出解码只有 ~150 帧/s（i9-13900H 上
+    // 20 个逻辑核只等效跑出 5 个核的活）。显式退出节流并把导出线程提到高
+    // 优先级，几十秒的吞吐活没必要省这点电。
+    {
+        PROCESS_POWER_THROTTLING_STATE st{};
+        st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        st.StateMask = 0; // 0 = 不允许被节流
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof(st));
+    }
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
     std::string tmpDir;
 
@@ -1607,10 +1790,17 @@ void Exporter::Run() {
         // （见 um\mfreadwrite.h 的说明），不开的话 SinkWriter 只挑微软软件编码器
         // mfh264enc.dll。录制端 MfEncoder 早就开了它，导出端一直漏着 ——
         // 2560x1440@144 的 20 秒成片纯 CPU 软编要跑十几秒，而 GPU 上只要 1 秒左右。
+        //
+        // 【DISABLE_THROTTLING 只给直拷开】重编码路径开了它反而是减速：
+        // WriteSample 不再等编码器，主线程把 2400 帧瞬间全堆进 SinkWriter
+        // 的内部队列就跑完了，编码工作全部堆到 Finalize 串行清空（1440p
+        // NVENC 一帧 2ms 出头，2400 帧就是 5 秒多）—— 和解码流水线完全
+        // 不重叠。不开它，WriteSample 自然跟着编码器背压，编码与解码/
+        // 贴图三个阶段叠着跑，Finalize 只剩个尾巴。
         IMFAttributes* sinkAttrs = nullptr;
         if (SUCCEEDED(MFCreateAttributes(&sinkAttrs, 3))) {
             sinkAttrs->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
-            sinkAttrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
+            if (uniform) sinkAttrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
             sinkAttrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
         }
 
@@ -1911,12 +2101,16 @@ void Exporter::Run() {
 
             IMFMediaType* encIn = nullptr;
             MFCreateMediaType(&encIn);
+            // 【NV12 而不是 RGB32】GPU 编码器（NVENC 等）只吃 NV12。以前喂
+            // RGB32，MF 会在中间插一个**软件**色彩转换器（RGB32→NV12），
+            // 每帧全屏转一遍 —— 1440p@144 导 20 秒就是 2880 次全帧转换，
+            // 全压在 CPU 上，这是导出慢的大头之一。NV12 直进编码器，一步省掉。
             encIn->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-            encIn->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+            encIn->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
             encIn->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
             // 正 stride = 自上而下。不给这个属性，编码器会当成自下而上，画面
-            // 上下颠倒（MfEncoder 里踩过同一个坑）。
-            encIn->SetUINT32(MF_MT_DEFAULT_STRIDE, canvasW * 4u);
+            // 上下颠倒（MfEncoder 里踩过同一个坑）。NV12 每行 = 宽度字节。
+            encIn->SetUINT32(MF_MT_DEFAULT_STRIDE, canvasW);
             MFSetAttributeSize(encIn, MF_MT_FRAME_SIZE, canvasW, canvasH);
             MFSetAttributeRatio(encIn, MF_MT_FRAME_RATE, canvasFps, 1);
             MFSetAttributeRatio(encIn, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
@@ -1950,9 +2144,14 @@ void Exporter::Run() {
                 return;
             }
 
-            const size_t canvasPitch = static_cast<size_t>(canvasW) * 4u;
-            const size_t canvasBytes = canvasPitch * canvasH;
-            std::vector<uint8_t> canvas(canvasBytes, 0);
+            // NV12 画布：Y 平面（height 行）+ UV 平面（height/2 行，行宽与 Y
+            // 相同）。紧密排布，pitch = 宽度。黑底初始值：Y=0x10、UV=0x80。
+            const size_t canvasPitch = static_cast<size_t>(canvasW);
+            const size_t uvOffset = canvasPitch * static_cast<size_t>(canvasH);
+            const size_t canvasBytes =
+                uvOffset + canvasPitch * static_cast<size_t>(canvasH / 2u);
+            std::vector<uint8_t> canvas(canvasBytes, 0x10);
+            std::memset(canvas.data() + uvOffset, 0x80, canvasBytes - uvOffset);
 
             // 把画布当前内容作为一帧样本写出去。
             //
@@ -2024,6 +2223,244 @@ void Exporter::Run() {
 
             // 按计划走：真实分片段解码贴画布，NO SIGNAL 段铺遮罩。顺序就是
             // 墙钟顺序，所以成片里缺口出现在它真正发生的位置。
+            //
+            // 【两级流水线 + 双解码线程】以前解码（ReadSample）和写帧（贴画布
+            // + WriteSample）串在同一个线程里排队，总耗时 = 解码 + 编码之和。
+            // 现在：两个解码线程从任务游标里各领一片去解（软解 1440p 一帧
+            // 6ms 出头，单线程解 1800 帧就是 12 秒，是重编码导出的最大头；
+            // 两个线程轮着解，墙钟时间近乎减半），解出的 NV12 裸帧推进按片
+            // 分队列的缓冲区；主线程按计划顺序逐片取帧、贴画布、铺网格、
+            // 送编码器。总耗时压到 max(解码/2, 贴图+编码)。
+            // 多分辨率/混合帧率的行为**完全不变**：画布仍取窗口内最大尺寸，
+            // 帧仍按各自真实时间戳重采样到 canvasFps 网格（9.9.2）。
+            // DecodedFrame / SegDecodeCb 定义见文件顶部（匿名 namespace）。
+            // 解码任务：VIDEO 计划项按顺序编上 slot 号，解码线程从这里领活。
+            struct DecodeTask {
+                size_t slot = 0;
+                size_t si = 0; // copies 下标
+                double skipSec = 0.0, stopSec = 0.0;
+                uint32_t srcW = 0, srcH = 0, contentW = 0, contentH = 0, srcFps = 0;
+            };
+            std::vector<DecodeTask> tasks;
+            for (const PlanItem& item : plan) {
+                if (item.noSignal) continue; // NO SIGNAL 主线程自己铺
+                const size_t si = item.segIndex;
+                if (si >= copies.size() || !shapes[si].ok) continue;
+                DecodeTask t;
+                t.slot = tasks.size();
+                t.si = si;
+                t.skipSec = item.skipSec > 0 ? item.skipSec : 0.0;
+                const double takeSec = item.seconds > 0 ? item.seconds : 0.0;
+                t.stopSec = takeSec > 0 ? t.skipSec + takeSec : 0.0;
+                t.srcW = shapes[si].width;
+                t.srcH = shapes[si].height;
+                t.contentW = shapes[si].contentW;
+                t.contentH = shapes[si].contentH;
+                t.srcFps = shapes[si].fps ? shapes[si].fps : 60u;
+                tasks.push_back(t);
+            }
+
+            // 按片分队列：主线程消费第 N 片时，N+1、N+2 片可以同时在解。
+            // 每片自己限深（不设全局预算）：全局预算会被"解得快的线程把
+            // 后面的片塞满"占住，前面的片反而推不进、主线程又在等前面的
+            // 片 —— 三方死等。每片限深天然背压：解得快的线程会停在自己
+            // 那片上，不会越过主线程的进度囤内存（1440p 一帧 NV12 约
+            // 5.5MB，2 线程 × 3 帧 + 已完成片的存量，封顶百来 MB）。
+            constexpr size_t kPerSegQueueLimit = 3;
+            std::map<size_t, std::deque<DecodedFrame>> segQueues;
+            std::mutex decodeMtx;
+            std::condition_variable decodeCv;
+            size_t finishedSegs = 0;
+            std::atomic<bool> decodeStop{false};
+            std::atomic<size_t> nextTask{0};
+
+            auto pushDecoded = [&](size_t slot, DecodedFrame&& f) -> bool {
+                const bool isEnd = f.segEnd;
+                std::unique_lock<std::mutex> lk(decodeMtx);
+                decodeCv.wait(lk, [&] {
+                    const auto it = segQueues.find(slot);
+                    const size_t depth =
+                        it == segQueues.end() ? 0u : it->second.size();
+                    return decodeStop.load() || isEnd || depth < kPerSegQueueLimit;
+                });
+                if (decodeStop.load()) return false;
+                segQueues[slot].push_back(std::move(f));
+                if (isEnd) ++finishedSegs;
+                lk.unlock();
+                decodeCv.notify_all();
+                return true;
+            };
+
+            // 【GPU 解码：试过，弃用】给 reader 挂 D3D manager 走 NVDEC，
+            // 在本机与录制端（WGC + NVENC 同进程并发）会稳定卡死整条导出。
+            // 软解虽是 ~160 帧/s 的硬顶（异步/双线程都突破不了），但胜在稳：
+            // 1440p@120 的 20 秒重编码 ≈ 12s，低帧率/低分辨率场景成比例变快。
+            // 解码线程：从任务游标里原子领片，各解各的（SourceReader 等 MF
+            // 对象全部在本线程创建和释放，不跨线程共享；WriteSample 仍归主
+            // 线程 —— SinkWriter 不允许并发写）。线程数 2：软解是纯 CPU 活，
+            // 两个正好和编码/贴图流水线错开，再多就只是抢核。
+            auto decodeWorker = [&](int workerId) {
+                const auto decodeT0 = std::chrono::steady_clock::now();
+                uint64_t decodedFrames = 0;
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                // SourceReader 要求所在线程自己初始化 COM（主线程的不继承）。
+                const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                const bool comOk = SUCCEEDED(comHr);
+
+                // 建一个分片的异步 SourceReader：挂回调（异步路径）+ 挂
+                // D3D manager（GPU 解码，建不起来就软解）。
+                //
+                // 【不开 ADVANCED_VIDEO_PROCESSING】NV12 本来就是 H.264 解码
+                // 器的原生输出，开着它 MF 会在管线里插一级转换 MFT 白吃吞吐。
+                // 真协商不过就让本片按跳过处理。
+                for (;;) {
+                    if (decodeStop.load() || !comOk) break;
+                    const size_t ti = nextTask.fetch_add(1);
+                    if (ti >= tasks.size()) break;
+                    const DecodeTask& task = tasks[ti];
+                    const size_t si = task.si;
+
+                    const uint32_t srcW = task.srcW;
+                    const uint32_t srcH = task.srcH;
+                    // 真实画面尺寸 ≤ 文件帧尺寸。过渡期的分片文件比画面大
+                    // （右/下是补的黑边），贴画布时只取左上角这一块 —— 见
+                    // SegmentFile::contentW 的注释。
+                    const uint32_t contentW = task.contentW;
+                    const uint32_t contentH = task.contentH;
+                    const uint32_t srcFps = task.srcFps;
+
+                    // 窗口可能把这一片切在中间：跳过开头那截、到点就停。
+                    const double skipSec = task.skipSec;
+                    const double stopSec = task.stopSec;
+
+                    bool segFailed = false;
+                    // ---- 异步解码 ----
+                    // 像素拷贝与入队都在 MF 工作队列线程里做（SegDecodeCb），
+                    // worker 只建 reader、发第一次 ReadSample、等片完。
+                    // 异步路径走 MF 的多线程工作队列：两个 reader 的解码任务
+                    // 能真正落到池里不同的线程上（同步 ReadSample 实测是一条
+                    // ~150 帧/s 的进程内串行流水，双线程也并行不起来）。
+                    std::mutex ctxMu;
+                    std::condition_variable ctxCv;
+                    bool ctxDone = false;
+                    bool ctxOk = false;
+
+                    SegDecodeCb* cb =
+                        new SegDecodeCb(task.slot, nullptr, srcW, srcH, contentW, contentH);
+                    cb->emit = [&](DecodedFrame&& f) -> bool {
+                        if (decodeStop.load()) return false;
+                        // 被回放窗口切掉的头尾：按源样本时间戳（100ns）过滤。
+                        // 用 ts 而不是数帧号 —— 片子中间可能有 gap 样本。
+                        const double sampleSec =
+                            static_cast<double>(f.ts100ns) / 10000000.0;
+                        if (skipSec > 0.0 && sampleSec < skipSec - 1e-6) return true;
+                        if (stopSec > 0.0 && sampleSec >= stopSec - 1e-6) return false;
+                        ++decodedFrames;
+                        return pushDecoded(task.slot, std::move(f));
+                    };
+                    cb->finish = [&](bool ok) {
+                        {
+                            std::lock_guard<std::mutex> lk(ctxMu);
+                            ctxDone = true;
+                            ctxOk = ok;
+                        }
+                        ctxCv.notify_all();
+                    };
+
+                    IMFAttributes* cbAttrs = nullptr;
+                    IMFSourceReader* areader = nullptr;
+                    if (SUCCEEDED(MFCreateAttributes(&cbAttrs, 1))) {
+                        cbAttrs->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, cb);
+                    }
+                    HRESULT rhr = MFCreateSourceReaderFromURL(
+                        copies[si].wstring().c_str(), cbAttrs, &areader);
+                    if (cbAttrs) cbAttrs->Release();
+                    cb->Release(); // reader 持有回调的引用；本地这份用完即放
+
+                    bool opened = false;
+                    if (SUCCEEDED(rhr) && areader) {
+                        // 回调里要续读，把 reader 指针交给它。
+                        cb->AttachReader(areader);
+                        IMFMediaType* nvType = nullptr;
+                        MFCreateMediaType(&nvType);
+                        nvType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                        nvType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+                        MFSetAttributeSize(nvType, MF_MT_FRAME_SIZE, srcW, srcH);
+                        MFSetAttributeRatio(nvType, MF_MT_FRAME_RATE, srcFps, 1);
+                        MFSetAttributeRatio(nvType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+                        rhr = areader->SetCurrentMediaType(
+                            static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr,
+                            nvType);
+                        nvType->Release();
+                        opened = SUCCEEDED(rhr);
+                    }
+
+                    if (!opened) {
+                        // 打不开这片：主线程按"跳过本片"处理，别让队列错位。
+                        if (areader) areader->Release();
+                        DecodedFrame end;
+                        end.slot = task.slot;
+                        end.segEnd = true;
+                        end.segOk = false;
+                        if (!pushDecoded(task.slot, std::move(end))) break;
+                        continue;
+                    }
+
+                    // 发起第一次异步读，之后由回调自续直到 EOF / 到点 / 失败。
+                    rhr = areader->ReadSample(
+                        static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, nullptr,
+                        nullptr, nullptr, nullptr);
+                    if (FAILED(rhr)) {
+                        segFailed = true;
+                    } else {
+                        std::unique_lock<std::mutex> lk(ctxMu);
+                        ctxCv.wait(lk, [&] { return ctxDone || decodeStop.load(); });
+                        segFailed = !ctxOk;
+                    }
+
+                    areader->Release();
+
+                    // 片尾哨兵：告诉主线程这一片完了（下一帧属于另一片）。
+                    DecodedFrame end;
+                    end.slot = task.slot;
+                    end.segEnd = true;
+                    end.segOk = !segFailed;
+                    if (!pushDecoded(task.slot, std::move(end))) break;
+                }
+
+                const double decodeMs =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - decodeT0)
+                        .count();
+                LogExportPlan("reencode decode thread #" + std::to_string(workerId) + ": " +
+                              std::to_string(static_cast<int>(decodeMs)) + " ms, " +
+                              std::to_string(decodedFrames) + " frames");
+                if (comOk) CoUninitialize();
+            };
+
+            std::thread decodeThread0(decodeWorker, 0);
+            std::thread decodeThread1(decodeWorker, 1);
+            const auto planT0 = std::chrono::steady_clock::now();
+
+            auto popDecoded = [&](size_t slot, DecodedFrame& out) -> bool {
+                std::unique_lock<std::mutex> lk(decodeMtx);
+                decodeCv.wait(lk, [&] {
+                    const auto it = segQueues.find(slot);
+                    const bool has = it != segQueues.end() && !it->second.empty();
+                    // 这一片的队列暂时空：等它解出帧，或者全部片都解完了
+                    //（某片解不出帧时队列里只有哨兵，取走后就是空）。
+                    return has || finishedSegs == tasks.size() || decodeStop.load();
+                });
+                const auto it = segQueues.find(slot);
+                if (it == segQueues.end() || it->second.empty()) return false;
+                out = std::move(it->second.front());
+                it->second.pop_front();
+                lk.unlock();
+                decodeCv.notify_all(); // 唤醒解码线程继续往里填
+                return true;
+            };
+
+            size_t videoSlot = 0; // VIDEO 项序号计数，与 tasks 的构建规则一致
             for (const PlanItem& item : plan) {
                 if (!mergeErr.empty()) break;
 
@@ -2036,50 +2473,13 @@ void Exporter::Run() {
                 if (si >= copies.size()) continue;
                 if (!shapes[si].ok) continue;
 
-                const uint32_t srcW = shapes[si].width;
-                const uint32_t srcH = shapes[si].height;
-                // 真实画面尺寸 ≤ 文件帧尺寸。过渡期的分片文件比画面大
-                // （右/下是补的黑边），贴画布时只取左上角这一块 —— 见
-                // SegmentFile::contentW 的注释。
-                const uint32_t contentW = shapes[si].contentW;
-                const uint32_t contentH = shapes[si].contentH;
-                const uint32_t srcFps = shapes[si].fps ? shapes[si].fps : 60u;
+                // 这一帧在解码任务表里的序号。
+                const size_t slot = videoSlot++;
 
-                // 窗口可能把这一片切在中间：跳过开头那截、到点就停。
+                // 窗口切掉的头部已经在解码线程按时间戳滤掉了，这里只需要
+                // 它来算"这一帧在成品时间轴上的落点"。
                 const double skipSec = item.skipSec > 0 ? item.skipSec : 0.0;
                 const double takeSec = item.seconds > 0 ? item.seconds : 0.0;
-                const double stopSec = takeSec > 0 ? skipSec + takeSec : 0.0;
-
-                // 让 SourceReader 自己插解码器，并且要它输出 BGRA 而不是原生
-                // H.264：重编码这一路必须拿到像素才能贴到画布上。
-                IMFAttributes* readerAttrs = nullptr;
-                if (SUCCEEDED(MFCreateAttributes(&readerAttrs, 1))) {
-                    // 允许高级视频处理：H.264 → RGB32 的色彩转换要靠它。
-                    readerAttrs->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
-                }
-                IMFSourceReader* reader = nullptr;
-                HRESULT rhr = MFCreateSourceReaderFromURL(copies[si].wstring().c_str(),
-                                                          readerAttrs, &reader);
-                if (readerAttrs) readerAttrs->Release();
-                if (FAILED(rhr) || !reader) continue;
-
-                IMFMediaType* rgbType = nullptr;
-                MFCreateMediaType(&rgbType);
-                rgbType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-                rgbType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-                rgbType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-                rgbType->SetUINT32(MF_MT_DEFAULT_STRIDE, srcW * 4u);
-                MFSetAttributeSize(rgbType, MF_MT_FRAME_SIZE, srcW, srcH);
-                MFSetAttributeRatio(rgbType, MF_MT_FRAME_RATE, srcFps, 1);
-                MFSetAttributeRatio(rgbType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-                rhr = reader->SetCurrentMediaType(
-                    static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, rgbType);
-                rgbType->Release();
-                if (FAILED(rhr)) {
-                    reader->Release();
-                    continue;
-                }
 
                 // 【输出帧网格：按 canvasFps 铺固定网格，源样本按时间戳"贴"上去】
                 //
@@ -2104,119 +2504,70 @@ void Exporter::Run() {
                 // 本片是否已经有过一帧落到画布上。用来区分"片头空网格"
                 // （没有上一帧可重复，只能跳过）和"片尾空网格"（重复最后一帧）。
                 bool havePrevCanvas = false;
+                bool segOk = false;
 
+                // 从这一片的队列收帧，直到片尾哨兵。
+                DecodedFrame f;
                 for (;;) {
-                    DWORD flags = 0;
-                    LONGLONG ts = 0;
-                    IMFSample* sample = nullptr;
-                    rhr = reader->ReadSample(
-                        static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, nullptr,
-                        &flags, &ts, &sample);
-                    if (FAILED(rhr)) break;
-                    if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
-                        if (sample) sample->Release();
-                        break;
-                    }
-                    if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
-                        // 重编码这一路**不能**因为类型变更就停：SourceReader 在
-                        // 第一条样本之前会拿"协商好的实际类型"顶回来一次
-                        // （尤其尺寸不符、走了视频处理器的时候），那是正常
-                        // 握手，不是流中间换格式。真正奇怪的帧由下面的拷贝
-                        // 逻辑兜住（按画布裁剪，多出来的列/行直接不要）。
-                        //
-                        // 直拷路径（3b）则必须停：H.264 裸流中间换 SPS 会拼坏。
-                        if (sample) sample->Release();
-                        continue;
-                    }
-                    if (!sample) continue;
-
-                    // 被回放窗口切掉的头尾，用源样本自己的时间戳判（100ns）。
-                    // 用 ts 而不是数帧号：片子中间可能有 gap 样本。
-                    const double sampleSec = static_cast<double>(ts) / 10000000.0;
-                    if (skipSec > 0.0 && sampleSec < skipSec - 1e-6) {
-                        sample->Release();
-                        continue;
-                    }
-                    if (stopSec > 0.0 && sampleSec >= stopSec - 1e-6) {
-                        sample->Release();
+                    if (!popDecoded(slot, f)) break; // 队列空且全部解完（防御）
+                    if (f.slot != slot) break; // 防御：顺序错乱时宁可不写
+                    if (f.segEnd) {
+                        segOk = f.segOk;
                         break;
                     }
 
-                    // 取像素：优先 2D 锁（能拿到真实 RowPitch），拿不到再退回
-                    // 连续缓冲。两种情况都要按 pitch 逐行拷，不能假设紧密排布。
-                    IMFMediaBuffer* mbuf = nullptr;
-                    if (FAILED(sample->ConvertToContiguousBuffer(&mbuf)) || !mbuf) {
-                        sample->Release();
-                        continue;
-                    }
-
-                    const uint8_t* srcPixels = nullptr;
-                    LONG srcPitch = static_cast<LONG>(srcW * 4u);
-                    IMF2DBuffer* mbuf2d = nullptr;
-                    bool locked2d = false;
-                    if (SUCCEEDED(mbuf->QueryInterface(IID_PPV_ARGS(&mbuf2d))) && mbuf2d) {
-                        BYTE* scan0 = nullptr;
-                        LONG pitch = 0;
-                        if (SUCCEEDED(mbuf2d->Lock2D(&scan0, &pitch)) && scan0) {
-                            srcPixels = scan0;
-                            srcPitch = pitch;
-                            locked2d = true;
-                        } else {
-                            mbuf2d->Release();
-                            mbuf2d = nullptr;
-                        }
-                    }
-                    BYTE* lockedBytes = nullptr;
-                    if (!srcPixels) {
-                        if (FAILED(mbuf->Lock(&lockedBytes, nullptr, nullptr)) || !lockedBytes) {
-                            if (mbuf2d) mbuf2d->Release();
-                            mbuf->Release();
-                            sample->Release();
-                            continue;
-                        }
-                        srcPixels = lockedBytes;
-                    }
+                    // 贴画布。帧是紧密排布的 NV12（解码线程已按真实行距重拷）。
+                    const uint32_t srcW = f.srcW;
+                    const uint32_t srcH = f.srcH;
+                    const uint8_t* srcY = f.pixels.get();
+                    const uint8_t* srcUV = srcY + static_cast<size_t>(srcW) * srcH;
+                    const size_t srcPitch = srcW;
+                    const double sampleSec =
+                        static_cast<double>(f.ts100ns) / 10000000.0;
 
                     // 补黑边。只清"这一帧覆盖不到"的两条：右侧竖条（限制在本帧
-                    // 高度内）和底部横条（整宽）。上一帧更大的部分会被这两条
-                    // 覆盖掉，所以不用每帧全屏清零 —— 4K 画布全清一次是 33MB，
-                    // 4800 帧下来就是 150GB 的 memset，纯浪费。
+                    // 高度内）和底部横条（整宽），Y、UV 各自处理。上一帧更大的
+                    // 部分会被这两条覆盖掉，所以不用每帧全屏清零。
                     //
                     // 【为什么用 contentW/contentH 而不是 srcW/srcH】过渡期的
                     // 分片文件比真实画面大（右/下是录制端补的黑边）。按文件尺寸
                     // 算的话，这一帧会被当成"有内容"整块搬上画布，那块黑边就
-                    // 一起搬进去了。只搬真实画面那一块。
-                    const uint32_t frameW = contentW ? contentW : srcW;
-                    const uint32_t frameH = contentH ? contentH : srcH;
+                    // 一起搬进去了。只搬真实画面那一块。尺寸先向下取偶：NV12
+                    // 的色度按 2x2 取块，奇数列/行没有独立的 UV。
+                    const uint32_t frameW = (f.contentW ? f.contentW : srcW) & ~1u;
+                    const uint32_t frameH = (f.contentH ? f.contentH : srcH) & ~1u;
                     const uint32_t copyRows = frameH < canvasH ? frameH : canvasH;
                     const uint32_t copyCols = frameW < canvasW ? frameW : canvasW;
                     if (frameW < canvasW) {
-                        const size_t rightBytes = canvasPitch - static_cast<size_t>(frameW) * 4u;
+                        // UV 行宽 = Y 行宽（字节）：frameW 列内容占前 frameW 字节。
                         for (uint32_t y = 0; y < copyRows; ++y) {
                             std::memset(canvas.data() + static_cast<size_t>(y) * canvasPitch +
-                                            static_cast<size_t>(frameW) * 4u,
-                                        0, rightBytes);
+                                            frameW,
+                                        0x10, canvasPitch - frameW);
+                        }
+                        for (uint32_t y = 0; y < copyRows / 2u; ++y) {
+                            std::memset(canvas.data() + uvOffset +
+                                            static_cast<size_t>(y) * canvasPitch + frameW,
+                                        0x80, canvasPitch - frameW);
                         }
                     }
                     if (frameH < canvasH) {
-                        std::memset(canvas.data() + static_cast<size_t>(frameH) * canvasPitch, 0,
-                                    static_cast<size_t>(canvasH - frameH) * canvasPitch);
+                        std::memset(canvas.data() + static_cast<size_t>(frameH) * canvasPitch,
+                                    0x10, static_cast<size_t>(canvasH - frameH) * canvasPitch);
+                        std::memset(canvas.data() + uvOffset +
+                                        static_cast<size_t>(frameH / 2u) * canvasPitch,
+                                    0x80,
+                                    static_cast<size_t>((canvasH - frameH) / 2u) * canvasPitch);
                     }
 
                     for (uint32_t y = 0; y < copyRows; ++y) {
                         std::memcpy(canvas.data() + static_cast<size_t>(y) * canvasPitch,
-                                    srcPixels + static_cast<size_t>(y) * srcPitch,
-                                    static_cast<size_t>(copyCols) * 4u);
+                                    srcY + static_cast<size_t>(y) * srcPitch, copyCols);
                     }
-
-                    if (locked2d) {
-                        mbuf2d->Unlock2D();
-                    } else {
-                        mbuf->Unlock();
+                    for (uint32_t y = 0; y < copyRows / 2u; ++y) {
+                        std::memcpy(canvas.data() + uvOffset + static_cast<size_t>(y) * canvasPitch,
+                                    srcUV + static_cast<size_t>(y) * srcPitch, copyCols);
                     }
-                    if (mbuf2d) mbuf2d->Release();
-                    mbuf->Release();
-                    sample->Release();
 
                     // 把这一帧"贴"到输出网格上：源样本时间戳落到哪个网格点，
                     // 就从那个网格点开始重复写到下一个源样本到来之前。
@@ -2226,7 +2577,8 @@ void Exporter::Run() {
                     // （相当于丢帧）；比网格疏时中间那些点就用这一帧重复填
                     // （相当于插帧）。两种情况都是"一帧多放几次"的自然结果。
                     const double relSec = sampleSec - skipSec;
-                    if (relSec < -1e-6) { sample->Release(); continue; }
+                    // （防御：正常到不了这里 —— 解码线程已经把越界样本过滤掉了。）
+                    if (relSec < -1e-6) continue;
                     uint64_t gridIdx = 0;
                     if (relSec > 0.0) {
                         gridIdx = static_cast<uint64_t>(
@@ -2300,16 +2652,34 @@ void Exporter::Run() {
                                                      static_cast<double>(canvasFps) +
                                                      0.5);
 
-                reader->Release();
                 if (segFrames > 0) ++usedSegments;
             }
+
+            // 无论走完还是中途失败，都收掉解码线程。
+            decodeStop.store(true);
+            decodeCv.notify_all();
+            if (decodeThread0.joinable()) decodeThread0.join();
+            if (decodeThread1.joinable()) decodeThread1.join();
+            const double planMs =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - planT0)
+                    .count();
+            LogExportPlan("reencode plan loop: " + std::to_string(static_cast<int>(planMs)) +
+                          " ms, outFrames=" + std::to_string(outFrames));
         }
 
         // 成品时长 = 时间轴推到了多远（下面再问一次文件本身校准）。
         const double cursorSec = static_cast<double>(cursorTicks) / 10000000.0;
 
+        const auto finT0 = std::chrono::steady_clock::now();
         HRESULT fhr = writer->Finalize();
         writer->Release();
+        LogExportPlan("reencode finalize: " +
+                      std::to_string(static_cast<int>(
+                          std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - finT0)
+                              .count())) +
+                      " ms");
 
         if (!mergeErr.empty()) {
             std::error_code ecx;

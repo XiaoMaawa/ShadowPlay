@@ -159,13 +159,24 @@
             还没有配置。点"＋ 新建"加一路。
           </div>
 
-          <ul class="plist">
+          <ul class="plist" @dragover.prevent @drop.prevent="onDrop">
             <li
               v-for="p in profiles"
               :key="p.id"
               class="pitem"
-              :class="{ active: p.id === selectedId, off: !p.enabled }"
+              :class="{
+                active: p.id === selectedId,
+                off: !p.enabled,
+                dragging: dragId === p.id,
+                'drop-on': dragOverId === p.id && dragId !== null && dragId !== p.id,
+              }"
+              draggable="true"
               @click="select(p.id)"
+              @dragstart="onDragStart(p.id, $event)"
+              @dragend="onDragEnd"
+              @dragover="onDragOver(p.id, $event)"
+              @dragleave="onDragLeave(p.id)"
+              @drop.prevent="onDrop"
             >
               <!-- iPhone 那种滑动开关：一个 checkbox 用 CSS 画成轨道 + 圆钮。
                    保留原生 input 是为了键盘可达性（空格能切）和无障碍语义。 -->
@@ -1556,12 +1567,77 @@ async function deleteProfile() {
     // 选中项往"删掉那一行的位置"接：删中间一行时停在原来下一行，删最后一行
     // 时退回新的最后一行，不会跳回第一行让用户重新找。
     selectedId.value = rest[Math.min(Math.max(idx, 0), rest.length - 1)]?.id ?? null
-    // 编辑面板这时已经收起来了，saveNotice 在表单里看不见 —— 走顶部那条提示。
-    exportNotice.value = { text: `已删除配置「${label}」（分片仍保留在磁盘上）`, bad: false }
   } catch (err) {
     saveError.value = `删除出错：${(err as Error).message}`
   } finally {
     deleting.value = false
+  }
+}
+
+/**
+ * 侧栏拖拽换位。
+ *
+ * 用原生 HTML5 DnD（不用任何库）：按住某一行拖到另一行上松手，被拖的那路
+ * 就插到目标位置。只改数组顺序，`num`（录像目录编号）跟着各自的配置走，
+ * 所以换位不影响已经录好的分片目录。
+ *
+ * 落盘走专门的单向通道 `reorder-profiles`：只发 id 顺序，磁盘上每一路的
+ * 内容原样保留 —— 和单路保存同一个安全思路，绝不把界面手里可能过时的
+ * 整份快照写回去。
+ */
+const dragId = ref<string | null>(null)
+const dragOverId = ref<string | null>(null)
+
+function onDragStart(id: string, e: DragEvent) {
+  dragId.value = id
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    // Firefox 没有 setData 不启动拖拽，顺手塞一份
+    e.dataTransfer.setData('text/plain', id)
+  }
+}
+
+function onDragOver(id: string, e: DragEvent) {
+  if (dragId.value === null || dragId.value === id) return
+  dragOverId.value = id
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+}
+
+function onDragLeave(id: string) {
+  if (dragOverId.value === id) dragOverId.value = null
+}
+
+function onDragEnd() {
+  dragId.value = null
+  dragOverId.value = null
+}
+
+async function onDrop() {
+  // li 和 ul 都挂了 drop，会触发两次；第二次 dragId 已经是 null，直接返回
+  const from = dragId.value
+  const to = dragOverId.value
+  dragId.value = null
+  dragOverId.value = null
+  if (!from || !to || from === to) return
+
+  const list = profiles.value.slice()
+  const fi = list.findIndex((x) => x.id === from)
+  const ti = list.findIndex((x) => x.id === to)
+  if (fi < 0 || ti < 0) return
+  const [moved] = list.splice(fi, 1)
+  list.splice(ti, 0, moved as Profile)
+  profiles.value = list
+
+  const fn = api()?.reorderProfiles as
+    | ((ids: string[]) => Promise<{ ok: boolean; error?: string }>)
+    | undefined
+  if (typeof fn !== 'function') return
+  try {
+    const res = (await fn(list.map((p) => p.id))) ?? { ok: false }
+    if (!res.ok) saveError.value = res.error ?? '顺序没保存上'
+  } catch (err) {
+    // 界面上的顺序已经换了；落盘失败的话下次启动会弹回旧顺序，如实提示
+    saveError.value = `顺序没保存上：${String(err)}`
   }
 }
 
@@ -1866,9 +1942,14 @@ watch(selectedId, (id) => {
   void switchSession(id)
 })
 
-// 编辑按钮和 sidebar 的联动
+// 编辑按钮和 sidebar 的联动：editing 变 true 就把当前选中那一路填进草稿。
+//
+// 【新建必须绕开】addProfile() 自己会把 draft 填成一份**默认值**，watch 是
+// 异步触发的（当前同步代码跑完才执行），如果这里不挡住，新建刚填好的默认
+// 草稿会被 startEdit() 用**当前选中那一路**的值整个覆盖 —— 用户看到的就是
+// 弹窗里全是旧配置的信息，点「确定」还会把原来那一路改掉而不是新增一路。
 watch(editing, (v) => {
-  if (v) startEdit()
+  if (v && !editingNew.value) startEdit()
 })
 
 // 编辑面板里切到"窗口捕获"时补拉一次窗口列表。
@@ -2400,6 +2481,15 @@ onBeforeUnmount(() => {
 }
 .pitem:hover {
   background: #0e1420;
+}
+/* 拖拽中的那一路压暗一点，让"要落到哪一行"的亮框更醒目 */
+.pitem.dragging {
+  opacity: 0.45;
+}
+/* 拖拽悬停的落点：亮一圈边框提示松手后会被插到这里 */
+.pitem.drop-on {
+  box-shadow: inset 0 0 0 1px #2b6cb0;
+  background: #12203a;
 }
 .pitem.active {
   background: #101a2b;

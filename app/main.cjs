@@ -2446,6 +2446,65 @@ function registerIpc() {
     }
   })
 
+  // 调整配置顺序（侧栏拖拽换位）。
+  //
+  // 收界面排好的 id 数组，磁盘上的列表就按这个顺序重排。只动数组顺序，
+  // 每一路的内容（含 num —— 录像目录编号）一个字节都不改，所以服务完全
+  // 不用 reload：录制行为和顺序无关，写完盘就算完。
+  //
+  // 不走 `service:save-profiles`（整份保存）：那条路会把界面手里可能已经
+  // 过时的每一路内容一起写回磁盘。这里只传 id 顺序，磁盘上每一路的现值
+  // 原样保留 —— 和单路保存是同一个安全思路，只是作用于"顺序"这一维。
+  ipcMain.handle('service:reorder-profiles', async (_evt, payload) => {
+    const ids = Array.isArray(payload?.ids) ? payload.ids.map((x) => String(x ?? '')) : []
+    if (ids.length === 0) return { ok: false, error: '缺少 id 顺序。' }
+
+    const file = profilesPath()
+    const current = loadProfiles()
+    if (current.error) return { ok: false, error: `读不到现有配置：${current.error}` }
+    const list = Array.isArray(current.profiles) ? current.profiles.slice() : []
+
+    // 按界面给的顺序挑出来；磁盘上有、但界面没提到的（理论上不会有，
+    // 防一手并发窗口）按原顺序补在后面，绝不因为拖一次拽丢配置。
+    const byId = new Map(list.map((p) => [String(p?.id ?? ''), p]))
+    const ordered = []
+    for (const id of ids) {
+      const p = byId.get(id)
+      if (p) {
+        ordered.push(p)
+        byId.delete(id)
+      }
+    }
+    for (const p of list) {
+      if (byId.has(String(p?.id ?? ''))) ordered.push(p)
+    }
+    if (ordered.length !== list.length) return { ok: false, error: '重排前后数量对不上，放弃写入。' }
+
+    const before = JSON.stringify(list)
+    if (before === JSON.stringify(ordered)) return { ok: true, path: file, changed: false }
+
+    const doc = {
+      ...current,
+      recordRoot: current.recordRoot,
+      exportDir: current.exportDir,
+      profiles: ordered,
+    }
+    try {
+      mkdirSync(path.dirname(file), { recursive: true })
+      try {
+        if (existsSync(file)) copyFileSync(file, `${file}.bak`)
+      } catch {
+        /* 备份失败不该挡住重排本身 */
+      }
+      writeFileSync(file, JSON.stringify(doc, null, 2), 'utf8')
+      lastGoodProfiles = doc
+    } catch (err) {
+      return { ok: false, error: `写入配置失败：${err.message}` }
+    }
+    log(`[profile] 配置顺序已调整（${ordered.length} 路）`)
+    return { ok: true, path: file, changed: true }
+  })
+
   // 界面要主动问一次"服务现在到底怎么样"（比如刚重启完服务）
   ipcMain.handle('service:refresh', async () => {
     const res = await sendServiceCommand({ cmd: 'list_sessions' })

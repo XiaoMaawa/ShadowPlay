@@ -9,6 +9,40 @@
       "name": "显示器捕获",
       "enabled": true,
       "source": {
+        "kind": "window",
+        "monitorIndex": 0,
+        "clientAreaOnly": false,
+        "wgc": true
+      },
+      "video": {
+        "fps": 15,
+        "bitrateMbps": 25,
+        "replaySeconds": 20,
+        "segmentSeconds": 2,
+        "scaleWidth": 0,
+        "scaleHeight": 0
+      },
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "match": {
+        "rule": "process",
+        "by": "process",
+        "mode": "contains",
+        "pattern": "此电脑 - 文件资源管理器",
+        "pick": "largest",
+        "pollMs": 1000,
+        "requireVisible": true,
+        "title": "此电脑 - 文件资源管理器",
+        "className": "CabinetWClass",
+        "process": "explorer.exe",
+        "hwnd": 4720522
+      }
+    },
+    {
+      "id": "p-1rlt6j",
+      "num": 2,
+      "name": "配置 2",
+      "enabled": true,
+      "source": {
         "kind": "monitor",
         "monitorIndex": 0,
         "clientAreaOnly": false,
@@ -16,13 +50,13 @@
       },
       "video": {
         "fps": 60,
-        "bitrateMbps": 25,
-        "replaySeconds": 20,
+        "bitrateMbps": 20,
+        "replaySeconds": 120,
         "segmentSeconds": 2,
         "scaleWidth": 0,
         "scaleHeight": 0
       },
-      "createdAt": "2026-01-01T00:00:00.000Z"
+      "createdAt": "2026-10-22T09:49:13.157Z"
     }
   ]
 }
