@@ -328,7 +328,9 @@
                       <!-- 服务手里握着的那个窗口如果已经不在枚举列表里（关掉重开换了
                            hwnd / 被最小化），单独补一行，别让下拉只剩"请选择"。 -->
                       <option v-if="capturedOption" :value="capturedOption.hwnd">
-                        当前正在录制：{{ capturedOption.title }}（已不在窗口列表中）
+                        {{ capturedOption.missing
+                          ? `等待窗口重新出现：${capturedOption.title}（不会改录同一程序的其它窗口）`
+                          : `当前正在录制：${capturedOption.title}（已不在窗口列表中）` }}
                       </option>
                       <option v-for="w in windows" :key="w.hwnd" :value="String(w.hwnd)">
                         {{ windowLabel(w) }}
@@ -1772,7 +1774,14 @@ const liveCapturedWindow = computed(() => {
   if (!s) return null
   const hwnd = Number(s.hwnd ?? 0)
   if (!hwnd) return null
-  return { hwnd, title: String(s.matchedTitle ?? '').trim() }
+  return {
+    hwnd,
+    title: String(s.matchedTitle ?? '').trim(),
+    // 捕获的那个窗口关掉了、服务正在等它回来。**必须**带上这个标记：
+    // 否则下拉会以为"这就是我现在录的窗口"，用户明明关掉了播放器，
+    // 却还看到播放器的标题（还被当成可选中的有效选项）。
+    missing: Boolean(s.windowMissing),
+  }
 })
 
 /**
@@ -1786,8 +1795,15 @@ const liveCapturedWindow = computed(() => {
 const capturedOption = computed(() => {
   const live = liveCapturedWindow.value
   if (!live) return null
-  if (windows.value.some((w) => Number(w.hwnd) === live.hwnd)) return null
-  return { hwnd: String(live.hwnd), title: live.title || `窗口 ${live.hwnd}` }
+  // 目标关掉了：即使它还在枚举结果里（Chromium 关窗口只隐藏不销毁，
+  // 枚举时能摸到一个已经没有画面的句柄），也要单独标出来 —— 它是"在等
+  // 回来的那个窗口"，不是"现在录着的窗口"。
+  if (!live.missing && windows.value.some((w) => Number(w.hwnd) === live.hwnd)) return null
+  return {
+    hwnd: String(live.hwnd),
+    title: live.title || `窗口 ${live.hwnd}`,
+    missing: live.missing,
+  }
 })
 
 // ---- 匹配方式（四个选项）----------------------------------------------------
@@ -1922,6 +1938,10 @@ const windowPickValue = computed(() => {
   if (picked) return String(picked.hwnd)
   const captured = live ? list.find((w) => Number(w.hwnd) === live.hwnd && ok(w)) : undefined
   if (captured) return String(captured.hwnd)
+  // 目标关掉了、服务在等它回来：下拉就停在这一行（capturedOption），
+  // 别落到下面"随便挑一个满足规则的"——那正是"录着主界面却显示播放器"的
+  // 反面：显示成主界面，用户以为配置被改了。
+  if (live?.missing) return String(live.hwnd)
   const hit = list.find(ok)
   return hit ? String(hit.hwnd) : ''
 })
@@ -2078,7 +2098,15 @@ watch(selectedId, (id) => {
 // 草稿会被 startEdit() 用**当前选中那一路**的值整个覆盖 —— 用户看到的就是
 // 弹窗里全是旧配置的信息，点「确定」还会把原来那一路改掉而不是新增一路。
 watch(editing, (v) => {
-  if (v && !editingNew.value) startEdit()
+  if (!v) return
+  if (!editingNew.value) startEdit()
+  // 每次打开都重新枚举一次窗口。
+  //
+  // 【为什么不能再"列表非空就复用"】那份列表是上次打开时拍的快照：窗口可能
+  // 已经关了（用户关掉播放器）、也可能新开了。用户实测点开编辑面板，窗口下拉
+  // 里还列着已经关掉的播放器标题 —— 因为它来自几十分钟前的旧列表。
+  // 这里无条件重拉，面板一打开看到的就是此刻真实的窗口。
+  void loadWindows()
 })
 
 // 编辑面板里切到"窗口捕获"时补拉一次窗口列表。

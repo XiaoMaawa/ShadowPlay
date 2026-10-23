@@ -31,6 +31,8 @@
 #include "ScreenCapture.h"
 #include "SegmentRecorder.h"
 #include "WindowCapture.h"
+// WindowInfo（目标窗口的身份快照）在 WindowEnum.h 里。
+#include "WindowEnum.h"
 
 namespace shadow {
 
@@ -74,6 +76,12 @@ struct SessionStatus {
     bool attached = false;       // 帧环是否已创建
     uint64_t hwnd = 0;           // 窗口源匹配到的窗口句柄（0 = 桌面源或未匹配）
     std::string matchedTitle;    // 匹配到的窗口标题，便于界面显示"正在录哪个"
+    // 捕获的那个窗口**关掉了**、这一路在等它回来（应用还活着）。
+    //
+    // 有这个标记，界面才能说人话：「在等《xxx》这个窗口回来」，而不是
+    // 把"没有画面"含糊成一句匹配失败。它是 windowMissing 而不是用 state 判，
+    // 因为 state=disabled 也可能是"从没匹配到"——两者的用户动作不一样。
+    bool windowMissing = false;
     uint32_t width = 0;
     uint32_t height = 0;
     double targetFps = 0.0;
@@ -493,13 +501,63 @@ private:
     uint32_t ringW_ = 0;
     uint32_t ringH_ = 0;
 
-    // 窗口锁定：这一路一旦选定并成功 Init 了一个窗口 hwnd，就锁死它。
-    // 环境波动（标题变了、被最小化、锁屏）都不再重新按匹配规则去解，
-    // 避免同 class 的窗口（如多个 Chrome_WidgetWin_1）被 pick:largest 选错源、
-    // 用户看着像"中途偷偷换了窗口"。只有该窗口真的被销毁（IsWindow 为假）
-    // 才清零、退回重新匹配。reload 重建会话时这个对象本身是新的，自然为 0
-    // —— 用户主动改了匹配规则，本就该重新解一次。
-    uint64_t lockedHwnd_ = 0;
+    // ---- 窗口锁定 + 同应用窗口黑名单 --------------------------------------
+    //
+    // 用户报的现象：录哔哩哔哩的**播放器窗口**，把播放器关掉，画面变成了它的
+    // **主界面**在继续录；而编辑面板的窗口下拉里还写着播放器的标题。
+    //
+    // 根因是"锁定了 hwnd，但 hwnd 一失效就退回按规则重新匹配"：主界面和播放器
+    // 同 exe、同 class（Chrome_WidgetWin_1），天然满足规则，于是被 pick:largest
+    // 选中 —— 画面悄悄换了源，配置里写的却还是播放器。
+    //
+    // 现在：选定窗口的那一刻，把**这个窗口的身份**和**同应用里其它窗口**一起
+    // 记下来（黑名单）。
+    //   * 目标还活着（可见；最小化也算活着）→ 一直录它，不重新解析；
+    //   * 目标不见了 → 只接受"目标自己回来"（新 hwnd 也行，只要不在黑名单
+    //     里），找不到就 Disabled —— 界面盖 NO SIGNAL，绝不改录同应用的别处；
+    //   * 这个 exe 一个顶层窗口都不剩 = 应用退了 → 黑名单作废，按规则重来；
+    //   * 用户在编辑面板点「确定」→ 会话重建，这些状态自然清空，重新解一次。
+    // 这些都是会话线程自己读写，不用进 mu_。
+    struct TargetWindow {
+        uint32_t hwnd = 0;
+        uint32_t pid = 0;      // 窗口所属进程。"应用是不是退了"就靠它，比数窗口可靠
+        std::string process;   // exe（小写），黑名单按它筛同应用的窗口
+        std::string klass;
+        std::string title;     // 原样保留，界面要显示"在等哪个窗口回来"
+        bool valid() const { return hwnd != 0; }
+    };
+    struct SiblingWindow {
+        uint32_t hwnd = 0;
+        std::string process;
+        std::string klass;
+        std::string title;
+    };
+    TargetWindow target_;
+    std::vector<SiblingWindow> siblings_;
+    // 上一次"目标窗口还在不在"的检查时刻（每秒一次）。
+    std::chrono::steady_clock::time_point lastTargetCheck_{};
+    // 目标的解析结果（见 ResolveTarget）。
+    enum class TargetResolve {
+        Locked,   // out 里是能录的窗口（目标本身，或目标回来了）
+        Waiting,  // 目标关着、应用还在：这一路要 Disabled，等它回来
+        Reset,    // 还没锁过 / 应用退了：调用方按规则重新解
+    };
+    /** 复用锁定的目标；不满足就返回 Waiting（不许改录同应用的别的窗口）。 */
+    TargetResolve ResolveTarget(WindowInfo& out);
+    /** 记下这一路要录的窗口，并把同应用的其它窗口拉进黑名单。 */
+    void LockTarget(const WindowInfo& win);
+    /** 清空目标与黑名单（应用退出 / 会话重来）。 */
+    void ClearTargetLock();
+    /** 这个窗口是不是黑名单里的（同应用、但不是我们要录的那个）。 */
+    bool IsSibling(const WindowInfo& win) const;
+    /**
+     * 刷新黑名单：把同 exe 里"不是目标"的窗口都记进来。
+     *
+     * 只在目标活着的时候调用 —— 否则目标关着时新出现的窗口（很可能就是回来
+     * 的播放器）会被当成"别的窗口"拉黑，永远等不到它。
+     */
+    void RefreshSiblings();
+
     // Capture() 的元数据出口（尺寸/QPC）。像素不用它——像素走 snap_。
     FrameView fvRaw_;
     // 本路已经吃过的「最近一张」版本号。多路同源时靠它决定要不要真的去

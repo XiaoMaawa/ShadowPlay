@@ -62,6 +62,24 @@ std::vector<WindowInfo> MatchWindows(const std::vector<WindowInfo>& all,
 // 便利函数：枚举并筛选，直接拿到选中的那一个。找不到返回 false。
 bool ResolveWindow(const WindowMatch& rule, WindowInfo& out);
 
+// 这个 exe 现在还有多少个顶层窗口（**不过滤**可见性 / 最小化 / 工具窗口）。
+//
+// 只有一个用途：判断"被录的那个应用是不是整个退出了"。
+// 关掉一个窗口和应用退出是两件事，但对调用方来说判据必须分得清：
+//   * 窗口关了、应用还在（播放器窗口关掉、主界面还在）→ 不许改录别的窗口
+//   * 应用退了（一个窗口都不剩）→ 之前的"别的窗口"黑名单作废，允许重新匹配
+// 所以这里要连隐藏窗口一起数：托盘里的应用窗口是隐藏的，但它显然还活着，
+// 用可见窗口判断会把"最小化到托盘"误判成"退出"。
+size_t ProcessTopLevelWindowCount(const std::string& processName);
+
+// 这个进程还活着吗（用来判断"被录的那个应用是不是退出了"）。
+//
+// 和上面的窗口计数比，pid 更可靠：应用退出时 pid 立刻失效，哪怕是
+// "关掉再飞快打开"这种一拍就能跨过去的操作也躲不掉。真到了 pid 被系统
+// 复用给别的进程的极端情况，最坏结果只是黑名单晚一点清（用户点一次编辑
+// 「确定」就能重来），不会凭空锁到错的窗口。
+bool ProcessAlive(uint32_t pid);
+
 // HWND → UTF-8 标题（窗口已销毁时返回空）
 std::string WindowTitle(HWND hwnd);
 std::string WindowClassName(HWND hwnd);

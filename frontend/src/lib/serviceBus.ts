@@ -30,6 +30,14 @@ export interface SessionLive {
    */
   hwnd?: number
   matchedTitle: string
+  /**
+   * 捕获的那个窗口**关掉了**，这一路正在等它回来（应用还活着）。
+   *
+   * 有它才能说人话：「在等《xxx》这个窗口回来」。没有它的话"没画面"只能
+   * 含糊成"匹配失败"，而这两件事用户该做的事完全不同 —— 前者是去把窗口
+   * 重新打开，后者是改配置。
+   */
+  windowMissing?: boolean
   width: number
   height: number
   targetFps: number

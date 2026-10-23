@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <regex>
+#include <utility>
 
 namespace shadow {
 namespace {
@@ -204,6 +205,16 @@ bool WindowPresent(HWND hwnd, uint32_t pid) {
     return true;
 }
 
+bool ProcessAlive(uint32_t pid) {
+    if (pid == 0) return false;
+    HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;  // 打不开：要么已经没了，要么根本没权限 → 当作不在
+    DWORD code = 0;
+    const bool alive = ::GetExitCodeProcess(h, &code) != FALSE && code == STILL_ACTIVE;
+    ::CloseHandle(h);
+    return alive;
+}
+
 std::string ProcessNameOf(uint32_t pid) {
     if (pid == 0) return {};
     // PROCESS_QUERY_LIMITED_INFORMATION 就够了，而且对更高完整性的进程
@@ -256,6 +267,54 @@ std::vector<WindowInfo> EnumerateWindows(const std::vector<HWND>& forceInclude) 
 
 std::vector<WindowInfo> EnumerateWindows() {
     return EnumerateWindows({});
+}
+
+namespace {
+
+struct CountCtx {
+    const std::string* process = nullptr;
+    size_t count = 0;
+    // pid → exe 名。一屏几十个顶层窗口，不去重的话每个都 OpenProcess 一次。
+    std::vector<std::pair<uint32_t, std::string>>* cache = nullptr;
+};
+
+BOOL CALLBACK CountProc(HWND hwnd, LPARAM lparam) {
+    auto* ctx = reinterpret_cast<CountCtx*>(lparam);
+    if (!ctx || !ctx->process || !ctx->cache) return TRUE;
+
+    if (::GetParent(hwnd) != nullptr) return TRUE;  // 只看顶层窗口
+
+    DWORD pid = 0;
+    ::GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) return TRUE;
+
+    std::string name;
+    bool hit = false;
+    for (const auto& kv : *ctx->cache) {
+        if (kv.first == pid) {
+            name = kv.second;
+            hit = true;
+            break;
+        }
+    }
+    if (!hit) {
+        name = ProcessNameOf(pid);
+        ctx->cache->emplace_back(pid, name);
+    }
+    if (name == *ctx->process) ++ctx->count;
+    return TRUE;
+}
+
+} // namespace
+
+size_t ProcessTopLevelWindowCount(const std::string& processName) {
+    if (processName.empty()) return 0;
+    std::vector<std::pair<uint32_t, std::string>> cache;
+    CountCtx ctx;
+    ctx.process = &processName;
+    ctx.cache = &cache;
+    ::EnumWindows(&CountProc, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.count;
 }
 
 std::vector<WindowInfo> MatchWindows(const std::vector<WindowInfo>& all,

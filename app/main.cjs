@@ -1473,6 +1473,10 @@ function listWindows() {
   }
   const includeHwnds = []
   for (const s of sessions) {
+    // 窗口已经关了（服务在等它回来）就不要强制收录：那个句柄要么已经销毁，
+    // 要么被 Chromium 藏起来了 —— 收进下拉里只会列出一条"早就没画面的窗口"，
+    // 用户还以为自己点的是正在录的那个。等它回来再说。
+    if (s?.windowMissing) continue
     const h = Number(s?.hwnd ?? 0)
     if (Number.isFinite(h) && h > 0) includeHwnds.push(h)
   }

@@ -267,6 +267,7 @@ std::string Session::StatusJson() const {
                   "{\"type\":\"session\",\"id\":\"%s\",\"name\":\"%s\","
                   "\"state\":\"%s\",\"detail\":\"%s\",\"enabled\":%s,"
                   "\"attached\":%s,\"hwnd\":%u,\"matchedTitle\":\"%s\","
+                  "\"windowMissing\":%s,"
                   "\"width\":%u,\"height\":%u,\"targetFps\":%.2f,"
                   "\"actualFps\":%.2f,\"gapMs\":%.2f,\"captureMs\":%.2f,"
                   "\"produced\":%llu,\"dropped\":%llu,\"consumerPid\":%u,"
@@ -282,6 +283,7 @@ std::string Session::StatusJson() const {
                   // （见 BuildWindowsJson 的说明：64 位值在 JS 里存不准）。
                   static_cast<unsigned>(static_cast<uint32_t>(s.hwnd)),
                   JsonEscape(s.matchedTitle).c_str(),
+                  s.windowMissing ? "true" : "false",
                   s.width, s.height, s.targetFps,
                   s.actualFps, s.gapMs, s.captureMs,
                   static_cast<unsigned long long>(s.produced),
@@ -641,7 +643,9 @@ float Session::MeterLevel() const {
 
 uint32_t Session::ResolveAudioPid() {
     if (profile_.source.kind != SourceKind::Window) return 0;
-    uint64_t hwnd = lockedHwnd_;
+    // 优先用"捕获目标"自己的 hwnd：它和画面用的是同一个窗口，
+    // 声音才不会跟画面错位（先锁目标、后建环回的那一瞬间尤其重要）。
+    uint64_t hwnd = target_.hwnd;
     if (hwnd == 0) {
         std::lock_guard<std::mutex> lk(mu_);
         hwnd = status_.hwnd;
@@ -921,6 +925,127 @@ void Session::RefreshAudioStatus(int64_t nowMs) {
     status_.audioTreeGrown = audioTreeGrown_;
 }
 
+// ---- 捕获目标锁定 / 同应用窗口黑名单 --------------------------------------
+//
+// 这一组方法的来龙去脉见 Session.h 里 TargetWindow / SiblingWindow 的说明。
+// 一句话：选定了哪个窗口，就只认那个窗口；它关掉就等它回来，绝不改录同应用
+// 的另一个窗口（"关掉播放器却开始录主界面"就是这么来的）。
+
+namespace {
+
+inline uint32_t HwndKeyOf(HWND h) {
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(h));
+}
+
+} // namespace
+
+void Session::ClearTargetLock() {
+    target_ = TargetWindow{};
+    siblings_.clear();
+}
+
+void Session::LockTarget(const WindowInfo& win) {
+    if (!win.hwnd) return;
+    target_.hwnd = HwndKeyOf(win.hwnd);
+    target_.pid = win.pid;
+    target_.process = win.processName;
+    target_.klass = win.className;
+    target_.title = win.title;
+    // 黑名单只增不删：目标重新出现时（新 hwnd）还要沿用之前记下的
+    // "主界面"那一条，否则它又会被当成候选。
+    RefreshSiblings();
+}
+
+bool Session::IsSibling(const WindowInfo& win) const {
+    const uint32_t key = HwndKeyOf(win.hwnd);
+    for (const auto& s : siblings_) {
+        if (s.hwnd == key) return true;
+        // 同一个窗口被关掉又开出来时 hwnd 会变，所以身份也要比：
+        // 同 exe + 同类名 + 同标题 = 同一个东西（比如"哔哩哔哩"主界面）。
+        if (!s.process.empty() && s.process == win.processName &&
+            s.klass == win.className && s.title == win.title) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Session::RefreshSiblings() {
+    if (!target_.valid() || target_.process.empty()) return;
+    // 目标没活着的时候不能刷：此刻新冒出来的窗口很可能就是回来的播放器，
+    // 拉黑它就等于永远等不到了。
+    if (!WindowPresent(reinterpret_cast<HWND>(static_cast<uintptr_t>(target_.hwnd)))) return;
+
+    const auto all = EnumerateWindows();
+    for (const auto& w : all) {
+        if (w.processName != target_.process) continue;
+        const uint32_t key = HwndKeyOf(w.hwnd);
+        if (key == target_.hwnd) continue;
+        bool known = false;
+        for (auto& s : siblings_) {
+            if (s.hwnd == key) {
+                // 标题会跟着内容变（"xxx - 哔哩哔哩"），随手更新，
+                // 免得同标题判据永远对不上。
+                s.title = w.title;
+                s.klass = w.className;
+                known = true;
+                break;
+            }
+        }
+        if (!known) siblings_.push_back(SiblingWindow{key, w.processName, w.className, w.title});
+    }
+}
+
+Session::TargetResolve Session::ResolveTarget(WindowInfo& out) {
+    if (!target_.valid()) return TargetResolve::Reset;
+
+    const HWND locked = reinterpret_cast<HWND>(static_cast<uintptr_t>(target_.hwnd));
+    if (WindowPresent(locked)) {
+        out.hwnd = locked;
+        const auto snap = EnumerateWindows({locked});
+        if (!snap.empty()) {
+            out = snap.front();
+            out.hwnd = locked;  // 保真（forceInclude 那条分支也会带上它）
+        } else {
+            // 最小化时枚举不到真实尺寸，但 hwnd 才是关键。
+            out.title = target_.title;
+            out.className = target_.klass;
+            out.processName = target_.process;
+            out.width = 0;
+            out.height = 0;
+        }
+        return TargetResolve::Locked;
+    }
+
+    // 目标不见了。先分清是"窗口关了"还是"应用退了"。
+    //
+    // 判据优先用 **pid 还活着没有**，不用"数窗口"：应用退出再飞快打开时，窗口数
+    // 在一拍之间从 0 又变成 1，数窗口根本观察不到那个 0；而 pid 一定换人了。
+    // 应用还在（哪怕窗口全关、躲在托盘里）就一直等这个窗口回来 —— 这正是
+    // 用户要的"除非这个应用退出，否则不换"。
+    // pid 拿不到时才退回数窗口（老路径，防一手）。
+    const bool appGone = target_.pid != 0
+                             ? !ProcessAlive(target_.pid)
+                             : (ProcessTopLevelWindowCount(target_.process) == 0);
+    if (appGone) {
+        // 应用整个退出：黑名单作废（下次启动的窗口就应该是新目标）。
+        ClearTargetLock();
+        return TargetResolve::Reset;
+    }
+
+    // 应用还在：只在黑名单之外找 —— 也就是"目标自己回来了"。
+    const auto all = EnumerateWindows();
+    std::vector<WindowInfo> pool;
+    pool.reserve(all.size());
+    for (const auto& w : all) {
+        if (!IsSibling(w)) pool.push_back(w);
+    }
+    const auto hits = MatchWindows(pool, profile_.match);
+    if (hits.empty()) return TargetResolve::Waiting;
+    out = hits.front();
+    return TargetResolve::Locked;
+}
+
 bool Session::ResolveSource() {
     // ---- 桌面源 ----------------------------------------------------------
     if (profile_.source.kind != SourceKind::Window) {
@@ -971,40 +1096,45 @@ bool Session::ResolveSource() {
 
     WindowInfo win;
     // ---- 窗口锁定：选定了就别中途换 --------------------------------------
+    //
     // 用户要求："选好一个窗口要录制了，就不要中途换来换去"。环境波动
     // （标题变了、被最小化、锁屏）都不该触发重新匹配——否则同 class 的窗口
-    // 会被 pick:largest 选错源。所以优先复用锁定的 hwnd：它还活着（IsWindow
-    // 为真，包括最小化/锁屏这种"还在"的情况）就直接用、跳过 ResolveWindow；
-    // 只有它真的被销毁（IsWindow 为假）才解锁、退回按规则重新匹配。
+    // 会被 pick:largest 选错源。
+    //
+    // 【更狠的一条：目标关掉了也不许换】用户报「关掉哔哩哔哩播放器，画面变成
+    // 主界面在继续录，下拉里还写着播放器的标题」。那就是"hwnd 一失效就退回
+    // 按规则重解"的后果 —— 主界面同 exe 同 class，天然命中。
+    // 现在交给 ResolveTarget 判断：目标关着就等（Disabled → 界面 NO SIGNAL），
+    // 应用整个退了才允许重新按规则挑。详见 Session.h 里 TargetWindow 的说明。
     bool locked = false;
-    // 锁定的窗口"还在"的判据不能只看 IsWindow：Chromium 系关窗口只隐藏不销毁，
-    // 句柄会一直有效，但已经没有任何画面了。这种情况必须当作"丢了"处理，
-    // 才能走下面的重新匹配 —— 匹配不到就 Disabled，界面立刻盖上 NO SIGNAL。
-    // （见 WindowEnum.h 里 WindowPresent 的说明。）
-    if (lockedHwnd_ != 0 && WindowPresent(reinterpret_cast<HWND>(lockedHwnd_))) {
-        locked = true;
-        win.hwnd = reinterpret_cast<HWND>(lockedHwnd_);
-        // 顺手补标题/尺寸（最小化时枚举不一定拿到真实尺寸，但 hwnd 才是关键）。
-        const auto snap = EnumerateWindows({reinterpret_cast<HWND>(lockedHwnd_)});
-        if (!snap.empty()) {
-            win = snap.front();
-            win.hwnd = reinterpret_cast<HWND>(lockedHwnd_);  // 保真
-        } else {
-            win.title.clear();
-            win.width = 0;
-            win.height = 0;
-        }
-    } else {
-        if (lockedHwnd_ != 0) lockedHwnd_ = 0;  // 锁定的窗口没了，解锁
-        if (!ResolveWindow(profile_.match, win)) {
+    switch (ResolveTarget(win)) {
+        case TargetResolve::Locked:
+            locked = true;
+            break;
+        case TargetResolve::Waiting: {
             std::lock_guard<std::mutex> lk(mu_);
             status_.state = SessionState::Disabled;
-            // 把规则原样写出来：用户要的就是"匹配不到就别乱选"，那至少要让他
-            // 看得见"在找什么、为什么没找到"。
-            status_.detail = "匹配不到窗口（要求：" + profile_.match.Describe() +
-                             "）；不会改录别的窗口";
+            status_.windowMissing = true;
+            // hwnd / 标题仍然报**那个目标的**：界面据此显示"在等哪个窗口回来"，
+            // 而不是把这一路当成"从没匹配到过"。
+            status_.hwnd = target_.hwnd;
+            status_.matchedTitle = target_.title;
+            status_.detail = "捕获的窗口已关闭（" + target_.title +
+                             "），正在等它重新出现；不会改录同一个程序的其它窗口";
             return false;
         }
+        case TargetResolve::Reset:
+            if (!ResolveWindow(profile_.match, win)) {
+                std::lock_guard<std::mutex> lk(mu_);
+                status_.state = SessionState::Disabled;
+                status_.windowMissing = false;
+                // 把规则原样写出来：用户要的就是"匹配不到就别乱选"，那至少要让他
+                // 看得见"在找什么、为什么没找到"。
+                status_.detail = "匹配不到窗口（要求：" + profile_.match.Describe() +
+                                 "）；不会改录别的窗口";
+                return false;
+            }
+            break;
     }
     if (win.hwnd == 0) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1032,11 +1162,14 @@ bool Session::ResolveSource() {
         std::string err;
         if (windowCapture_->Init(win.hwnd, err)) {
             capture_ = nullptr;
-            lockedHwnd_ = reinterpret_cast<uint64_t>(win.hwnd);  // 锁定这一路
+            // 锁定这一路：同时把同应用的其它窗口记进黑名单，之后目标关了
+            // 也不许漂到它们身上（见 Session.h 里 TargetWindow 的说明）。
+            LockTarget(win);
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 status_.hwnd = reinterpret_cast<uint64_t>(win.hwnd);
                 status_.matchedTitle = win.title;
+                status_.windowMissing = false;
                 status_.width = windowCapture_->Width();
                 status_.height = windowCapture_->Height();
                 status_.detail = "窗口（WGC）：" + win.title;
@@ -1196,6 +1329,34 @@ void Session::ThreadMain() {
         while (!stopRequested_.load(std::memory_order_acquire)) {
             const auto loopStart = std::chrono::steady_clock::now();
             waitingSkip = false;
+
+            // ---- 目标窗口还在不在（每秒核一次）----------------------------------
+            //
+            // WGC 对"关掉的窗口"**不一定**报 AccessLost：Chromium 系关窗口只是
+            // ShowWindow(SW_HIDE)，合成器直接停帧，AcquireNextFrame 不报错、
+            // 只是再也不给新帧。不主动查的话画面永远停在最后一帧、状态还是
+            // live —— 用户要的 NO SIGNAL 永远盖不上来（"关了窗口画面定住"
+            // 就是这么来的）。
+            //
+            // 查到它没了就跳出主循环：外层会走"每秒重试 + Disabled"那条路，
+            // 由 ResolveTarget 判断到底是"等它回来"还是"应用退了重新匹配"。
+            if (profile_.source.kind == SourceKind::Window && target_.valid()) {
+                const auto nowCheck = std::chrono::steady_clock::now();
+                if (lastTargetCheck_.time_since_epoch().count() == 0 ||
+                    nowCheck - lastTargetCheck_ >= std::chrono::milliseconds(1000)) {
+                    lastTargetCheck_ = nowCheck;
+                    if (!WindowPresent(
+                            reinterpret_cast<HWND>(static_cast<uintptr_t>(target_.hwnd)))) {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        status_.state = SessionState::Disabled;
+                        status_.windowMissing = true;
+                        status_.detail =
+                            "捕获的窗口已关闭（" + target_.title +
+                            "），正在等它重新出现；不会改录同一个程序的其它窗口";
+                        break;
+                    }
+                }
+            }
 
             // ---- 等消费者接入 -------------------------------------------------
             if (!connected) {
@@ -1702,28 +1863,38 @@ void Session::ThreadMain() {
                             }
                             // 句柄失效了：落到下面的重新匹配逻辑。
                         }
-                        // WGC 这一路：窗口断了要重建。优先复用**锁定的**那个窗口——
-                        // 它还活着（哪怕最小化/锁屏）就继续抓它，不重新按规则匹配，
-                        // 这正是"选定后不中途换窗口"。只有它真没了才解锁重解。
-                        // "没了"包括隐藏（Chromium 关窗口只隐藏不销毁），见 WindowPresent。
+                        // WGC 这一路：窗口断了要重建。复用 ResolveTarget ——
+                        // 目标还活着（哪怕最小化/锁屏）就继续抓它；目标关着就
+                        // 直接放弃这一轮（don't drift），不改成同应用的别的窗口。
                         WindowInfo again;
                         if (!profile_.match.Valid()) break;  // 没规则，再试也没用
-                        if (lockedHwnd_ != 0 && WindowPresent(reinterpret_cast<HWND>(lockedHwnd_))) {
-                            again.hwnd = reinterpret_cast<HWND>(lockedHwnd_);
-                            const auto snap = EnumerateWindows({again.hwnd});
-                            if (!snap.empty()) again = snap.front();
-                        } else {
-                            if (lockedHwnd_ != 0) lockedHwnd_ = 0;  // 窗口没了，解锁
-                            if (!ResolveWindow(profile_.match, again) || !again.hwnd) continue;
+                        const auto tr = ResolveTarget(again);
+                        if (tr == TargetResolve::Waiting) {
+                            // 目标关着、应用还在：这一轮别重建了，立刻回外层
+                            // 走"每秒重试 + Disabled（NO SIGNAL）"那条路。
+                            {
+                                std::lock_guard<std::mutex> lk(mu_);
+                                status_.state = SessionState::Disabled;
+                                status_.windowMissing = true;
+                                status_.hwnd = target_.hwnd;
+                                status_.matchedTitle = target_.title;
+                                status_.detail = "捕获的窗口已关闭（" + target_.title +
+                                                 "），正在等它重新出现；不会改录同一个程序的其它窗口";
+                            }
+                            break;
                         }
+                        if (!again.hwnd) continue;
                         std::string werr;
                         if (windowCapture_->Init(again.hwnd, werr)) {
                             rebuilt = true;
                             newW = windowCapture_->Width();
                             newH = windowCapture_->Height();
+                            // 目标回来了：重新锁定它（黑名单沿用，只补新的）。
+                            LockTarget(again);
                             std::lock_guard<std::mutex> lk(mu_);
                             status_.hwnd = reinterpret_cast<uint64_t>(again.hwnd);
                             status_.matchedTitle = again.title;
+                            status_.windowMissing = false;
                             break;
                         }
                         // 窗口变了但 WGC 还抓不到（新窗口刚创建、合成器还没上）：
@@ -1782,8 +1953,15 @@ void Session::ThreadMain() {
                     // 每拍都会撞一次 AccessLost，等于没有节制的重试；而如果 ws
                     // 真的坏了，线程就永久卡在 Failed 上，窗口再开也接不回来。
                     std::lock_guard<std::mutex> lk(mu_);
-                    status_.state = SessionState::Failed;
-                    status_.detail = useWgc ? "目标窗口不见了，正在等它回来" : "桌面采集中断，正在等它恢复";
+                    if (status_.windowMissing) {
+                        // 目标窗口关着（上面已经写清楚在等它）：别用一句含糊的
+                        // "目标窗口不见了"把窗口标题盖掉 —— 界面要靠它告诉用户
+                        // 到底在等哪个窗口。
+                    } else {
+                        status_.state = SessionState::Failed;
+                        status_.detail =
+                            useWgc ? "目标窗口不见了，正在等它回来" : "桌面采集中断，正在等它恢复";
+                    }
                     break;  // 跳出主循环 → 走外层的解析重试
                 }
                 lastPublish = actEnd;
@@ -1996,6 +2174,10 @@ void Session::ThreadMain() {
             if (sinceWindow >= std::chrono::seconds(1)) {
                 RefreshRecordStatus();
                 RefreshAudioStatus(0);
+                // 黑名单每秒补一次：目标活着的时候，同应用新冒出来的窗口
+                // （弹出的对话框、新建的播放器）也要记进去，否则目标关掉之后
+                // 它们就成了"合法候选"，画面又漂过去了。
+                RefreshSiblings();
                 const double secs = std::chrono::duration<double>(sinceWindow).count();
                 const double instant = static_cast<double>(framesInWindow) / secs;
                 std::lock_guard<std::mutex> lk(mu_);
