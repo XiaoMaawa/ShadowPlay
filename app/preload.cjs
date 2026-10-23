@@ -702,6 +702,25 @@ const api = {
     return () => ipcRenderer.removeListener('service:event', wrapped)
   },
 
+  /**
+   * 订阅实时电平（≈20Hz）：`{ ts, items: [{ id, lv }] }`，lv 是线性 0..1。
+   *
+   * 和 onServiceEvent 分开是因为频率完全不同：那条一秒一次，这条每秒 20 次，
+   * 界面得用轻量的方式处理（只改一个 Map，不走整份状态）。
+   */
+  onMeter(callback) {
+    if (typeof callback !== 'function') return () => {}
+    const wrapped = (_evt, payload) => {
+      try {
+        callback(payload)
+      } catch (err) {
+        console.error('[preload] 电平事件处理出错：', err)
+      }
+    }
+    ipcRenderer.on('service:meter', wrapped)
+    return () => ipcRenderer.removeListener('service:meter', wrapped)
+  },
+
   // 页面主动把统计推给主进程。
   //
   // 为什么不反过来让主进程用 executeJavaScript 去"拉"：跨进程读一次要

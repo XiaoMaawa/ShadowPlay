@@ -49,6 +49,9 @@ const SERVICE_SOURCES = [
   'native\\backend\\SegmentRecorder.cpp',
   'native\\backend\\Exporter.cpp',
   'native\\backend\\MfEncoder.cpp',
+  // 声音：WASAPI 采集（系统混音 / 进程环回）+ PCM 滚动落地。
+  'native\\backend\\AudioCapture.cpp',
+  'native\\backend\\AudioRing.cpp',
   'native\\backend\\Utf8Path.cpp',
   'native\\backend\\EnvPath.cpp',
   'native\\backend\\StatusFile.cpp',
@@ -74,6 +77,10 @@ const SERVICE_LIBS = [
   // WindowsDeleteString。WindowCapture.cpp 用 Windows.Graphics.Capture 抓窗口
   // （被挡住也能录）时离不开这三个符号，漏了就是 LNK2019。
   'winmm.lib', 'windowsapp.lib',
+  // 声音（AudioCapture.cpp）：WASAPI 全在这一对里
+  //   mmdevapi  -- ActivateAudioInterfaceAsync / IMMDeviceEnumerator
+  //   ole32     -- PropVariantClear（上面已经有了）
+  'mmdevapi.lib',
   // exe_main.cpp 用 CommandLineToArgvW
   'shell32.lib',
 ]
@@ -178,7 +185,8 @@ runBatch(
 // 的编译，漏掉就是 LNK2019。
 // ---------------------------------------------------------------------------
 const addonExtraObjs = []
-for (const src of ['Exporter', 'MfEncoder', 'Utf8Path', 'EnvPath']) {
+// AudioRing 也在里面：Exporter 导出时要从 audio 目录读 PCM 塞进成片。
+for (const src of ['Exporter', 'MfEncoder', 'AudioRing', 'Utf8Path', 'EnvPath']) {
   const o = path.join(BUILD_DIR, `addon_${src}.obj`)
   runBatch(
     `编译 addon_${src}.obj`,

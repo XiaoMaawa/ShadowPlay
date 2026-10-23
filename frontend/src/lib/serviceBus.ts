@@ -53,6 +53,25 @@ export interface SessionLive {
   recordFrames: number
 
   /**
+   * 声音（只进导出成片，预览不发声）。
+   *
+   * audioPeak / audioRms 是**线性** 0..1（服务端直接给的峰值/有效值），界面
+   * 自己转 dB 画条。audioActive = 这一路现在真的在抓声音；audioDetail 说明
+   * 抓的是系统混音还是某个窗口的进程环回。
+   *
+   * audioError 非空 = 这一路采不到声音的原因（目前只有窗口捕获会报：窗口音频
+   * 只抓那个进程，抓不到就直接失败，不再退化成"所有窗口混在一起"的系统混音）。
+   * 界面拿它在预览画面上盖一条红条，空串表示没问题。
+   */
+  audioActive?: boolean
+  audioPeak?: number
+  audioRms?: number
+  audioDetail?: string
+  audioError?: string
+  audioChunks?: number
+  audioBytes?: number
+
+  /**
    * 编码器**实际**在用的帧率 / 码率（和配置值分开）。
    *
    * 【为什么要分两套】硬件编码器有「分辨率 × 帧率」的吞吐上限（2560x1440 只到
@@ -191,6 +210,31 @@ const exportStates = ref<Record<string, ExportJobState>>({})
 /** 服务进程退出过（预览会跟着断，界面要提示重启） */
 const serviceExited = ref<number | null>(null)
 
+/**
+ * 实时电平（配置 id -> 线性 0..1）。
+ *
+ * 【为什么不放进 live】live 是每秒一份的整份快照，而这个是每秒 20~30 次的
+ * 小更新。混在一起会让每个 tick 都去 diff 整个 sessions 数组（几十 KB），
+ * 音量条还没动，主线程先卡了。所以单独一个浅层对象：一次只换掉 map，
+ * 用到它的 computed 才重算。
+ */
+const meterLevels = shallowRef<Record<string, number>>({})
+
+let meterUnlisten: (() => void) | null = null
+
+/** 把主进程推来的一份电平表铺进 meterLevels（已按 id 摊平）。 */
+function applyMeter(doc: { items?: { id?: unknown; lv?: unknown }[] } | null) {
+  const items = Array.isArray(doc?.items) ? doc.items : []
+  const next: Record<string, number> = {}
+  for (const it of items) {
+    const id = typeof it?.id === 'string' ? it.id : ''
+    const lv = Number(it?.lv)
+    if (!id || !Number.isFinite(lv)) continue
+    next[id] = Math.min(1, Math.max(0, lv))
+  }
+  meterLevels.value = next
+}
+
 let timer: ReturnType<typeof setInterval> | null = null
 let unlisten: (() => void) | null = null
 let inflight = false
@@ -322,6 +366,13 @@ export function startServiceBus(pollMs = 1000) {
 
   void pull()
   timer = setInterval(() => void pull(), Math.max(250, pollMs))
+
+  // 实时电平：单独一条通道（见 onMeter 的说明），不触发 pull，也不进 live。
+  if (p && typeof p.onMeter === 'function') {
+    meterUnlisten = (p.onMeter as (cb: (d: unknown) => void) => () => void)((doc) => {
+      applyMeter(doc as { items?: { id?: unknown; lv?: unknown }[] })
+    })
+  }
 }
 
 export function stopServiceBus() {
@@ -333,6 +384,11 @@ export function stopServiceBus() {
     unlisten()
     unlisten = null
   }
+  if (meterUnlisten) {
+    meterUnlisten()
+    meterUnlisten = null
+  }
+  meterLevels.value = {}
 }
 
 /** 界面上的"配置列表"变了以后调一下，让 profileCount 立刻跟上 */
@@ -350,6 +406,7 @@ export function useServiceBus() {
     lastExport: readonly(lastExport),
     exportStates: readonly(exportStates),
     serviceExited: readonly(serviceExited),
+    meterLevels,
     refresh: pull,
   }
 }

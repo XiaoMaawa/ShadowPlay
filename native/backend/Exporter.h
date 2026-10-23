@@ -147,7 +147,9 @@ private:
 
     mutable std::mutex mu_;
     ExportStatus       status_;
-    uint64_t           lastJobId_ = 0;
+    // jobId 用进程级的单调计数器（见 Exporter.cpp 的 g_lastJobId），不放成员：
+    // 改配置会重建 Session/Exporter，放成员会让 jobId 从头开始，界面拿它判
+    // 「这是不是新的一次导出」就会误判成旧任务。
     std::thread        worker_;
 
     // ---- 点击那一刻的「照片」------------------------------------------------

@@ -73,6 +73,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <future>
 #include <map>
 #include <mutex>
@@ -560,6 +561,14 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
     // 只保护**表**本身，不保护表里的 Session —— Session 自己有锁，Stop() 也是
     // 在锁外调的，否则等 ffmpeg 收尾的那一秒多会把主循环全堵死。
     std::mutex sessionsMutex;
+    // doc（主循环手里那份配置）的保护。
+    //
+    // 【为什么需要】doc 过去只在启动时读一次，reload 线程读进来的 fresh 是局部
+    // 变量 —— 改了「回放时长」「导出目录」并保存后，正在跑的服务还在用旧值：
+    // 导出按旧的 replaySeconds 裁窗口、写到旧的 exportDir，状态文件里报的也是
+    // 旧目录，必须重启服务才对。现在 reload 成功后把 fresh 写回 doc，读写都走
+    // 这把锁（主循环读、reload 线程写）。
+    std::mutex docMutex;
     // 同一时刻只允许一次重建：连点保存不会叠出两组 ffmpeg 抢同一批分片目录。
     std::mutex reloadSerial;
     std::mutex reloadMutex;
@@ -883,6 +892,74 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
     // 反向看门：守护盯服务，服务也盯守护 —— 它的心跳没了就再拉一个。
     int guardianCheckTicks = 0;
 
+    // ---- 实时电平表（30Hz）------------------------------------------------
+    //
+    // 【为什么单独一个文件】status-v1.json 是每秒整份重写一次的（几 KB），
+    // 拿它画音量条只能得到 1Hz 的台阶。用户要的是"像 OBS 那样实时动"，
+    // 所以另起一个几十字节的小文件 id→电平，界面按 30~60Hz 轮询它。
+    //
+    // 写法和状态文件一样用"先写 .tmp 再 MoveFileEx 换过去"：读的一侧永远
+    // 不会读到半截 JSON。代价是每秒 30 次小文件写，忽略不计。
+    std::atomic<bool> meterStop{false};
+    const auto nowWall = []() {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER u;
+        u.LowPart = ft.dwLowDateTime;
+        u.HighPart = ft.dwHighDateTime;
+        return static_cast<int64_t>(u.QuadPart / 10000ull) - 11644473600000ll;
+    };
+    std::thread meterThread([&]() {
+        // 和 status-v1.json 放同一个目录（主进程据此找它）。
+        const std::wstring meterPath =
+            std::filesystem::path(FromUtf8(StatusFilePath())).parent_path().wstring() +
+            L"\\meter-v1.json";
+        const std::wstring meterTmp = meterPath + L".tmp";
+        while (!meterStop.load(std::memory_order_acquire)) {
+            std::string js = "{\"ts\":" + std::to_string(nowWall()) + ",\"items\":[";
+            bool first = true;
+            {
+                std::lock_guard<std::mutex> lk(sessionsMutex);
+                for (auto& s : sessions) {
+                    if (!s) continue;
+                    if (!first) js += ",";
+                    first = false;
+                    js += "{\"id\":\"" + JsonEscape(s->Id()) + "\",\"lv\":" +
+                          std::to_string(static_cast<double>(s->MeterLevel())) + "}";
+                }
+            }
+            js += "]}";
+            {
+                HANDLE f = CreateFileW(meterTmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                       FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (f != INVALID_HANDLE_VALUE) {
+                    DWORD written = 0;
+                    const BOOL ok = WriteFile(f, js.data(), static_cast<DWORD>(js.size()),
+                                              &written, nullptr);
+                    CloseHandle(f);
+                    if (ok) {
+                        if (!MoveFileExW(meterTmp.c_str(), meterPath.c_str(),
+                                         MOVEFILE_REPLACE_EXISTING)) {
+                            // 目标被占用（极偶尔）：直接覆盖写一次，别停表。
+                            HANDLE g = CreateFileW(meterPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                            if (g != INVALID_HANDLE_VALUE) {
+                                DWORD w2 = 0;
+                                WriteFile(g, js.data(), static_cast<DWORD>(js.size()), &w2,
+                                          nullptr);
+                                CloseHandle(g);
+                            }
+                            DeleteFileW(meterTmp.c_str());
+                        }
+                    } else {
+                        DeleteFileW(meterTmp.c_str());
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        }
+    });
+
     while (g_running.load(std::memory_order_acquire)) {
         // ---- 守护进程还活着吗（每 5 秒一次）--------------------------------
         //
@@ -945,6 +1022,13 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                     LogError("profile_reload_failed",
                              std::string("重新读取配置失败，保留旧会话：") + loadErr);
                     return;
+                }
+                // 把新配置同步回主循环手里那份：导出时长、导出目录、录制根目录
+                // 都是主循环从 doc 里取的（见 ExportNow 的调用处），不同步的话
+                // 保存完这几项仍然按旧值干（详见 docMutex 处注释）。
+                {
+                    std::lock_guard<std::mutex> lk(docMutex);
+                    doc = fresh;
                 }
                 for (const std::string& id : reloads) {
                     const Profile* np = fresh.Find(id);
@@ -1108,19 +1192,29 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
 
             // 时长：命令里给了就用它，否则用该配置的 replaySeconds
             // （"导出最近 N 秒"跟回放缓冲时长本来就是同一个语义）。
+            // 这两项都从 doc 取，而 doc 会被 reload 线程改写，所以整体在锁里
+            // 抄一份出来用（不要边读边用：锁外再读 doc 可能已经换了一份）。
             double useSeconds = secs;
-            if (useSeconds <= 0.0) {
-                for (const auto& p : doc.profiles) {
-                    if (p.id == id) { useSeconds = static_cast<double>(p.video.replaySeconds); break; }
+            std::string exportDirNow;
+            {
+                std::lock_guard<std::mutex> lk(docMutex);
+                if (useSeconds <= 0.0) {
+                    for (const auto& p : doc.profiles) {
+                        if (p.id == id) {
+                            useSeconds = static_cast<double>(p.video.replaySeconds);
+                            break;
+                        }
+                    }
                 }
+                exportDirNow = doc.exportDir;
             }
 
-            const bool started = target->ExportNow(doc.exportDir, useSeconds);
+            const bool started = target->ExportNow(exportDirNow, useSeconds);
             LogLine("{\"type\":\"export_started\",\"id\":\"" + JsonEscape(id) +
                     "\",\"name\":\"" + JsonEscape(target->Name()) +
                     "\",\"ok\":" + (started ? "true" : "false") + ",\"seconds\":" +
                     std::to_string(useSeconds) + ",\"exportDir\":\"" +
-                    JsonEscape(doc.exportDir) + "\"}");
+                    JsonEscape(exportDirNow) + "\"}");
         }
 
         // ---- 状态上报：满 1 秒才做 ----------------------------------------
@@ -1154,7 +1248,15 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
         // 固定信息也要放进去：界面光拿 sessions 是不知道导出到哪儿的，而它要显示。
         // profilesPath 尤其重要 —— 界面要靠它判断"正在跑的这个服务用的是不是
         // 我这份配置"（复用别人的服务时两边的 recordRoot 可能完全不同）。
-        PublishStatusFile(items, doc.recordRoot, doc.exportDir, opt.profilesPath);
+        // 这两个字符串同样来自 doc，会被 reload 改写，所以在锁里抄出来。
+        std::string statusRecordRoot;
+        std::string statusExportDir;
+        {
+            std::lock_guard<std::mutex> lk(docMutex);
+            statusRecordRoot = doc.recordRoot;
+            statusExportDir = doc.exportDir;
+        }
+        PublishStatusFile(items, statusRecordRoot, statusExportDir, opt.profilesPath);
 
         // ---- 导出进度/结果事件 -------------------------------------------
         // 界面不能靠"对比两次 sessions 快照"来判断导出结束了没有 —— 那需要
@@ -1195,6 +1297,10 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
             }
         }
     }
+
+    // 电平表线程先收工：它每 33ms 抓一次 sessionsMutex，下面要动 sessions。
+    meterStop.store(true, std::memory_order_release);
+    if (meterThread.joinable()) meterThread.join();
 
     LogLine("{\"type\":\"stopping\"}");
     // 先等后台重建线程收尾：它们手里可能正攥着一个 Session（还没挂进表里），

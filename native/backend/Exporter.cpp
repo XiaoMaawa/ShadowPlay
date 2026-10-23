@@ -58,12 +58,15 @@
 #include <vector>
 
 #include "EnvPath.h"    // ExpandEnv：导出目录里的 %TEMP% 这类占位符
+#include "AudioRing.h"  // AudioClipReader：按窗口读 PCM，写进成片的音轨
 #include "JsonUtil.h"   // JsonEscape：诊断日志里要转义
 #include "MfEncoder.h"  // MfAcquire / MfRelease：MF 的进程级生命周期
 #include "Utf8Path.h"   // FromUtf8 / ToUtf8 / PathToUtf8 / PathFromUtf8
 
 namespace shadow {
 namespace fs = std::filesystem;
+
+
 
 namespace {
 
@@ -987,13 +990,186 @@ bool Exporter::CaptureSnapshot() {
     return true;
 }
 
+namespace {
+
+/**
+ * 成片的音轨：把 `<录像目录>/audio` 里的 PCM 按时间轴顺序编码成 AAC 写出去。
+ *
+ * 【为什么音频不在分片里】见 AudioRing.h 文件头：每片重开 AAC 编码器会带
+ * priming，2 秒一片就在成片里留下每 2 秒一个 20ms 的空隙。音频独立落地、
+ * 导出时**一次**编码进成品，只有文件开头那一次编码器延迟。
+ *
+ * 【时间轴】调用方给 anchorMs（视频时间轴 0 点对应的墙钟毫秒），这里按
+ * 采样号推 ticks：ticks = samples * 1e7 / 48000。视频那边也是按帧号推的，
+ * 两边都从 0 起，天然对齐。
+ *
+ * 【背压】WriteUntil(ticks) 只写到"视频已经写到的位置"附近，不会把整条
+ * 音轨一次性堆进 SinkWriter —— 否则 Finalize 要串行清空一大坨编码任务。
+ */
+class AudioMux {
+public:
+    /** 无论导出正常收尾还是半路失败，都要把"保留"放开（见 Open）。 */
+    ~AudioMux() {
+        if (pinned_) AudioRing::SetExportPin(0);
+    }
+
+    /**
+     * 给 writer 加一条 AAC 音轨并打开音频源。返回 false = 没有音频或加不上，
+     * 调用方照旧导纯视频（**不能**因此让整次导出失败）。
+     */
+    bool Open(IMFSinkWriter* writer, const std::string& audioDir, int64_t anchorMs) {
+        active_ = false;
+        exhausted_ = false;
+        sampleIndex_ = 0;
+        writer_ = writer;
+        if (!writer_ || audioDir.empty() || anchorMs <= 0) return false;
+        if (!reader_.Open(audioDir, anchorMs, 0) || !reader_.HasAudio()) return false;
+        // 音频是跟着视频进度慢慢读的，一次导出要读几十秒。这段时间里滚动
+        // 删除照跑，万一删掉还没读到的块，成片就会凭空静音一整块。钉住。
+        AudioRing::SetExportPin(anchorMs);
+        pinned_ = true;
+
+        // 输出：AAC-LC，48k 立体声，192kbps（对这个用途足够，成片体积也可控）。
+        IMFMediaType* outT = nullptr;
+        HRESULT hr = MFCreateMediaType(&outT);
+        if (SUCCEEDED(hr)) hr = outT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        if (SUCCEEDED(hr)) hr = outT->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+        if (SUCCEEDED(hr)) hr = outT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        if (SUCCEEDED(hr)) hr = outT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        if (SUCCEEDED(hr)) hr = outT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        if (SUCCEEDED(hr)) hr = outT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);
+        if (SUCCEEDED(hr)) hr = outT->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+        if (SUCCEEDED(hr)) hr = writer_->AddStream(outT, &stream_);
+        if (outT) outT->Release();
+        if (FAILED(hr)) {
+            LogExportPlan(std::string("audio: AddStream 失败，成片将没有声音（hr=") + HrText(hr) +
+                          "）");
+            return false;
+        }
+
+        // 输入：未压缩 PCM（SinkWriter 内部会调 AAC 编码器 MFT 压它）。
+        IMFMediaType* inT = nullptr;
+        hr = MFCreateMediaType(&inT);
+        if (SUCCEEDED(hr)) hr = inT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        if (SUCCEEDED(hr)) hr = inT->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        if (SUCCEEDED(hr)) hr = inT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        if (SUCCEEDED(hr)) hr = inT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        if (SUCCEEDED(hr)) hr = inT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        if (SUCCEEDED(hr)) hr = inT->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+        if (SUCCEEDED(hr)) hr = inT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192000);
+        if (SUCCEEDED(hr)) hr = writer_->SetInputMediaType(stream_, inT, nullptr);
+        if (inT) inT->Release();
+        if (FAILED(hr)) {
+            LogExportPlan(std::string("audio: 输入类型被拒，成片将没有声音（hr=") + HrText(hr) +
+                          "）");
+            return false;
+        }
+
+        pcm_.assign(kBlockFrames * 2, 0);
+        active_ = true;
+        LogExportPlan("audio: 音轨已接上，起点 " + std::to_string(anchorMs) + " ms");
+        return true;
+    }
+
+    bool Active() const { return active_; }
+
+    /** 把音轨推进到 ticks（100ns，相对时间轴 0）。 */
+    void WriteUntil(int64_t ticks) {
+        if (!active_ || exhausted_) return;
+        while (true) {
+            const int64_t t0 = TicksOf(sampleIndex_);
+            if (t0 >= ticks) break;
+            const size_t got = reader_.Read(sampleIndex_, pcm_.data(), kBlockFrames);
+            if (got == 0) {
+                exhausted_ = true;
+                break;
+            }
+            if (!WriteBlock(t0, got)) {
+                active_ = false;
+                return;
+            }
+            sampleIndex_ += static_cast<int64_t>(got);
+        }
+    }
+
+    /**
+     * 收尾：写到 endTicks 为止，**音频不够长就补静音**。
+     *
+     * 不补的话，音频设备中途断掉的那次录制会产出一条比视频短很多的音轨；
+     * 有些播放器会按音轨长度显示时长，看起来像"视频被截断了"。
+     */
+    void Finish(int64_t endTicks) {
+        if (!active_) return;
+        WriteUntil(endTicks);
+        if (!active_) return;
+        while (TicksOf(sampleIndex_) < endTicks) {
+            std::fill(pcm_.begin(), pcm_.end(), 0);
+            if (!WriteBlock(TicksOf(sampleIndex_), kBlockFrames)) break;
+            sampleIndex_ += static_cast<int64_t>(kBlockFrames);
+        }
+        active_ = false;
+    }
+
+private:
+    static constexpr size_t kBlockFrames = 1024; // AAC 一帧的采样数
+
+    static int64_t TicksOf(int64_t samples) { return samples * 10000000ll / 48000ll; }
+
+    bool WriteBlock(int64_t startTicks, size_t frames) {
+        IMFMediaBuffer* buf = nullptr;
+        if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(frames) * 4, &buf)) || !buf) return false;
+        BYTE* dst = nullptr;
+        if (FAILED(buf->Lock(&dst, nullptr, nullptr)) || !dst) {
+            buf->Release();
+            return false;
+        }
+        std::memcpy(dst, pcm_.data(), frames * 4);
+        buf->Unlock();
+        buf->SetCurrentLength(static_cast<DWORD>(frames) * 4);
+
+        IMFSample* sample = nullptr;
+        if (FAILED(MFCreateSample(&sample)) || !sample) {
+            buf->Release();
+            return false;
+        }
+        sample->AddBuffer(buf);
+        buf->Release();
+        sample->SetSampleTime(startTicks);
+        sample->SetSampleDuration(TicksOf(static_cast<int64_t>(frames)));
+        const HRESULT hr = writer_->WriteSample(stream_, sample);
+        sample->Release();
+        if (FAILED(hr)) {
+            LogExportPlan(std::string("audio: WriteSample 失败（hr=") + HrText(hr) + "）");
+            return false;
+        }
+        return true;
+    }
+
+    IMFSinkWriter* writer_ = nullptr;
+    DWORD stream_ = 0;
+    bool active_ = false;
+    bool exhausted_ = false;
+    bool pinned_ = false; // 是否钉住了音频块（见 Open / 析构）
+    AudioClipReader reader_;
+    int64_t sampleIndex_ = 0;
+    std::vector<int16_t> pcm_;
+};
+
+} // namespace
+
+// 导出任务号的唯一来源：进程级单调递增。
+// 为什么不是 Exporter 的成员：改配置（reload）会重建 Session 连带重建
+// Exporter，成员会从 0 重新数，界面和脚本拿 jobId 判「这是不是新的一次」
+// 就会把第二次导出当成第一次，一直等不到结果。
+static std::atomic<uint64_t> g_lastJobId{0};
+
 bool Exporter::Start() {
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (status_.running) return false; // 上一轮还在导
         status_ = ExportStatus{};
         status_.running = true;
-        status_.jobId = ++lastJobId_;
+        status_.jobId = ++g_lastJobId;
         status_.phase = "快照";
     }
     // 拍照要在这个线程做（理由见 CaptureSnapshot 上面那段）。
@@ -1272,12 +1448,35 @@ void Exporter::Run() {
     }
     const double cutoffEnd = (newestEnd > 0.0 && newestEnd < nowUnix) ? newestEnd : nowUnix;
     // 「从指定时刻起导」：窗口左端锚定在给定的墙钟上，右端就是内容时间轴的
-    // 最新位置 —— 窗口跨度因此是"实际录到的时长"，不再由 maxSeconds 决定。
+    // 最新位置 —— 一开始窗口跨度是"实际录到的时长"，随后会被下面的
+    // 回放时长上限夹一次（用户要求：配置多少秒就出多少秒）。
     // 中间隔着停录的空档也照算（那一截在计划器里直接跳过，不补 NO SIGNAL）。
     const bool   fromCut = startUnixMs_ > 0;
     const double cutSec   = static_cast<double>(startUnixMs_) / 1000.0;
-    const double windowSec = fromCut ? (cutoffEnd - cutSec)
-                                     : (maxSeconds_ > 0 ? static_cast<double>(maxSeconds_) : 0.0);
+    double windowSec = fromCut ? (cutoffEnd - cutSec)
+                               : (maxSeconds_ > 0 ? static_cast<double>(maxSeconds_) : 0.0);
+    // 窗口左端（墙钟秒）。fromCut 默认就是切点；下面若超长会被推后。
+    double windowStartSec = cutSec;
+
+    // 【「从上次保存处继续」也必须服从回放时长】
+    //
+    // 原来这里把窗口跨度直接取成"切点 → 现在"，而且 fromCut 分支的 want
+    // 是 1e18（"想铺多长铺多长"）。于是成片长度 = 从上次保存到现在过了多久，
+    // 分片环还留着 24~26 秒，用户设 20 秒就会导出 22 秒、23 秒 —— 完全是
+    // 看运气（点保存之后隔了多久才点导出）。用户原话：
+    // 「录制的视频莫名其妙多了几秒，我要严格的配置写多少就是多少秒」。
+    //
+    // 现在：超过回放窗口就以"最新内容为准，往回数 maxSeconds 秒"为左端。
+    // 这样既不会把保存之前的内容带进来（起点仍在切点之后），也不会超出
+    // 用户配置的时长。
+    if (fromCut && maxSeconds_ > 0) {
+        const double cap = static_cast<double>(maxSeconds_);
+        if (windowSec > cap) {
+            windowSec = cap;
+            windowStartSec = cutoffEnd - cap;
+            if (windowStartSec < cutSec) windowStartSec = cutSec;
+        }
+    }
     if (fromCut && windowSec < 0.05) {
         MfRelease();
         fail("上次保存之后还没有录到新的画面，无可导出的内容。");
@@ -1601,9 +1800,10 @@ void Exporter::Run() {
                 plan.push_back(PlanItem{false, si, 0.0, 0.0});
             }
         } else {
-            // fromCut：不设上限（1e18 当"无穷大"用），每一片铺完为止。
+            // fromCut：窗口跨度在 1b 已经按回放时长夹过了（见那里的说明），
+            // 这里就用它 —— 绝不再"想铺多长铺多长"。
             const double want =
-                fromCut ? 1e18 : static_cast<double>(maxSeconds_);
+                fromCut ? windowSec : static_cast<double>(maxSeconds_);
             double placedSec = 0.0;
             for (const PlanItem& item : plan) {
                 placedSec += item.noSignal ? item.seconds : 0.0;
@@ -1616,7 +1816,7 @@ void Exporter::Run() {
             // 掉了前面）prevEndWall 就是 0，于是第一片的墙钟起点 1792…410 被
             // 当成"距离 0 点有十七亿秒的空档"，一个遮罩项吃满 20 秒，计划里
             // 再没有真实分片，导出报「分片里读不到任何可用的视频帧」。
-            const double windowStart = fromCut ? cutSec : (axisNow - windowSec);
+            const double windowStart = fromCut ? windowStartSec : (axisNow - windowSec);
             double prevEndWall = windowStart + lead;
             bool havePrevEnd = segs.front().startUnixMs > 0;
 
@@ -1844,6 +2044,36 @@ void Exporter::Run() {
 
         DWORD streamIndex = 0;
 
+        // ---- 音频的时间原点 --------------------------------------------------
+        //
+        // 视频时间轴 0 点对应的墙钟毫秒，音频按它对齐：
+        //   * 有回放窗口（maxSeconds_）或「从上次保存处继续」（fromCut）：
+        //     视频 0 点就是窗口起点（片头缺的那截由 NO SIGNAL 的帧占着，
+        //     音频也该从窗口起点开始算，这样声画才对得上）；
+        //   * 不限时长（预览/调试）：视频 0 点是第一段真实内容的起点。
+        int64_t audioAnchorMs = 0;
+        if (fromCut) {
+            // 用夹过之后的窗口左端：视频 0 点就是它（见 1b 的说明）。
+            audioAnchorMs = static_cast<int64_t>(windowStartSec * 1000.0 + 0.5);
+        } else if (maxSeconds_ > 0) {
+            audioAnchorMs = static_cast<int64_t>((axisNow - windowSec) * 1000.0 + 0.5);
+        } else {
+            for (const PlanItem& item : plan) {
+                if (item.noSignal) continue;
+                const size_t si = item.segIndex;
+                if (si >= segs.size() || segs[si].startUnixMs <= 0) continue;
+                audioAnchorMs = segs[si].startUnixMs +
+                                static_cast<int64_t>(item.skipSec * 1000.0 + 0.5);
+                break;
+            }
+        }
+        // 音频就不进「隔离副本」了：它在 <录像目录>/audio 下，和分片一样会被
+        // 环形删除，而这次导出只读窗口内那几十个块 —— 读到一半被删的概率
+        // 远低于分片（块不会被重写，只有跌出窗口才删）。真缺几块就是几段静音，
+        // 不值得为它多复制一份。
+        const std::string audioDirForExport = AudioDirForSegmentsDir(segmentsDir_);
+        AudioMux audioMux;
+
         // ---- 时间轴（两条路共用同一套语义）--------------------------------
         //
         // 按**帧号 × 1e7 / 帧率**算时间戳，不用源 PTS：
@@ -1894,7 +2124,12 @@ void Exporter::Run() {
             hr = writer->AddStream(outType, &streamIndex);
             if (SUCCEEDED(hr)) hr = writer->SetInputMediaType(streamIndex, outType, nullptr);
             outType->Release();
-            if (SUCCEEDED(hr)) hr = writer->BeginWriting();
+            if (SUCCEEDED(hr)) {
+                // 音轨必须在 BeginWriting 之前加（SinkWriter 的约定：Begin 之后
+                // 不能再 AddStream）。加不上就静默走纯视频，不让整次导出失败。
+                audioMux.Open(writer, audioDirForExport, audioAnchorMs);
+                hr = writer->BeginWriting();
+            }
             if (FAILED(hr)) {
                 writer->Release();
                 giveUp("分片的编码格式没法直拷进 MP4（hr=" + HrText(hr) + "）。");
@@ -2034,6 +2269,10 @@ void Exporter::Run() {
                                                          static_cast<double>(segOutFps) +
                                                      0.5);
 
+                // 音频跟着视频往前推（背压：只写到视频已经到过的地方，
+                // 不把整条音轨一次性堆进 SinkWriter）。
+                audioMux.WriteUntil(cursorTicks);
+
                 reader->Release();
                 if (!mergeErr.empty()) break;
                 if (segFrames > 0) ++usedSegments;
@@ -2166,7 +2405,11 @@ void Exporter::Run() {
             if (encCfg) encCfg->Release();
             encOut->Release();
             encIn->Release();
-            if (SUCCEEDED(hr)) hr = writer->BeginWriting();
+            if (SUCCEEDED(hr)) {
+                // 音轨（AAC）和视频一样在 BeginWriting 之前加。加不上就纯视频。
+                audioMux.Open(writer, audioDirForExport, audioAnchorMs);
+                hr = writer->BeginWriting();
+            }
             if (FAILED(hr)) {
                 writer->Release();
                 giveUp("建不了导出编码器（hr=" + HrText(hr) + "）。");
@@ -2221,6 +2464,9 @@ void Exporter::Run() {
                     mergeErr = "写样本失败（hr=" + HrText(whr) + "）";
                     return false;
                 }
+                // 音频跟着视频推进（含 NO SIGNAL 段：那一段也该有这段时间的声音，
+                // 断录时补的不是画面而是"当时其实没声音"，所以音频照常读）。
+                audioMux.WriteUntil(timeTicks);
                 ++outFrames;
                 return true;
             };
@@ -2699,6 +2945,10 @@ void Exporter::Run() {
 
         // 成品时长 = 时间轴推到了多远（下面再问一次文件本身校准）。
         const double cursorSec = static_cast<double>(cursorTicks) / 10000000.0;
+
+        // 音轨收尾：音频比视频短（设备中途断了）就补静音到视频结尾 —— 不然
+        // 播放器看到的是"音轨提前结束"，有的还会按音轨长度显示时长。
+        audioMux.Finish(cursorTicks);
 
         const auto finT0 = std::chrono::steady_clock::now();
         HRESULT fhr = writer->Finalize();

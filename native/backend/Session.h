@@ -24,6 +24,8 @@
 #include <vector>
 
 #include "Exporter.h"
+#include "AudioCapture.h"
+#include "AudioRing.h"
 #include "FrameRing.h"
 #include "Profiles.h"
 #include "ScreenCapture.h"
@@ -151,6 +153,28 @@ struct SessionStatus {
     // 120fps 就是 5.3GB/s —— fps 上不去时靠这三个数分辨卡在哪一段。
     double publishMs = 0.0;
     double feedMs = 0.0;
+    // ---- 声音（需求：声音只进导出成片，预览不发声）------------------------
+    //
+    // audioActive 是"这一路现在真的在抓声音"；audioPeak / audioRms 是线性
+    // 0..1 的电平（界面画音量条用，转 dB 是界面的事）。audioDetail 说明抓的
+    // 是哪条通道（系统混音 / 窗口进程环回），以及退回原因。
+    bool audioActive = false;
+    float audioPeak = 0.0f;
+    float audioRms = 0.0f;
+    std::string audioDetail;
+    // 采不到声音的原因（空 = 没问题）。界面拿它在预览画面上盖一条红条。
+    // 窗口源采不到**不再退回系统混音**：混进来的别的窗口的声音用户根本看不
+    // 出来，那比明着报错更糟。
+    std::string audioError;
+    uint32_t audioChunks = 0;      // 磁盘上保留的音频块数
+    uint64_t audioBytes = 0;       // 音频占用字节
+    // 看门狗重建过几次采集。一直涨说明目标应用反复换音频会话（Chromium 系
+    // 的 audio service 子进程就是按需起停的），出问题时这是第一个该看的数。
+    uint32_t audioRestarts = 0;
+    // 最近一次进程树扫描时"目标进程树里比建环回那一刻多出来的进程数"。
+    // 0 = 树没变。它是上面那个看门狗的判据本身 —— 排查"明明在响却没声音"时，
+    // 先看这个：>0 说明有新子进程跑到了环回外面，紧接着应该看到 audioRestarts 涨。
+    uint32_t audioTreeGrown = 0;
 };
 
 // 一个采集会话。构造后调用 Start()，析构时会自动停线程。
@@ -233,6 +257,19 @@ public:
     std::string StatusJson() const;
 
     /**
+     * 实时电平（0..1 线性，快起慢落）。
+     *
+     * 单独一个接口而不是塞进 StatusJson：状态是每秒一次的，这个要 30Hz 地
+     * 被采集器读走画音量条（见 main.cpp 的电平表写入线程）。
+     *
+     * 【为什么要衰减】这个值只在"收到音频包"时更新。声音一停，引擎往往
+     * 就一个包都不再发 —— 不做衰减的话条子会永远停在最后一个值上，看起来
+     * 像"已经不出声了但音量还是满的"。所以超过 120ms 没新包就按半衰期
+     * 往下掉（见 Session.cpp）。
+     */
+    float MeterLevel() const;
+
+    /**
      * 导出（需求 6）：把这一路的分片合并成一个 MP4 落到 exportDir。
      *
      * 内部起后台线程，立刻返回；进度和结果看 Status().export 那组字段。
@@ -312,6 +349,32 @@ private:
     uint32_t EffectivePreviewFps(uint32_t srcW, uint32_t srcH);
     // 把状态里的录制信息刷新一遍（每秒调一次，扫目录有开销）。
     void RefreshRecordStatus();
+    /**
+     * 起一路声音采集（录制的附属品，recorder 起来之后调）。
+     *
+     * 桌面/显示器源 → 系统混音；窗口源 → 被捕获窗口的进程环回（只抓那个
+     * 进程树）。窗口源采不到就是采不到，**不退回系统混音**（退回会把别的
+     * 窗口的声音混进成片），原因写进 audioError，界面在预览上盖红条。
+     */
+    void StartAudio(const std::string& recordDir);
+    /** 关掉声音采集并收尾落盘的当前块。 */
+    void StopAudio();
+    /**
+     * 只重开采集通道，**不动** audioRing_（落盘目录/文件句柄都不变）。
+     *
+     * 看门狗走这条：环回"看着正常但一个包都没有"时重建一次采集，重建会
+     * 重新抓一次目标进程树，目标进程树里新冒出来的子进程（Chromium 的
+     * audio.mojom.AudioService 就是按需创建、闲着几秒就被回收）才进得来。
+     * 走 StartAudio 会把 ring 也重建一遍、顺手 Purge 掉老块，没必要。
+     */
+    bool RestartAudioCapture();
+    /** 每秒调：刷新电平/统计，采集线程意外退出（换设备）时重开。 */
+    void RefreshAudioStatus(int64_t nowMs);
+    /**
+     * 现在该抓哪个进程的声音：窗口源返回被捕获窗口所属 pid，桌面源/还没匹到
+     * 窗口都返回 0（= 系统混音）。
+     */
+    uint32_t ResolveAudioPid();
 
     Profile profile_;
     ScreenCapture* sharedDesktop_ = nullptr;
@@ -332,6 +395,35 @@ private:
     // 显示器源专用：本会话自己开一份桌面复制，只在没有共享实例时才用。
     std::unique_ptr<ScreenCapture> ownCapture_;
     ScreenCapture* capture_ = nullptr;
+
+    // ---- 声音 ---------------------------------------------------------------
+    //
+    // 采集通道：桌面/显示器源走系统混音（默认渲染设备 loopback），窗口源走
+    // 进程环回（只抓被捕获窗口那个进程树）。落盘走 AudioRing，按回放窗口滚
+    // 动删除；导出端从 audio 目录按墙钟窗口读 PCM 写进成片。
+    //
+    // 为什么把音频和分片分开（不进 mp4）：见 AudioRing.h 文件头 —— 每片重开
+    // AAC 编码器的 priming 会在成片里留下每 2 秒一次的 20ms 空隙。
+    std::unique_ptr<AudioCapture> audio_;
+    std::unique_ptr<AudioRing> audioRing_;
+    int64_t audioRestartAtMs_ = 0;   // 下次允许重开音频的时刻（防抖）
+    bool audioWarned_ = false;       // 退回系统混音的提示只报一次
+    // 看门狗：连续多久没收到音频包才重建采集。静音时引擎本来就不发包，
+    // 所以用"指数退避"（3s→6s→12s→…→60s），真在出声的场景 3 秒内就能救回来，
+    // 一直没声音的场景也不会每秒重建一次。
+    int64_t audioIdleSinceMs_ = 0;   // 从哪一刻开始"没包"
+    int64_t audioIdleBackoffMs_ = 0; // 当前退避窗口（0 = 还没退避过）
+    int64_t audioTreeCheckAtMs_ = 0; // 下次允许扫进程树（1 秒一次）
+    int64_t audioSilentSinceMs_ = 0; // 从哪一刻开始"电平一直是 0"（0 = 此刻有声）
+    uint32_t audioTreeGrown_ = 0;    // 最近一次扫树发现的新子进程数（诊断）
+    uint32_t audioRestarts_ = 0;     // 重建次数（诊断用）
+    /** 实时电平（采集线程写、电平表线程读）。 */
+    std::atomic<float> meterLevel_{0.0f};
+    /** meterLevel_ 最后一次被写入的墙钟毫秒（0 = 还没收到过包）。MeterLevel 靠它衰减。 */
+    std::atomic<int64_t> meterUpdatedMs_{0};
+    // 当前音频抓的是哪个进程（0 = 系统混音）。窗口源在运行中重新匹配到
+    // **另一个进程**的窗口时，采集链路要跟着换，否则画面换了声音还是老的。
+    uint32_t audioPid_ = 0;
 
     // 窗口源专用：WGC（Windows Graphics Capture）直接抓窗口本体，这样窗口
     // 被挡住/被移出屏幕也能录到它自己。WGC 建不起来这一路就失败，

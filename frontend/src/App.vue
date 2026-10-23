@@ -17,6 +17,21 @@
         <b>{{ fpsShown }}</b> fps
       </span>
 
+      <!-- 音量条：显示这一路此刻**录进去**的音量（预览不发声，这是采集电平）。
+           数据是 20~30Hz 的实时电平（service:meter），条子跟着声音连续上下走；
+           颜色不是整条换色，而是把一条固定的"绿→黄→橙→红"渐变用 clip 一点点
+           露出来 —— 和 OBS 一样，越推越往红走。鼠标悬停能看到走的是系统混音
+           还是窗口进程环回。 -->
+      <span
+        v-if="running && activeLive && activeLive.recording"
+        class="meta audio"
+        :title="audioTitle"
+      >
+        <span class="audiobar" :class="{ mute: audioMuted }">
+          <i :style="{ clipPath: audioClip }" />
+        </span>
+      </span>
+
       <span class="spacer" />
 
       <!-- 设置：齿轮就在"服务运行中"左边。
@@ -442,6 +457,18 @@
           </div>
         </div>
 
+        <!-- 采不到声音的红色提示条：盖在预览画面**底部**，宽度铺满、高度正好
+             一行，右侧一个叉关掉。
+             【为什么窗口捕获要报错而不是退回去】窗口捕获只抓那一个窗口的声音；
+             抓不到时如果偷偷退回"系统混音"，录进去的就是所有窗口混在一起的声音
+             —— 用户看不出来，成片里却混着别的程序的声音。宁可明着告诉他这一路
+             没声音，也不要给他一份错的音频。 -->
+        <div v-if="audioAlert" class="audio-alert" role="alert">
+          <span class="aa-ico" aria-hidden="true">!</span>
+          <span class="aa-txt" :title="audioAlert">{{ audioAlert }}</span>
+          <button class="aa-x" type="button" title="关闭提示" @click="dismissAudioAlert">×</button>
+        </div>
+
         <!-- 服务没在跑时给一键启动 -->
         <div v-if="waitingService && !fatal" class="overlay-actions">
           <button class="primary" @click="launchService">启动采集服务</button>
@@ -461,7 +488,7 @@ import type { SessionLive } from '@/lib/serviceBus'
 const { canvas, running, fatal, waitingService, serviceHint, stats, start, stop, retry, switchSession, seedLedgerFromService, reportStats, setupHistory, getHistory, setMaxFps } =
   usePreview()
 
-const { live, lastExport, exportStates } = useServiceBus()
+const { live, lastExport, exportStates, meterLevels } = useServiceBus()
 
 // 自检钩子：主进程 --selftest 通过它核对渲染状态（推送模式）。
 ;(window as unknown as { __shadowStats?: () => unknown }).__shadowStats = reportStats
@@ -673,6 +700,22 @@ const selectedProfile = computed(() => profiles.value.find((p) => p.id === selec
 const liveOf = (id: string) => live.value.sessions.find((s) => s.id === id) ?? null
 const activeLive = computed(() => (selectedId.value ? liveOf(selectedId.value) : null))
 const selectedLive = computed(() => activeLive.value)
+
+/**
+ * 采不到声音的提示（服务端 audioError）。
+ *
+ * 关掉之后记下"关的是哪一句话"：错误内容变了（比如从"激活失败"变成
+ * "音频设备被切换"）就重新弹出来，否则用户关一次就再也看不到新问题了。
+ */
+const dismissedAudioError = ref('')
+const audioAlert = computed(() => {
+  const t = String(activeLive.value?.audioError ?? '').trim()
+  if (!t || t === dismissedAudioError.value) return ''
+  return t
+})
+function dismissAudioAlert() {
+  dismissedAudioError.value = String(activeLive.value?.audioError ?? '').trim()
+}
 
 /**
  * 选中的配置没在出画面时，NO SIGNAL 画面上该写什么。
@@ -1960,6 +2003,49 @@ async function launchService() {
 // 录制帧率不受预览影响，想看录制跑没跑到目标，看导出视频/侧栏配置即可。
 const fpsShown = computed(() => Math.round(stats.value.renderFpsShown || 0))
 
+// ---- 音量条 ---------------------------------------------------------------
+//
+// 数据来自**实时电平**（主进程 50ms 推一次 service:meter）：服务端在音频采集
+// 线程上顺手算每块 PCM 的峰值（快起慢落），每 33ms 写一份 meter-v1.json。
+//
+// 【为什么不再用 audioPeak】它住在每秒重写一次的状态文件里，是"这一秒的峰值
+// 保持"——条子一秒才跳一格，像坏了（用户原话：音量显示不够明显，要实时变化，
+// 像 obs 一样有绿有黄有橙有红）。audioPeak 现在只当兜底：服务是老版本、或者
+// 电平表还没写出来的那一小会儿。
+const meterLevel = computed(() => {
+  const id = selectedId.value
+  const m = meterLevels.value
+  if (!id || !m) return null
+  const v = m[id]
+  return typeof v === 'number' && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : null
+})
+const audioPeak = computed(() => {
+  const v = meterLevel.value ?? activeLive.value?.audioPeak
+  return typeof v === 'number' && Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0
+})
+const audioDb = computed(() => (audioPeak.value > 0 ? 20 * Math.log10(audioPeak.value) : -60))
+/** -60dB..0dB 线性映射到 0..100%（和 OBS 的刻度一致：-20dBFS 大约占 2/3）。 */
+const audioPct = computed(() => {
+  const d = Math.min(0, Math.max(-60, audioDb.value))
+  return Math.round(((d + 60) / 60) * 100)
+})
+/**
+ * 条子怎么"亮"：整条渐变固定不动，用 clip 从左往右露出。
+ *
+ * 这样绿/黄/橙/红的**位置**是绑在 dB 刻度上的（-18dB 黄、-10dB 橙、-4dB 红），
+ * 音量往上推的时候是"越过一条条界线"，而不是早先那样整条三选一换色。
+ */
+const audioClip = computed(() => `inset(0 ${100 - audioPct.value}% 0 0)`)
+const audioMuted = computed(() => audioPct.value <= 0)
+const audioTitle = computed(() => {
+  const l = activeLive.value
+  if (!l) return ''
+  const where = l.audioDetail || ''
+  if (l.audioActive === false) return where || '没采到声音'
+  const level = audioDb.value <= -60 ? '静音' : `${audioDb.value.toFixed(0)} dB`
+  return where ? `${where} · ${level}` : `当前音量 ${level}`
+})
+
 function describeSource(p: Profile): string {
   if (p.source.kind === 'desktop') return '整屏桌面'
   if (p.source.kind === 'monitor') return `显示器 ${p.source.monitorIndex + 1}`
@@ -2059,6 +2145,62 @@ onBeforeUnmount(() => {
 }
 .meta.warn {
   color: #e0a83c;
+}
+
+/* ---- 音量条（顶栏） ------------------------------------------------------
+   整条是固定的 dB 渐变（绿→黄→橙→红），填充块 i 铺满全宽、靠 clip-path
+   从左往右露出。这样颜色的**分界位置**是钉死在刻度上的，不会随填充宽度被
+   拉伸；30Hz 更新 + 60ms 线性过渡，看着是连续跟着声音走，不是一格一格跳。
+
+   条子比早先宽了一倍多（56→92px）：用户说"不够明显"，光改颜色还是看不清，
+   得让它在顶栏里真的占点地方。 */
+.meta.audio {
+  display: inline-flex;
+  align-items: center;
+}
+.audiobar {
+  position: relative;
+  display: inline-block;
+  width: 92px;
+  height: 8px;
+  border-radius: 2px;
+  background: #10151f;
+  border: 1px solid #232c40;
+  overflow: hidden;
+}
+/* 分隔刻度：压在渐变上的一排细竖线，跑起来有"一排小灯"的感觉 */
+.audiobar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: repeating-linear-gradient(
+    90deg,
+    rgba(5, 7, 12, 0.6) 0 1px,
+    transparent 1px 5px
+  );
+}
+.audiobar i {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* -60dB 绿 → -18dB 黄 → -10dB 橙 → -4dB 红 → 0dB 爆红 */
+  background-image: linear-gradient(
+    90deg,
+    #2f9e63 0%,
+    #57c97f 40%,
+    #96d068 62%,
+    #e2c85c 70%,
+    #e8a24d 84%,
+    #ef7f7c 93%,
+    #ff5a56 100%
+  );
+  transition: clip-path 60ms linear;
+  will-change: clip-path;
+}
+.audiobar.mute i {
+  background-image: none;
+  background: #333a4c;
 }
 
 /* 顶栏那枚"服务运行中"。绿色代表"我确实读到了服务状态" —— 这跟
@@ -2903,6 +3045,60 @@ onBeforeUnmount(() => {
     radial-gradient(ellipse 70% 60% at 50% 44%, rgba(27, 41, 64, 0.55), transparent 72%),
     #04060a;
   pointer-events: none;
+}
+
+/* 采不到声音的红条：铺满预览宽度、一行高、贴着预览底部盖上去。
+   高度写死成一行（22px），换行会把画面挡得更多 —— 长原因靠 title 悬停看全。 */
+.audio-alert {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 5;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px 0 8px;
+  background: rgba(150, 26, 26, 0.94);
+  border-top: 1px solid rgba(255, 138, 128, 0.85);
+  color: #ffe7e5;
+  font-size: 12px;
+  line-height: 22px;
+}
+/* 红色感叹号：一个小圆里一个 ! */
+.audio-alert .aa-ico {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #ff5a4e;
+  color: #4a0503;
+  font: 700 10px/13px system-ui, sans-serif;
+  text-align: center;
+}
+.audio-alert .aa-txt {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.audio-alert .aa-x {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #ffd7d4;
+  font: 14px/18px system-ui, sans-serif;
+  cursor: pointer;
+}
+.audio-alert .aa-x:hover {
+  background: rgba(0, 0, 0, 0.28);
+  color: #fff;
 }
 
 /* 斜条纹：一组粗灰条整体斜着飘，比"竖条各自上下"更像雪花信号 */

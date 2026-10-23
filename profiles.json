@@ -45,17 +45,17 @@
       },
       "createdAt": "2026-01-01T00:00:00.000Z",
       "match": {
-        "rule": "process",
-        "by": "process",
+        "rule": "class+process",
+        "by": "class",
         "mode": "contains",
-        "pattern": "此电脑 - 文件资源管理器",
+        "pattern": "Chrome_WidgetWin_1",
         "pick": "largest",
         "pollMs": 1000,
         "requireVisible": true,
-        "title": "此电脑 - 文件资源管理器",
-        "className": "CabinetWClass",
-        "process": "explorer.exe",
-        "hwnd": 4720522
+        "title": "天崩，女儿基因病脑积水，父亲开深夜烧烤摊赚手术费，我去消费一下，",
+        "className": "Chrome_WidgetWin_1",
+        "process": "哔哩哔哩.exe",
+        "hwnd": 722664
       }
     }
   ]

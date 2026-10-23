@@ -2005,6 +2005,65 @@ function shutdownFromService() {
 // ---------------------------------------------------------------------------
 const MIRROR_POLL_MS = 1000
 
+// ---------------------------------------------------------------------------
+// 实时电平（≈20Hz）
+//
+// 状态文件每秒才重写一次，拿它画出来的音量条是"一秒一格"的台阶 —— 用户要的是
+// 像 OBS 那样跟着声音实时跳。所以服务另外每 33ms 写一份 meter-v1.json
+// （只有 id→电平，几十字节），这里以 50ms 的节奏读它并推给界面。
+//
+// 读不到就什么都不做：服务没起 / 旧版服务没有这份文件，音量条自己会落到 0。
+// ---------------------------------------------------------------------------
+const METER_POLL_MS = 50
+/** 这么久没有任何新电平数据，就把界面上的条子清零（服务停了 / 卡住了）。 */
+const METER_STALE_MS = 800
+let meterTimer = null
+let meterLastTs = 0
+let meterLastAt = 0
+
+function meterFilePath() {
+  return path.join(path.dirname(statusFilePath()), 'meter-v1.json')
+}
+
+function startMeterPoll() {
+  if (meterTimer) return
+  meterTimer = setInterval(() => {
+    let doc = null
+    try {
+      doc = JSON.parse(readFileSync(meterFilePath(), 'utf8'))
+    } catch {
+      // 读不到 / 半截文件：当作这一拍没数据，走下面的超时清零
+    }
+    // 只有内容真的变了（ts 前进）才推送，避免同一份数据重复跨进程。
+    if (doc && Array.isArray(doc.items) && doc.ts !== meterLastTs) {
+      meterLastTs = doc.ts
+      meterLastAt = Date.now()
+      for (const w of BrowserWindow.getAllWindows()) {
+        try {
+          w.webContents.send('service:meter', doc)
+        } catch {
+          /* 窗口正在关 */
+        }
+      }
+      return
+    }
+    // 服务没了 / 卡住了：电平文件不再更新，界面上的条子会冻在最后一个值上
+    // （看起来像"明明没声音却还满格"）。这里推一次空表把它压回 0。
+    if (meterLastAt && Date.now() - meterLastAt > METER_STALE_MS) {
+      meterLastAt = 0
+      const empty = { ts: Date.now(), items: [] }
+      for (const w of BrowserWindow.getAllWindows()) {
+        try {
+          w.webContents.send('service:meter', empty)
+        } catch {
+          /* 窗口正在关 */
+        }
+      }
+    }
+  }, METER_POLL_MS)
+  meterTimer.unref?.()
+}
+
 function startStatusMirrorPoll() {
   setInterval(() => {
     const m = readStatusFile()
@@ -2045,6 +2104,7 @@ function startStatusMirrorPoll() {
 // ---------------------------------------------------------------------------
 function registerIpc() {
   startStatusMirrorPoll()
+  startMeterPoll()
 
   // 页面每 500ms 主动推一笔渲染统计过来（见 app/preload.cjs 的 reportStats）。
   // 主进程只记录，绝不反过来用 executeJavaScript 去"拉" —— 拉一次要 2.5 秒，

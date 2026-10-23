@@ -18,14 +18,18 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
 #include "JsonUtil.h"
 #include "RingNames.h"
+#include "Utf8Path.h"
 #include "WindowEnum.h"
 
 namespace shadow {
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -150,6 +154,9 @@ Session::~Session() {
     // 帧环之前收尾。手工写死顺序比依赖成员声明位置可靠 —— 以后有人在
     // Session.h 里挪一行，析构顺序就不会跟着悄悄变。
     Stop();
+    // 声音采集要最先停：它的回调正在往 audioRing_ 里写，ring 不能先没。
+    audio_.reset();
+    audioRing_.reset();
     windowCapture_.reset();
     recorder_.reset();
     exporter_.reset();
@@ -214,6 +221,22 @@ std::string Session::StatusJson() const {
                  // 管道是单向的，服务没法回话，这就是那条回执。
                  ",\"flushSeq\":" +
                  std::to_string(flushSeq_.load(std::memory_order_relaxed));
+        // 声音：界面用 audioPeak/audioRms 画音量条（线性 0..1，转 dB 是界面的事），
+        // audioDetail 说明抓的是系统混音还是某个窗口的进程环回。
+        char abuf[64];
+        std::snprintf(abuf, sizeof(abuf), ",\"audioPeak\":%.4f,\"audioRms\":%.4f",
+                      static_cast<double>(status_.audioPeak),
+                      static_cast<double>(status_.audioRms));
+        record += abuf;
+        record += ",\"audioActive\":";
+        record += status_.audioActive ? "true" : "false";
+        record += ",\"audioDetail\":\"" + JsonEscape(status_.audioDetail) + "\"";
+        // 采不到声音的原因（窗口源）。界面拿它在预览画面上盖红条，空串=没事。
+        record += ",\"audioError\":\"" + JsonEscape(status_.audioError) + "\"";
+        record += ",\"audioChunks\":" + std::to_string(status_.audioChunks);
+        record += ",\"audioBytes\":" + std::to_string(status_.audioBytes);
+        record += ",\"audioRestarts\":" + std::to_string(status_.audioRestarts);
+        record += ",\"audioTreeGrown\":" + std::to_string(status_.audioTreeGrown);
     }
 
     // 导出状态另拼：它来自 exporter_（自己带锁），而且字段里有字符串路径。
@@ -416,11 +439,17 @@ void Session::EnsureRecorder(uint32_t w, uint32_t h) {
     recorderH_ = h;
     const bool ok = recorder_->Start();
 
-    std::lock_guard<std::mutex> lk(mu_);
-    status_.recordDir = dir;
-    status_.recordFailed = !ok;
-    status_.recording = ok;
-    status_.recordDetail = ok ? "录制中" : recorder_->Stats().detail;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        status_.recordDir = dir;
+        status_.recordFailed = !ok;
+        status_.recording = ok;
+        status_.recordDetail = ok ? "录制中" : recorder_->Stats().detail;
+    }
+
+    // 录制起来了才开声音（音频和分片是同一段内容的两个轨，录制没跑就没意义）。
+    // 放锁外面：Start() 内部要等采集线程把设备建好，最多 1.5 秒，不能占着 mu_。
+    if (ok) StartAudio(dir);
 }
 
 // 把新配置里可以就地生效的部分应用到正在跑的会话上。
@@ -575,6 +604,321 @@ void Session::RefreshRecordStatus() {    if (!recorder_) return;
     status_.captureDropped = rs.captureDropped;
     status_.captureFrames = rs.captureFrames;
     status_.drainedOnStop = rs.drainedOnStop;
+}
+
+// ---------------------------------------------------------------------------
+// 声音（需求：只进导出成片，预览不发声）
+// ---------------------------------------------------------------------------
+
+namespace {
+/** 墙钟毫秒（Unix 纪元）。和 AudioRing / AudioCapture 用的是同一套时基。 */
+int64_t NowMs() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return static_cast<int64_t>(u.QuadPart / 10000ull) - 11644473600000ll;
+}
+} // namespace
+
+float Session::MeterLevel() const {
+    const float lv = meterLevel_.load(std::memory_order_relaxed);
+    if (lv <= 0.0f) return 0.0f;
+    const int64_t last = meterUpdatedMs_.load(std::memory_order_relaxed);
+    if (last <= 0) return 0.0f;
+    const int64_t dt = NowMs() - last;
+    // 120ms 以内都算"新鲜的"：正常一块 10ms 左右，静音时引擎最多也就几十毫秒
+    // 才补一次静音包。这段窗口内的值原样给出去，条子不会莫名地抖。
+    if (dt <= 120) return lv;
+    // 之后按 100ms 一个半衰期往下掉：声音一停，条子半秒内见底。
+    // 采集线程死了 / 窗口换进程导致环回失效，也都靠它自然归零，
+    // 不会一直挂着最后一个值让人以为还有声音。
+    const double f = std::pow(0.5, static_cast<double>(dt - 120) / 100.0);
+    if (f < 0.004) return 0.0f;
+    return static_cast<float>(static_cast<double>(lv) * f);
+}
+
+uint32_t Session::ResolveAudioPid() {
+    if (profile_.source.kind != SourceKind::Window) return 0;
+    uint64_t hwnd = lockedHwnd_;
+    if (hwnd == 0) {
+        std::lock_guard<std::mutex> lk(mu_);
+        hwnd = status_.hwnd;
+    }
+    if (hwnd == 0) return 0;
+    DWORD procId = 0;
+    GetWindowThreadProcessId(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwnd)), &procId);
+    return static_cast<uint32_t>(procId);
+}
+
+void Session::StartAudio(const std::string& recordDir) {
+    StopAudio();
+    if (recordDir.empty()) return;
+
+    // 音频目录与分片目录平级：<录像目录>/segments 与 <录像目录>/audio。
+    // 导出端只拿到分片目录，按这个约定自己找得到音频（见 AudioRing.h）。
+    const std::string audioDir = PathToUtf8(fs::u8path(recordDir) / fs::u8path("audio"));
+    audioRing_ = std::make_unique<AudioRing>();
+    if (!audioRing_->Open(audioDir, profile_.video.replaySeconds, 2)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        status_.audioActive = false;
+        status_.audioDetail = "声音写不进去：" + audioDir;
+        return;
+    }
+
+    RestartAudioCapture();
+}
+
+bool Session::RestartAudioCapture() {
+    // 顺序很关键：先把旧的采集线程停干净，它的回调手里攥着 ring 的裸指针。
+    if (audio_) {
+        audio_->Stop();
+        audio_.reset();
+    }
+    if (!audioRing_) return false;
+
+    AudioRing* ring = audioRing_.get();
+    audio_ = std::make_unique<AudioCapture>();
+    // 回调跑在音频采集线程上：只往 ring 里追加 + 更新实时电平（都是几个原子
+    // 操作），不做别的（ring 自己带锁）。
+    audio_->SetSink([this, ring](const int16_t* pcm, size_t frames, int64_t startWallMs) {
+        ring->Append(pcm, frames, startWallMs);
+        // 实时电平：界面那条音量条要 30Hz 地动，1 秒一次的状态撑不起来。
+        // 就在这里顺手算一块的峰值（48k 立体声一秒也就 96k 个样本，可忽略）。
+        int32_t mx = 0;
+        const size_t n = frames * 2;
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t v = pcm[i] < 0 ? -static_cast<int32_t>(pcm[i]) : pcm[i];
+            if (v > mx) mx = v;
+        }
+        // 快起慢落：突然安静时条子平滑落，不闪。
+        const float lv = static_cast<float>(mx) / 32768.0f;
+        const float prev = meterLevel_.load(std::memory_order_relaxed);
+        meterLevel_.store(lv >= prev ? lv : prev * 0.82f + lv * 0.18f,
+                          std::memory_order_relaxed);
+        // 记下这一刻：声音一停就不会再有包了，MeterLevel 靠这个时间戳自己往下掉。
+        meterUpdatedMs_.store(NowMs(), std::memory_order_relaxed);
+    });
+
+    // 窗口源 = 只抓被捕获窗口（进程树）的声音；桌面/显示器源 = 系统混音。
+    bool wantProcess = profile_.source.kind == SourceKind::Window;
+    const uint32_t pid = ResolveAudioPid();
+    // 窗口源还没匹到窗口：这一路本来就还没有画面，声音也无从谈起。
+    // 不退回系统混音（用户要的是"只录这个窗口"），等 RefreshAudioStatus
+    // 发现 pid 出现时再起采集。
+    if (wantProcess && pid == 0) {
+        std::lock_guard<std::mutex> lk(mu_);
+        status_.audioActive = false;
+        status_.audioError.clear();
+        status_.audioDetail = "还没匹配到窗口，匹配上之后再采声音";
+        audioPid_ = 0;
+        audioIdleSinceMs_ = 0;
+        return false;
+    }
+
+    std::string err;
+    std::string detail;
+    const bool ok = audio_->Start(wantProcess, pid, &err, &detail);
+    // 记下"这一路实际在抓谁"：0 = 系统混音。RefreshAudioStatus 靠它判断
+    // 目标窗口是不是换了进程（见那里的说明）。
+    audioPid_ = wantProcess ? pid : 0;
+    // 看门狗从这里开始计时（见 RefreshAudioStatus 里的说明）。
+    audioIdleSinceMs_ = NowMs();
+    // 新采集刚起，电平还没读上来 —— 别拿旧的"静音起点"立刻又触发一次重建。
+    audioSilentSinceMs_ = 0;
+
+    std::lock_guard<std::mutex> lk(mu_);
+    status_.audioActive = ok;
+    if (ok) {
+        status_.audioDetail = detail;
+        status_.audioError.clear();
+        audioWarned_ = false;
+    } else {
+        const std::string why = err.empty() ? std::string("原因不明") : err;
+        status_.audioDetail = "没采到声音：" + why;
+        // 窗口源采不到声音 = 这条素材不会有声，必须让用户看见（界面盖红条）。
+        if (profile_.source.kind == SourceKind::Window) status_.audioError = why;
+    }
+    status_.audioChunks = audioRing_ ? audioRing_->Chunks() : 0;
+    status_.audioBytes = audioRing_ ? audioRing_->Bytes() : 0;
+    return ok;
+}
+
+void Session::StopAudio() {
+    // 顺序不能反：采集线程的回调里攥着 ring 的裸指针，必须先停线程再拆 ring。
+    if (audio_) {
+        audio_->Stop();
+        audio_.reset();
+    }
+    uint32_t chunks = 0;
+    uint64_t bytes = 0;
+    if (audioRing_) {
+        audioRing_->Close();
+        audioRing_->Purge();
+        chunks = audioRing_->Chunks();
+        bytes = audioRing_->Bytes();
+        audioRing_.reset();
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    status_.audioActive = false;
+    status_.audioPeak = 0.0f;
+    status_.audioRms = 0.0f;
+    status_.audioError.clear();
+    status_.audioChunks = chunks;
+    status_.audioBytes = bytes;
+    audioPid_ = 0;
+}
+
+void Session::RefreshAudioStatus(int64_t nowMs) {
+    if (nowMs <= 0) {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER u;
+        u.LowPart = ft.dwLowDateTime;
+        u.HighPart = ft.dwHighDateTime;
+        nowMs = static_cast<int64_t>(u.QuadPart / 10000ull) - 11644473600000ll;
+    }
+
+    bool recording = false;
+    std::string dir;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        recording = status_.recording;
+        dir = status_.recordDir;
+    }
+
+    auto pull = [&](bool* active, float* peak, float* rms, std::string* detail) {
+        if (!audio_) return;
+        *active = audio_->Running();
+        // 用"峰值保持"读法：状态是每秒刷新一次的，取瞬时峰值几乎永远是 0，
+        // 音量条会一动不动。TakePeak 给的是这一秒里最响的那一刻。
+        *peak = audio_->TakePeak();
+        *rms = audio_->Rms();
+        *detail = audio_->Detail();
+    };
+
+    bool active = false;
+    float peak = 0.0f;
+    float rms = 0.0f;
+    std::string detail;
+    pull(&active, &peak, &rms, &detail);
+
+    // 【跟着窗口换目标】窗口源在运行中可能重新匹配到**另一个进程**的窗口
+    // （用户换了目标、原窗口关掉了）。画面会跟着换（见 ResolveSource 的重建
+    // 分支），声音不能还挂在老进程上 —— 否则录出来是"新窗口的画面 + 旧程序的
+    // 声音"。pid 变了就重开一路采集。
+    //
+    // 顺带解决另一个情况：一开始没匹到窗口，按系统混音录着；匹到之后 pid 从
+    // 0 变成有值，这里同样会把它切成进程环回（这才是用户要的"只录这个窗口"）。
+    if (recording && !dir.empty() && profile_.source.kind == SourceKind::Window) {
+        const uint32_t wantPid = ResolveAudioPid();
+        if (wantPid != 0 && wantPid != audioPid_ && nowMs >= audioRestartAtMs_) {
+            audioRestartAtMs_ = nowMs + 5000; // 和下面的重开共用防抖，别叠两次
+            StartAudio(dir);
+            pull(&active, &peak, &rms, &detail);
+        }
+    }
+
+    // 【看门狗：环回"活着但一个包都没有"】
+    //
+    // 进程环回有个很难查的失效方式：目标进程树里**新冒出来**的子进程
+    // （Chromium 系一律把音频丢给按需创建、闲置几秒就被回收的
+    // audio.mojom.AudioService 子进程）不一定被已经建好的那条环回看到。
+    // 这时候什么都不报错：running_ 还是 true、detail 还是"窗口进程环回"，
+    // 但收到的包全是 0（或者干脆没有包）。用户看到的就是
+    // 「这次保存没声音，什么都不动下次可能就有」——纯看那条音频子进程
+    // 是不是恰好在建环回那一刻活着。
+    //
+    // 处理办法只能是"重建一次采集"：重建会重新抓一次进程树，新进程就进得来了。
+    // 静音时引擎本来就不发包，所以不能一没包就重建 —— 用指数退避
+    // （3s → 6s → 12s → … → 60s）。真在出声的场景第一次就救回来，
+    // 一直没声音的场景也不会把音频引擎刷爆。
+    //
+    // 【实测补一句】Chromium（Edge/Chrome/B 站客户端）的常态是**包一直在、
+    // 但全是静音**（进程在渲染，音频那个 utility 子进程不在树里），见
+    // scripts/probe-late-child-audio.mjs。这种情况 PacketGapMs 永远是几十
+    // 毫秒，"没包"这条判据一辈子等不到 —— 所以下面还加了"进程树变了"那条。
+    if (active && recording && !dir.empty() && profile_.source.kind == SourceKind::Window &&
+        audio_) {
+        const int64_t gap = audio_->PacketGapMs();
+        const int64_t idleMs =
+            gap >= 0 ? gap : (audioIdleSinceMs_ > 0 ? nowMs - audioIdleSinceMs_ : 0);
+        if (gap >= 0 && gap < 700) {
+            // 有包进来：退避清零，下次再出问题还能 3 秒内就救回来。
+            audioIdleBackoffMs_ = 0;
+        }
+        // "已经在静音多久"：Chromium 那种"包一直在、但全是 0"的情况靠它判断
+        // （见下面进程树那一段）。用采集端自己的电平，比数包的数量准。
+        int64_t silentMs = 0;
+        if (audio_->Level() < 0.002f) {
+            if (audioSilentSinceMs_ == 0) audioSilentSinceMs_ = nowMs; // 刚开始静音
+            silentMs = nowMs - audioSilentSinceMs_;
+        } else {
+            audioSilentSinceMs_ = 0;
+            silentMs = 0;
+        }
+
+        // 【更早一步：进程树变了】
+        //
+        // 环回只在创建那一刻抓一次进程树。浏览器/客户端播放音频时会懒创建
+        // audio.mojom.AudioService 子进程，它要是晚于环回出现，就永远进不来 ——
+        // 用户看到的是"两个窗口一起播，被捕获的那个反而没声音"。
+        //
+        // 【为什么不能只看"没包"】实测（scripts/probe-late-child-audio.mjs）：
+        // Edge 这种 Chromium 应用，环回**一直有包**（每秒几十 KB），只是全是
+        // 静音 —— 目标进程在渲染，但它的音频不在被捕获的树里。所以 PacketGapMs
+        // 永远是几十毫秒，光靠它永远等不到"没包"。真正的判据是"树变了 + 现在
+        // 一点电平都没有"，这时重建纯粹是白捡的（本来就听不到声音）。
+        if (nowMs >= audioTreeCheckAtMs_) {
+            audioTreeCheckAtMs_ = nowMs + 1000;
+            const int grown = audio_->NewChildCount();
+            audioTreeGrown_ = grown > 0 ? static_cast<uint32_t>(grown) : 0;
+            if (grown > 0 && silentMs >= 800 && nowMs >= audioRestartAtMs_) {
+                audioRestartAtMs_ = nowMs + 3000;
+                ++audioRestarts_;
+                RestartAudioCapture();
+                pull(&active, &peak, &rms, &detail);
+                silentMs = 0;
+            }
+        }
+
+        const int64_t limit = audioIdleBackoffMs_ > 0 ? audioIdleBackoffMs_ : 3000;
+        if (idleMs > limit && nowMs >= audioRestartAtMs_) {
+            audioRestartAtMs_ = nowMs + 1000;
+            audioIdleBackoffMs_ = limit >= 60000 ? 60000 : limit * 2;
+            ++audioRestarts_;
+            RestartAudioCapture();
+            pull(&active, &peak, &rms, &detail);
+        }
+    }
+
+    // 【自动重开】采集线程会因为「默认设备换了/被独占」自己退出。那种情况不该
+    // 让这一路从此静音，也不能每秒都重试（反复建 client 会把音频引擎刷爆）。
+    // 5 秒一次，直到起来为止。
+    if (!active && recording && !dir.empty() && nowMs >= audioRestartAtMs_) {
+        audioRestartAtMs_ = nowMs + 5000;
+        RestartAudioCapture();
+        pull(&active, &peak, &rms, &detail);
+    }
+
+    uint32_t chunks = 0;
+    uint64_t bytes = 0;
+    if (audioRing_) {
+        audioRing_->Purge(nowMs);
+        chunks = audioRing_->Chunks();
+        bytes = audioRing_->Bytes();
+    }
+
+    std::lock_guard<std::mutex> lk(mu_);
+    status_.audioActive = active;
+    status_.audioPeak = peak;
+    status_.audioRms = rms;
+    if (!detail.empty()) status_.audioDetail = detail;
+    status_.audioChunks = chunks;
+    status_.audioBytes = bytes;
+    status_.audioRestarts = audioRestarts_;
+    status_.audioTreeGrown = audioTreeGrown_;
 }
 
 bool Session::ResolveSource() {
@@ -1651,6 +1995,7 @@ void Session::ThreadMain() {
             const auto sinceWindow = publishedAt - windowStart;
             if (sinceWindow >= std::chrono::seconds(1)) {
                 RefreshRecordStatus();
+                RefreshAudioStatus(0);
                 const double secs = std::chrono::duration<double>(sinceWindow).count();
                 const double instant = static_cast<double>(framesInWindow) / secs;
                 std::lock_guard<std::mutex> lk(mu_);
@@ -1724,6 +2069,8 @@ void Session::ThreadMain() {
         // 关了、显示器没了），那就回到外层重新解析，等着它回来。
         if (!stopRequested_.load(std::memory_order_acquire)) {
             // 这一轮的帧环/录制器要收干净再重来，否则新的解析会撞上自己。
+            // 声音也跟着收（录制停了就没有要往成片里塞的音频了）。
+            StopAudio();
             if (recorder_) {
                 recorder_->Stop();
                 recorder_ = nullptr;
@@ -1756,6 +2103,8 @@ void Session::ThreadMain() {
         recorder_->Stop();
         RefreshRecordStatus();
     }
+    // 录制收尾之后声音也停掉：音频段和分片段对得上就够了，多录的部分不导出。
+    StopAudio();
 
     // 注意这里**不**主动销毁帧环。
     //
