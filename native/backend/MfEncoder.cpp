@@ -6,6 +6,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
+#include <mftransform.h>
 #include <codecapi.h>
 #include <mferror.h>
 #include <emmintrin.h>  // SSE2：non-temporal 存储
@@ -23,6 +24,17 @@ namespace shadow {
 namespace fs = std::filesystem;
 
 namespace {
+
+// CLSID_AACMFTEncoder 在 wmcodecdsp.h 里定义，但那个头会拖进一堆东西。
+// 直接写死这个 GUID（等价于 CLSID_AACMFTEncoder）。
+// {93AF0C51-2275-45D2-A35B-F2BA21CAED00}
+static const GUID kClsidAacEncoder = {0x93AF0C51, 0x2275, 0x45D2,
+                                      {0xA3, 0x5B, 0xF2, 0xBA, 0x21, 0xCA, 0xED, 0x00}};
+
+// 音频采集的统一格式（与 AudioCapture.h 的 kAudioRate/kAudioChannels 一致）。
+constexpr uint32_t kAudioRate = 48000;
+constexpr uint32_t kAudioChannels = 2;
+constexpr uint32_t kAacFrameSamples = 1024; // AAC-LC 一帧的采样数
 
 /**
  * MF 的进程级引用计数。
@@ -606,7 +618,7 @@ bool MfEncoder::Start(const std::string& dir, uint32_t width, uint32_t height, u
     // 界面上的说明要写「已从 X 帧降到 Y 帧」。
     requestedFps_ = fps_;
     segmentSeconds_ = segmentSeconds ? segmentSeconds : 2;
-    keepSegments_ = keepSegments < 2 ? 2 : keepSegments;
+    keepSegments_.store(keepSegments < 2 ? 2 : keepSegments, std::memory_order_relaxed);
 
     if (width_ == 0 || height_ == 0 || dir_.empty()) {
         status_.failed = true;
@@ -667,7 +679,8 @@ bool MfEncoder::Start(const std::string& dir, uint32_t width, uint32_t height, u
     // 8 倍 = 20 秒窗口里平均每片 0.25 秒还有余量。真超了也不丢新内容，
     // PurgeExpired() 会按时间从最旧的开始扔，磁盘上限始终等于回放窗口的内容量。
     {
-        const uint64_t wanted = static_cast<uint64_t>(keepSegments_) * 8u;
+        const uint64_t wanted =
+            static_cast<uint64_t>(keepSegments_.load(std::memory_order_relaxed)) * 8u;
         keepSlots_ = wanted > kMaxSlots ? kMaxSlots : static_cast<uint32_t>(wanted);
         if (keepSlots_ < 2) keepSlots_ = 2;
     }
@@ -688,6 +701,22 @@ bool MfEncoder::Start(const std::string& dir, uint32_t width, uint32_t height, u
     doneSeconds_ = 0.0;
     status_.segmentsWritten = 0;
     status_.framesWritten = 0;
+
+    // 音频时间轴归零：新一轮录制从"还没采到声音"开始。上一次的时间轴留着
+    // 会让新分片的音频时间戳从上一轮的位置起跳，导出按墙钟一裁就整段错位。
+    audioStartTicks_ = 0;
+    audioBufferStart_ = 0;
+    aacPcmBuf_.clear();
+    aacPending_.clear();
+    aacInTicks_.clear();
+    aacLastOutTicks_ = 0;
+
+    // 建常驻 AAC 编码器（音频编码进切片）。**必须在第一个分片开出来之前**：
+    // 分片开片时（OpenSegment）要拿 asc_（AudioSpecificConfig）给 SinkWriter
+    // 挂音轨流，晚建的话第一片就永远没有音轨 —— 而导出端只认分片里的音轨
+    // （audio/ PCM 目录已删除），首片缺音轨 = 成片开头静音一整片。失败不致命
+    // —— OpenSegment 里还会逐片重试，某次起不来下一片就补上了。
+    InitAudioEncoder();
 
     // 【帧率可能被自动降下来】硬件编码器对「分辨率 × 帧率」有吞吐上限，
     // 超了会拒绝输入类型。见 StartWithFpsFallback() 与 MfEncoder.h 里
@@ -959,6 +988,63 @@ bool MfEncoder::OpenSegment() {
     if (encAttrs) encAttrs->Release();
     encAttrs = nullptr;
 
+    // ---- 加音频流：AAC passthrough（常驻编码器已产出的样本直拷进来）-----
+    //
+    // 【为什么是 passthrough 而不是让 SinkWriter 自己编码】如果这里用 PCM 输入，
+    // SinkWriter 会为这一片新建一个 AAC 编码器 —— 每片 priming 一次，2 秒一片
+    // 就是"每 2 秒顿一下"。passthrough（输入类型也设 AAC）让 SinkWriter 纯搬
+    // 样本，编码器是常驻的那一个，priming 只在录制开头发生一次。
+    //
+    // 【前提】两个条件都满足才给这一片挂音轨：
+    //   1) 常驻 AAC 编码器就绪（asc_ 有 AudioSpecificConfig）。Start 里建过
+    //      一次，但那次可能失败 —— 这里逐片重试，这一片起不来只影响这一片。
+    //   2) 音频时间轴已经开始（audioStartTicks_ > 0，即至少采到过一块 PCM）。
+    //      没开始就挂一条空音轨的话，这个 fMP4 会被 MF 的 SourceReader 直接
+    //      拒收（0xC00D36C4），导出端一片都读不出来 —— 比"这段没声音"严重得多。
+    if (!aacEncoder_ || asc_.empty()) InitAudioEncoder();
+    audioStreamIndex_ = 0xFFFFFFFFu;
+    const bool audioReady = aacEncoder_ && !asc_.empty() && audioStartTicks_ > 0;
+    if (audioReady) {
+        IMFMediaType* aacOut = nullptr;
+        HRESULT ahr = MFCreateMediaType(&aacOut);
+        if (SUCCEEDED(ahr)) ahr = aacOut->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        if (SUCCEEDED(ahr)) ahr = aacOut->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+        if (SUCCEEDED(ahr)) ahr = aacOut->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        if (SUCCEEDED(ahr)) ahr = aacOut->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioRate);
+        if (SUCCEEDED(ahr)) ahr = aacOut->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioChannels);
+        if (SUCCEEDED(ahr)) ahr = aacOut->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);
+        if (SUCCEEDED(ahr)) ahr = aacOut->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+        if (SUCCEEDED(ahr)) ahr = aacOut->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+        if (SUCCEEDED(ahr)) ahr = aacOut->SetBlob(MF_MT_USER_DATA, asc_.data(),
+                                                   static_cast<UINT32>(asc_.size()));
+
+        DWORD aStream = 0;
+        if (SUCCEEDED(ahr)) ahr = writer->AddStream(aacOut, &aStream);
+        if (aacOut) aacOut->Release();
+
+        if (SUCCEEDED(ahr)) {
+            // 输入类型也设 AAC = passthrough（探针验证过返回 S_OK）。
+            IMFMediaType* aacIn = nullptr;
+            ahr = MFCreateMediaType(&aacIn);
+            if (SUCCEEDED(ahr)) ahr = aacIn->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            if (SUCCEEDED(ahr)) ahr = aacIn->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+            if (SUCCEEDED(ahr)) ahr = aacIn->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            if (SUCCEEDED(ahr)) ahr = aacIn->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioRate);
+            if (SUCCEEDED(ahr)) ahr = aacIn->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioChannels);
+            if (SUCCEEDED(ahr)) ahr = aacIn->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);
+            if (SUCCEEDED(ahr)) ahr = aacIn->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+            if (SUCCEEDED(ahr)) ahr = aacIn->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+            if (SUCCEEDED(ahr)) ahr = aacIn->SetBlob(MF_MT_USER_DATA, asc_.data(),
+                                                     static_cast<UINT32>(asc_.size()));
+            if (SUCCEEDED(ahr)) ahr = writer->SetInputMediaType(aStream, aacIn, nullptr);
+            if (aacIn) aacIn->Release();
+
+            if (SUCCEEDED(ahr)) {
+                audioStreamIndex_ = aStream;
+            }
+        }
+    }
+
     hr = writer->BeginWriting();
     if (FAILED(hr)) {
         writer->Release();
@@ -1069,6 +1155,38 @@ void MfEncoder::ReleaseSample() {
 void MfEncoder::CloseSegment() {
     IMFSinkWriter* writer = static_cast<IMFSinkWriter*>(writer_);
     if (!writer) return;
+
+    // 把属于这一片时间范围的 AAC 样本直拷进它的音轨（在 Finalize 之前，否则
+    // 音轨样本写不进去）。时间范围 = [segStartUnix_, 下一片起点)。片长由帧数
+    // 推算（见下面 nextSegStartUnix_ 的算法），这里先算出来用。
+    //
+    // 【为什么必须用 tick 精度】老实现用毫秒算边界、用毫秒算样本时间戳，
+    // 21.333ms 的块被截成 21ms —— 采样步长比时长小，样本在 MP4 里互相重叠，
+    // 导出直拷时解码器直接崩成"滋滋"噪声。现在整条链路都是 100ns。
+    if (audioStreamIndex_ != 0xFFFFFFFFu) {
+        // 先把队列里还没编码的 PCM 全部编码掉 —— CloseSegment 可能在"没有新
+        // Write"的情况下被调（FlushSegment / Finish / SetFps / ResizeTo），
+        // 那时最后的 PCM 还躺在 pcmQueue_ 里，不 pump 的话这一片的音轨会缺
+        // 最后那几百毫秒。
+        PumpAudio();
+        // 这一片的墙钟终点：起点 + 帧数/帧率的时长。与 CloseSegment 末尾算
+        // nextSegStartUnix_ 的口径一致。
+        const double secPerFrame = 1.0 / static_cast<double>(fps_ ? fps_ : 60u);
+        const int64_t segStartTicks = segStartUnix_ * 10000ll;
+        const int64_t segEndTicks =
+            segStartTicks + static_cast<int64_t>(static_cast<double>(framesInSegment_) *
+                                                 secPerFrame * 10000000.0);
+
+        // 【整片一个音频样本都没有 → 补静音】这不是为了好听，是为了分片能被
+        // 解析：带音轨却零样本的 fMP4，MF 的 SourceReader 会直接返回
+        // 0xC00D36C4（整片读不了），导出端一看"所有分片都打不开"就失败。
+        // 系统静音时 WASAPI loopback 一个包都不发，这种情况非常常见。
+        if (!HasAudioInRange(segStartTicks, segEndTicks)) {
+            FillSilenceToTicks(segEndTicks);
+            PumpAudio();
+        }
+        FlushAudioToSegment(segStartTicks, segEndTicks);
+    }
 
     // Finalize 会把 moov/mfra 索引写完 —— 这是分片能被读出来的前提。
     // 失败也不影响已经写进去的 moof，SourceReader 仍然能读到内容。
@@ -1293,6 +1411,11 @@ bool MfEncoder::Write(const void* pixels, uint32_t stride, uint32_t width, uint3
     // 绝大部分都是重复帧 —— 用户报的「切片刻成 PPT」就是这么来的。
     if (!writer_) return false;
 
+    // 顺带把音频队列里的 PCM 编码掉（音频采集线程投进来的）。放在写视频帧
+    // 之前，保证音频样本不会落后视频太多。AAC 编码很轻（每秒 ~47 次
+    // ProcessOutput），不会挤占喂帧线程的帧预算。
+    PumpAudio();
+
     // 喂帧线程通常和 Start() 那个线程不同，套间要自己进。
     //
     // 【为什么必须放在尺寸分支之前】换尺寸要走 ResizeTo，它会 Finalize 当前
@@ -1349,8 +1472,13 @@ bool MfEncoder::Write(const void* pixels, uint32_t stride, uint32_t width, uint3
     // 递归进来的那次（WritePadded 补完黑边回来）传的是**画布**尺寸，不能记账
     // —— 真实尺寸已经由 WritePadded 自己记过了。
     if (!repeat && !padRecurse_) {
-        if (width > segContentW_) segContentW_ = width;
-        if (height > segContentH_) segContentH_ = height;
+        // 取偶，口径与 WritePadded 里的记账一致（见那处的长注释）：index.csv
+        // 里的 contentW/H 必须等于编码器真正写入的帧尺寸，否则导出端直拷判定
+        // 永远差 1、被逼进重编码。
+        const uint32_t evenW = width & ~1u;
+        const uint32_t evenH = height & ~1u;
+        if (evenW > segContentW_) segContentW_ = evenW;
+        if (evenH > segContentH_) segContentH_ = evenH;
     }
 
     // 【复用样本，不再每帧分配】见 MfEncoder.h 里 sample_ 的注释：
@@ -1465,8 +1593,18 @@ bool MfEncoder::WritePadded(const void* pixels, uint32_t stride, uint32_t width,
     uint8_t* dst = padBuf_.data();
 
     // 先记真实画面尺寸（导出端按它定画布，见 DoneSegment::contentW）。
-    if (width > segContentW_) segContentW_ = width;
-    if (height > segContentH_) segContentH_ = height;
+    //
+    // 【必须取偶】这里收到的 width/height 是采集端给的**原始**尺寸（窗口可能
+    // 是奇数宽/高，如 1827×1155），而真正编码进 H.264 的帧已经被 ResizeTo
+    // 向下取偶成 1826×1154。如果照原样记奇数，index.csv 里的 contentW 就和
+    // 编码器写进文件的帧尺寸差 1 —— 导出端算画布时又向上取偶成 1828，于是
+    // 直拷判定的 `contentW == canvasW` 永远差 1 不成立，每一片都被逼进重编码
+    // （解码+重压），120 秒成片要 30 秒。记成取偶后的真实尺寸，和编码器写进
+    // 文件的尺寸一致，导出端才能走 -c copy。
+    const uint32_t evenW = width & ~1u;
+    const uint32_t evenH = height & ~1u;
+    if (evenW > segContentW_) segContentW_ = evenW;
+    if (evenH > segContentH_) segContentH_ = evenH;
 
     // 先整体清黑，下面只覆盖"这一帧真正占了"的那一块，其余自然是黑边。
     std::memset(dst, 0, canvasBytes);
@@ -1649,6 +1787,21 @@ bool MfEncoder::SetFps(uint32_t fps) {
     }
 }
 
+void MfEncoder::SetKeepSegments(uint32_t keepSegments) {
+    if (keepSegments < 2) keepSegments = 2;
+    keepSegments_.store(keepSegments, std::memory_order_relaxed);
+    // 槽位数同步放宽/收紧（只影响文件名空间，不影响保留时长）。
+    uint64_t wanted = static_cast<uint64_t>(keepSegments) * 8u;
+    if (wanted > kMaxSlots) wanted = kMaxSlots;
+    uint32_t slots = wanted < 2u ? 2u : static_cast<uint32_t>(wanted);
+    keepSlots_ = slots < keepSlots_ ? slots : keepSlots_; // 只放大，绝不缩小
+    // 【为什么不在这里立刻 Purge】
+    // done_ / 分片文件只由喂帧线程碰（PurgeExpired 在 RenewSlot 里跑）。
+    // 从会话线程（reload）直接清会与喂帧线程并发读写同一张表 —— 数据竞争。
+    // 改小窗口后，下一次分片轮转（≤ 一个片长）就会把跌出窗口的旧片清掉，
+    // 用户感知不到延迟。
+}
+
 bool MfEncoder::SetBitrate(uint32_t bitrateMbps) {
     if (bitrateMbps > 200) bitrateMbps = 200;
 
@@ -1717,11 +1870,401 @@ void MfEncoder::Finish() {
     // 样本缓冲也跟着收掉（CloseSegment 里已经 Release 过一次，
     // 这里是兜底：万一没关成功片也不能把 14.7MB 漏在内存里）。
     ReleaseSample();
+    // 常驻 AAC 编码器 + 未写出的音频样本一起收掉。
+    CloseAudioEncoder();
     // 释放这个对象持有的进程级 MF 引用（配 Start 里的 MfProcessRetain）。
     if (retained_) {
         MfProcessRelease();
         retained_ = false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 常驻 AAC 编码器（音频编码进切片）
+//
+// 设计见 MfEncoder.h 里 FeedPcm 的注释。一句话：AAC 编码器常驻在 MfEncoder
+// 生命周期（和视频编码器同一周期），跨分片复用，priming 只一次 —— 这样分片
+// 里内嵌的音轨不会"每 2 秒顿一下"。
+//
+// 线程模型：FeedPcm 在音频采集线程调（只投队列），PumpAudio / FlushAudioToSegment
+// 在喂帧线程调（真正碰 MF）。两者靠 pcmMu_ + pcmQueue_ 解耦。
+// ---------------------------------------------------------------------------
+
+void MfEncoder::FeedPcm(const int16_t* pcm, size_t frames, int64_t startWallMs) {
+    if (!pcm || frames == 0) return;
+    PcmBlock b;
+    b.data.assign(pcm, pcm + frames * kAudioChannels);
+    b.startWallMs = startWallMs;
+    {
+        std::lock_guard<std::mutex> lk(pcmMu_);
+        // 队列无限涨会拖垮内存（采集线程每秒投 ~47 块，每块 1024 帧 4KB）。
+        // 喂帧线程没及时消费时（编码器忙 / 还没就绪），丢最旧的 —— 音频滚动
+        // 缓冲本来就允许丢（丢旧块保新块，和采集端同一语义）。
+        if (pcmQueue_.size() >= 4096) pcmQueue_.pop_front();
+        pcmQueue_.push_back(std::move(b));
+    }
+}
+
+bool MfEncoder::AudioEncoderReady() const {
+    return aacEncoder_ != nullptr && !asc_.empty();
+}
+
+bool MfEncoder::InitAudioEncoder() {
+    if (aacEncoder_) return true; // 已经建好
+
+    // 建 AAC 编码器 MFT。
+    IMFTransform* enc = nullptr;
+    HRESULT hr = CoCreateInstance(kClsidAacEncoder, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&enc));
+    if (FAILED(hr) || !enc) {
+        // 建不起来就静默放弃音频（录制主功能不受影响）。常见原因：缺
+        // Media Feature Pack。不写 status_.failed —— 那会连累视频判定。
+        return false;
+    }
+
+    // 输入类型：PCM 16bit/48k/立体声。
+    IMFMediaType* inT = nullptr;
+    MFCreateMediaType(&inT);
+    inT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    inT->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+    inT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+    inT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioRate);
+    inT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioChannels);
+    inT->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, kAudioChannels * 2);
+    inT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, kAudioRate * kAudioChannels * 2);
+    inT->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, 1);
+    hr = enc->SetInputType(0, inT, 0);
+    inT->Release();
+    if (FAILED(hr)) {
+        enc->Release();
+        return false;
+    }
+
+    // 输出类型：AAC-LC raw，192kbps。
+    IMFMediaType* outT = nullptr;
+    MFCreateMediaType(&outT);
+    outT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+    outT->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+    outT->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+    outT->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, kAudioRate);
+    outT->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, kAudioChannels);
+    outT->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);
+    outT->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29); // AAC-LC
+    outT->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0); // raw AAC
+    hr = enc->SetOutputType(0, outT, 0);
+    if (FAILED(hr)) {
+        outT->Release();
+        enc->Release();
+        return false;
+    }
+
+    // 读回 AudioSpecificConfig（MF_MT_USER_DATA）—— passthrough 给分片 SinkWriter
+    // 时**必须**带上，否则解码端不知道采样率/声道数/配置。
+    UINT32 ascSize = 0;
+    HRESULT ascHr = outT->GetBlobSize(MF_MT_USER_DATA, &ascSize);
+    if (SUCCEEDED(ascHr) && ascSize > 0) {
+        asc_.resize(ascSize);
+        outT->GetBlob(MF_MT_USER_DATA, asc_.data(), ascSize, nullptr);
+    }
+    outT->Release();
+
+    // 拿输出流缓冲区大小（自己分配输出样本用，见 ProcessOutput 的注释）。
+    MFT_OUTPUT_STREAM_INFO outInfo = {};
+    if (SUCCEEDED(enc->GetOutputStreamInfo(0, &outInfo))) {
+        aacOutBufSize_ = outInfo.cbSize ? outInfo.cbSize : 4096;
+    }
+
+    aacEncoder_ = enc;
+    aacEncoderStarted_ = false;
+    aacLastOutTicks_ = 0;
+    aacInTicks_.clear();
+    return true;
+}
+
+void MfEncoder::CloseAudioEncoder() {
+    IMFTransform* enc = static_cast<IMFTransform*>(aacEncoder_);
+    if (enc) enc->Release();
+    aacEncoder_ = nullptr;
+    aacOutBufSize_ = 0;
+    asc_.clear();
+    aacPending_.clear();
+    aacEncoderStarted_ = false;
+    aacInTicks_.clear();
+    aacLastOutTicks_ = 0;
+    audioStartTicks_ = 0;
+    audioBufferStart_ = 0;
+    aacPcmBuf_.clear();
+    {
+        std::lock_guard<std::mutex> lk(pcmMu_);
+        pcmQueue_.clear();
+    }
+}
+
+void MfEncoder::PumpAudio() {
+    IMFTransform* enc = static_cast<IMFTransform*>(aacEncoder_);
+    if (!enc) return;
+
+    // 取队列里所有 PCM 块（一次性拿出来，锁外编码）。**队列空也要继续往下走**：
+    // 编码器里可能还有已经编好、等着 ProcessOutput 取的样本，提前 return 会把
+    // 它们一直留在编码器里（分片收尾时刚好没新 PCM，成片的音轨就缺最后一截）。
+    std::vector<PcmBlock> blocks;
+    {
+        std::lock_guard<std::mutex> lk(pcmMu_);
+        blocks.reserve(pcmQueue_.size());
+        while (!pcmQueue_.empty()) {
+            blocks.push_back(std::move(pcmQueue_.front()));
+            pcmQueue_.pop_front();
+        }
+    }
+
+    // 首次编码前发消息序列（缺了会崩溃，见探针）。
+    if (!aacEncoderStarted_) {
+        enc->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        enc->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        aacEncoderStarted_ = true;
+    }
+
+    // 编码前重新问一次输出缓冲大小（首次可能还没拿到）。
+    if (aacOutBufSize_ == 0) {
+        MFT_OUTPUT_STREAM_INFO oi = {};
+        if (SUCCEEDED(enc->GetOutputStreamInfo(0, &oi))) {
+            aacOutBufSize_ = oi.cbSize ? oi.cbSize : 4096;
+        }
+    }
+
+    // ---- 把新 PCM 接到时间轴尾部（必要时补静音 / 裁掉重叠的头）----------
+    //
+    // 时间轴只认采样帧号：位置 = audioBufferStart_ + 缓冲帧数。这样静音段
+    // （WASAPI loopback 没声音时一个包都不发）也能在时间轴上"占住"正确的
+    // 时长，AAC 样本的时间戳永远首尾相接、不重叠。
+    constexpr int64_t kGapMinTicks = 500000;    // <50ms 当抖动，不补
+    constexpr int64_t kMaxFillTicks = 50000000; // 一次最多补 5 秒（设备挂很久）
+    for (PcmBlock& b : blocks) {
+        const size_t nFrames = b.data.size() / kAudioChannels;
+        if (nFrames == 0) continue;
+        if (audioStartTicks_ == 0) {
+            // 第一次拿到 PCM：时间轴从这里开始。
+            audioStartTicks_ = b.startWallMs * 10000ll;
+            audioBufferStart_ = 0;
+        }
+        const int64_t blockStartTicks = b.startWallMs * 10000ll;
+        const int64_t tailTicks = AudioEndTicks();
+        const int64_t delta = blockStartTicks - tailTicks;
+        if (delta > kGapMinTicks) {
+            int64_t fill = delta > kMaxFillTicks ? kMaxFillTicks : delta;
+            AppendSilenceTicks(fill);
+        } else if (delta < 0) {
+            // 采集块比时间轴落后（实时回调抖动，或上一段刚补过静音）：
+            // 裁掉重叠的部分，绝不写重叠样本。
+            const int64_t skipFrames = (-delta) * 48000 / 10000000ll;
+            if (skipFrames >= static_cast<int64_t>(nFrames)) continue;
+            aacPcmBuf_.insert(
+                aacPcmBuf_.end(), b.data.begin() + static_cast<std::ptrdiff_t>(skipFrames * kAudioChannels),
+                b.data.begin() + static_cast<std::ptrdiff_t>(nFrames * kAudioChannels));
+            continue;
+        }
+        aacPcmBuf_.insert(aacPcmBuf_.end(), b.data.begin(),
+                          b.data.begin() + static_cast<std::ptrdiff_t>(nFrames * kAudioChannels));
+    }
+
+    // 从累积缓冲里按 1024 帧/块喂编码器。时间戳由采样帧号算出来，步长与时长
+    // 严格一致（见 TsOfOffset 的注释）。
+    size_t consumed = 0;
+    const size_t totalFrames = aacPcmBuf_.size() / kAudioChannels;
+    while (consumed + kAacFrameSamples <= totalFrames) {
+        IMFMediaBuffer* buf = nullptr;
+        if (FAILED(MFCreateMemoryBuffer(kAacFrameSamples * kAudioChannels * 2, &buf))) break;
+        BYTE* dst = nullptr;
+        if (SUCCEEDED(buf->Lock(&dst, nullptr, nullptr)) && dst) {
+            std::memcpy(dst, aacPcmBuf_.data() + consumed * kAudioChannels,
+                        kAacFrameSamples * kAudioChannels * 2);
+            buf->Unlock();
+            buf->SetCurrentLength(kAacFrameSamples * kAudioChannels * 2);
+        } else {
+            buf->Release();
+            break;
+        }
+
+        IMFSample* s = nullptr;
+        MFCreateSample(&s);
+        s->AddBuffer(buf);
+        buf->Release();
+        const int64_t globalFrame =
+            audioBufferStart_ + static_cast<int64_t>(consumed);
+        const int64_t t0 = TsOfOffset(globalFrame);
+        const int64_t t1 = TsOfOffset(globalFrame + kAacFrameSamples);
+        s->SetSampleTime(t0);
+        s->SetSampleDuration(t1 - t0);
+        HRESULT ihr = enc->ProcessInput(0, s, 0);
+        s->Release();
+        if (FAILED(ihr)) {
+            // 输入队列满（MF_E_NOTACCEPTING）：已喂的保留，剩下的下次再喂。
+            break;
+        }
+        aacInTicks_.push_back(t1);
+        consumed += kAacFrameSamples;
+    }
+    // 把已喂掉的帧从缓冲头部移除（保留不足一帧的尾巴，下次继续攒）。
+    if (consumed > 0) {
+        aacPcmBuf_.erase(aacPcmBuf_.begin(),
+                         aacPcmBuf_.begin() + static_cast<std::ptrdiff_t>(consumed * kAudioChannels));
+        audioBufferStart_ += static_cast<int64_t>(consumed);
+    }
+    // 缓冲若因异常涨太多（编码器一直不产出 / 喂不进去），兜底丢弃最旧的，
+    // 防止内存失控。注意：丢的是"还没编码的音频"，时间轴照样前进。
+    if (BufferedFrames() > static_cast<int64_t>(kAacFrameSamples) * 64) {
+        const int64_t dropFrames = BufferedFrames() - static_cast<int64_t>(kAacFrameSamples) * 32;
+        aacPcmBuf_.erase(aacPcmBuf_.begin(),
+                         aacPcmBuf_.begin() +
+                             static_cast<std::ptrdiff_t>(dropFrames * kAudioChannels));
+        audioBufferStart_ += dropFrames;
+    }
+
+    // 排空输出：把编码好的 AAC 样本取出来缓存。
+    const DWORD obSize = aacOutBufSize_ ? aacOutBufSize_ : 4096;
+    for (;;) {
+        DWORD outFlags = 0;
+        HRESULT shr = enc->GetOutputStatus(&outFlags);
+        if (FAILED(shr) || !(outFlags & MFT_OUTPUT_STATUS_SAMPLE_READY)) break;
+
+        IMFMediaBuffer* obuf = nullptr;
+        if (FAILED(MFCreateMemoryBuffer(obSize, &obuf))) break;
+        IMFSample* os = nullptr;
+        MFCreateSample(&os);
+        os->AddBuffer(obuf);
+        obuf->Release();
+
+        MFT_OUTPUT_DATA_BUFFER outBuf = {};
+        outBuf.dwStreamID = 0;
+        outBuf.pSample = os;
+        DWORD status = 0;
+        shr = enc->ProcessOutput(0, 1, &outBuf, &status);
+        if (shr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            os->Release();
+            break;
+        }
+        if (FAILED(shr)) {
+            os->Release();
+            break;
+        }
+        if (outBuf.pSample) {
+            IMFMediaBuffer* ob = nullptr;
+            if (SUCCEEDED(outBuf.pSample->GetBufferByIndex(0, &ob)) && ob) {
+                BYTE* od = nullptr;
+                DWORD len = 0;
+                if (SUCCEEDED(ob->Lock(&od, nullptr, &len)) && od && len > 0) {
+                    AudioSample as;
+                    as.data.assign(od, od + len);
+                    // 时间戳按**喂进去的顺序**取（见 aacInTicks_ 的说明）：
+                    // 编码器回填的 sts 不可靠（有的 MFT 直接给 0），而顺序是
+                    // AAC 编码器保证的（没有重排），一比一对应。
+                    //
+                    // 队列里存的是每块的**结束** tick：本块起点 = 上一块结束，
+                    // 于是相邻样本首尾严格相接（不多不少 0 tick），stts 不会
+                    // 出现重叠或空洞。
+                    const int64_t nominalDur = static_cast<int64_t>(kAacFrameSamples) *
+                                               10000000ll / 48000ll;
+                    int64_t endTicks = 0;
+                    if (!aacInTicks_.empty()) {
+                        endTicks = aacInTicks_.front();
+                        aacInTicks_.pop_front();
+                    } else {
+                        endTicks = (aacLastOutTicks_ ? aacLastOutTicks_ : audioStartTicks_) +
+                                   nominalDur;
+                    }
+                    as.wallTicks = aacLastOutTicks_ ? aacLastOutTicks_ : (endTicks - nominalDur);
+                    as.durTicks = endTicks - as.wallTicks;
+                    if (as.durTicks <= 0) as.durTicks = nominalDur;
+                    aacLastOutTicks_ = as.wallTicks + as.durTicks;
+                    aacPending_.push_back(std::move(as));
+                    ob->Unlock();
+                }
+                ob->Release();
+            }
+        }
+        if (outBuf.pEvents) outBuf.pEvents->Release();
+        os->Release();
+    }
+}
+
+void MfEncoder::AppendSilenceTicks(int64_t ticks) {
+    if (ticks <= 0) return;
+    const int64_t frames = ticks * 48000 / 10000000ll;
+    if (frames <= 0) return;
+    aacPcmBuf_.insert(aacPcmBuf_.end(),
+                      static_cast<size_t>(frames) * kAudioChannels, 0);
+}
+
+void MfEncoder::FillSilenceToTicks(int64_t endTicks) {
+    const int64_t tail = AudioEndTicks();
+    if (tail <= 0 || endTicks <= tail) return;
+    AppendSilenceTicks(endTicks - tail);
+}
+
+bool MfEncoder::HasAudioInRange(int64_t startTicks, int64_t endTicks) const {
+    for (const AudioSample& as : aacPending_) {
+        if (as.wallTicks < endTicks && as.wallTicks + as.durTicks > startTicks) return true;
+    }
+    return false;
+}
+
+void MfEncoder::FlushAudioToSegment(int64_t startTicks, int64_t endTicks) {
+    // 把 [startTicks, endTicks) 范围的 AAC 样本直拷进当前分片的音频流。
+    IMFSinkWriter* writer = static_cast<IMFSinkWriter*>(writer_);
+    if (audioStreamIndex_ == 0xFFFFFFFFu) return;
+    if (aacPending_.empty()) return;
+    if (!writer) return;
+    if (endTicks <= startTicks) return;
+
+    std::vector<AudioSample> keep;
+    keep.reserve(aacPending_.size());
+    LONGLONG lastRel = -1;
+    for (AudioSample& as : aacPending_) {
+        const int64_t asEnd = as.wallTicks + as.durTicks;
+        // 早于片起点：已经过期（属于更早的、已 Finalize 的片），直接丢弃。
+        if (asEnd <= startTicks) continue;
+        // 晚于片终点：属于下一片，保留待后续 FlushAudioToSegment 写入。
+        if (as.wallTicks >= endTicks) {
+            keep.push_back(std::move(as));
+            continue;
+        }
+
+        // 直拷这个样本进分片音轨。时间戳按"相对本片起点"重排（每片从 0 开始，
+        // 与视频直拷的时间轴语义一致）。
+        IMFMediaBuffer* buf = nullptr;
+        if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(as.data.size()), &buf))) {
+            keep.push_back(std::move(as));
+            continue;
+        }
+        BYTE* dst = nullptr;
+        if (FAILED(buf->Lock(&dst, nullptr, nullptr)) || !dst) {
+            buf->Release();
+            keep.push_back(std::move(as));
+            continue;
+        }
+        std::memcpy(dst, as.data.data(), as.data.size());
+        buf->Unlock();
+        buf->SetCurrentLength(static_cast<DWORD>(as.data.size()));
+
+        IMFSample* s = nullptr;
+        MFCreateSample(&s);
+        s->AddBuffer(buf);
+        buf->Release();
+        // 相对本片起点的时间戳，**tick 精度**。落在片起点之前的样本（跨在
+        // 边界上的那一帧）夹到 0，最多牺牲一帧的开头对齐，换取音轨不丢
+        // （SinkWriter 对负时间戳处理不可靠，实测会让整条音轨样本数为 0）。
+        LONGLONG relTs = static_cast<LONGLONG>(as.wallTicks - startTicks);
+        if (relTs < 0) relTs = 0;
+        // 绝不写时间戳回退的样本：重叠时间戳会让 MP4 的 stts 自相矛盾，
+        // 播放器解出来是噪声（用户实测的"角磨机"声）。
+        if (relTs <= lastRel) continue;
+        lastRel = relTs;
+        s->SetSampleTime(relTs);
+        s->SetSampleDuration(static_cast<LONGLONG>(as.durTicks));
+        writer->WriteSample(audioStreamIndex_, s);
+        s->Release();
+    }
+    aacPending_.swap(keep);
 }
 
 int64_t MfEncoder::NowUnixMs() {

@@ -310,6 +310,15 @@ struct Profile {
     // 用户的原话（m14071）：「有关编辑的东西一保存立刻落地，像配置改帧率，
     // 改码率什么的」。
     bool SameSettingsIgnoringFpsBitrate(const Profile& other) const;
+
+    // 同上，但**连回放时长一起忽略**（video.replaySeconds）。
+    //
+    // 【为什么需要】回放时长只决定环形缓冲保留多久，可以在录制过程中就地改
+    // （见 MfEncoder::SetKeepSegments）。以前改它落进「拆掉重建」分支：预览
+    // 立刻 NO SIGNAL、正在跑的导出被 reload 线程等住 —— 用户的原话是
+    // 「改一下回放时间，预览出现 no signal，似乎什么东西重启了，我并不希望
+    // 他重启，要求连续的录下去」。
+    bool SameSettingsIgnoringFpsBitrateReplay(const Profile& other) const;
 };
 
 // ---------------------------------------------------------------------------

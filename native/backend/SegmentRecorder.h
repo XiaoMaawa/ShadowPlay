@@ -212,6 +212,21 @@ public:
      * 返回 true = 已经按新码率工作（或码率本来就没变）；false = 没在录 / 超时。
      */
     bool SetBitrate(uint32_t bitrateMbps, uint32_t timeoutMs = 3000);
+
+    /**
+     * 就地改回放时长（秒），**不重建录制器**。
+     *
+     * 【为什么需要】用户点保存时正在导出、顺手把回放时长从 120 秒改成 10 秒，
+     * 以前会走"拆掉整路会话重建"：预览立刻 NO SIGNAL（新录制器从零开始）、
+     * 导出被 reload 线程等着或拦腰打断（表现就是"刚点的导出忽然变得极慢"）。
+     *
+     * 回放时长只决定"环形缓冲保留多久"，和编码器、采集器都无关：这里换算成
+     * 保留片数交给 MfEncoder::SetKeepSegments，喂帧线程在下一次分片轮转时
+     * 就按新窗口清理旧片。轮次目录、分片序号、时间轴全部原地不动。
+     *
+     * 返回 true（永远成功；没在录时只更新记录值，下次 Start 生效）。
+     */
+    bool SetReplaySeconds(uint32_t replaySeconds);
     bool Running() const;
 
     /**
@@ -237,6 +252,15 @@ public:
 
     /** 分片**根**目录（segments/），下面按轮次分子目录。导出从这层开始扫。 */
     std::string SegmentsDir() const;
+
+    /**
+     * 喂一块 PCM 给常驻 AAC 编码器（音频采集线程调用，转发到 MfEncoder）。
+     *
+     * 【为什么单独转发】MfEncoder 在喂帧线程里跑，音频采集线程是另一条线程。
+     * 这里只转发到 MfEncoder::FeedPcm（它内部是线程安全队列 + 锁），不做任何
+     * MF 调用。音频编码进切片这件事由喂帧线程在写视频帧间隙完成。
+     */
+    void FeedPcm(const int16_t* pcm, size_t frames, int64_t startWallMs);
 
 private:
     void RefreshDiskStatsLocked() const;

@@ -767,6 +767,9 @@ napi_value ExportStatusToJs(napi_env env, const shadow::ExportStatus& st) {
     SetProp(env, out, "detail", Str(env, st.detail));
     SetProp(env, out, "segmentCount", Number(env, st.segmentCount));
     SetProp(env, out, "durationSeconds", Number(env, st.durationSeconds));
+    // 成片内容铺到的墙钟位置（Unix 毫秒）。主进程拿它当「从上次保存处继续」
+    // 的切点 —— 第二支的第一帧正好接在第一支的末帧后面，中间不丢样本。
+    SetProp(env, out, "contentEndUnixMs", Number(env, static_cast<double>(st.contentEndUnixMs)));
     SetProp(env, out, "bytes", Number(env, static_cast<double>(st.bytes)));
     SetProp(env, out, "elapsedMs", Number(env, st.elapsedMs));
     SetProp(env, out, "jobId", Number(env, static_cast<double>(st.jobId)));

@@ -411,6 +411,11 @@ SegmentRecorder::~SegmentRecorder() { Stop(); }
 std::string SegmentRecorder::ListFilePath() const { return listFile_; }
 std::string SegmentRecorder::SegmentsDir() const { return segmentsDir_; }
 
+void SegmentRecorder::FeedPcm(const int16_t* pcm, size_t frames, int64_t startWallMs) {
+    if (!encoder_) return;
+    encoder_->FeedPcm(pcm, frames, startWallMs);
+}
+
 bool SegmentRecorder::Running() const {
     std::lock_guard<std::mutex> lk(mu_);
     return stats_.active;
@@ -1268,8 +1273,23 @@ bool SegmentRecorder::SetBitrate(uint32_t bitrateMbps, uint32_t timeoutMs) {
     return brOk_;
 }
 
-void SegmentRecorder::Stop() {
-    // 先收喂帧线程：它可能正卡在 WriteSample 上等编码器。
+bool SegmentRecorder::SetReplaySeconds(uint32_t replaySeconds) {
+    if (replaySeconds == 0) replaySeconds = 1;
+    const uint32_t segmentSeconds = video_.segmentSeconds ? video_.segmentSeconds : 2u;
+    uint32_t keep = (replaySeconds + segmentSeconds - 1) / segmentSeconds;
+    if (keep < 2) keep = 2;
+
+    video_.replaySeconds = replaySeconds;
+    // 编码器按"保留几片"管理环形窗口；让它就地换预算（不切会话、不停录制）。
+    if (encoder_) encoder_->SetKeepSegments(keep);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        stats_.keepSegments = keep;
+    }
+    return true;
+}
+
+void SegmentRecorder::Stop() {    // 先收喂帧线程：它可能正卡在 WriteSample 上等编码器。
     // 必须等它退出来再 Finish 编码器，否则它可能往已经关掉的 writer 里写。
     if (feeder_.joinable()) {
         {

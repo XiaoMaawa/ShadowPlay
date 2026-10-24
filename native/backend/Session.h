@@ -25,7 +25,6 @@
 
 #include "Exporter.h"
 #include "AudioCapture.h"
-#include "AudioRing.h"
 #include "FrameRing.h"
 #include "Profiles.h"
 #include "ScreenCapture.h"
@@ -235,6 +234,11 @@ public:
     bool SameSettingsIgnoringFpsBitrate(const Profile& other) const {
         return profile_.SameSettingsIgnoringFpsBitrate(other);
     }
+
+    // 同上，但**连回放时长一起忽略** —— 它也能就地改（见 ApplyLiveSettings）。
+    bool SameSettingsIgnoringFpsBitrateReplay(const Profile& other) const {
+        return profile_.SameSettingsIgnoringFpsBitrateReplay(other);
+    }
     const Profile& Config() const { return profile_; }
 
     /**
@@ -365,15 +369,14 @@ private:
      * 窗口的声音混进成片），原因写进 audioError，界面在预览上盖红条。
      */
     void StartAudio(const std::string& recordDir);
-    /** 关掉声音采集并收尾落盘的当前块。 */
+    /** 关掉声音采集。 */
     void StopAudio();
     /**
-     * 只重开采集通道，**不动** audioRing_（落盘目录/文件句柄都不变）。
+     * 只重开采集通道（不动录制器）。
      *
      * 看门狗走这条：环回"看着正常但一个包都没有"时重建一次采集，重建会
      * 重新抓一次目标进程树，目标进程树里新冒出来的子进程（Chromium 的
      * audio.mojom.AudioService 就是按需创建、闲着几秒就被回收）才进得来。
-     * 走 StartAudio 会把 ring 也重建一遍、顺手 Purge 掉老块，没必要。
      */
     bool RestartAudioCapture();
     /** 每秒调：刷新电平/统计，采集线程意外退出（换设备）时重开。 */
@@ -407,13 +410,14 @@ private:
     // ---- 声音 ---------------------------------------------------------------
     //
     // 采集通道：桌面/显示器源走系统混音（默认渲染设备 loopback），窗口源走
-    // 进程环回（只抓被捕获窗口那个进程树）。落盘走 AudioRing，按回放窗口滚
-    // 动删除；导出端从 audio 目录按墙钟窗口读 PCM 写进成片。
+    // 进程环回（只抓被捕获窗口那个进程树）。
     //
-    // 为什么把音频和分片分开（不进 mp4）：见 AudioRing.h 文件头 —— 每片重开
-    // AAC 编码器的 priming 会在成片里留下每 2 秒一次的 20ms 空隙。
+    // 音频**直接编进分片**（MfEncoder 的常驻 AAC 编码器）：PCM 经 FeedPcm 投
+    // 进编码器的线程安全队列，喂帧线程编码后按墙钟写进当前分片的音轨。
+    // 曾经音频独立落到 <录像目录>/audio 的 PCM 块、导出时再合入 —— 已删除：
+    // 那套链路一旦目录被清/块被滚删/锚点算错，成片就整段静音；音源统一到
+    // 分片之后，导出端"画面在、声音丢"的问题不再可能出现。
     std::unique_ptr<AudioCapture> audio_;
-    std::unique_ptr<AudioRing> audioRing_;
     int64_t audioRestartAtMs_ = 0;   // 下次允许重开音频的时刻（防抖）
     bool audioWarned_ = false;       // 退回系统混音的提示只报一次
     // 看门狗：连续多久没收到音频包才重建采集。静音时引擎本来就不发包，
@@ -493,6 +497,29 @@ private:
     std::vector<uint8_t> snap_;
     uint32_t snapW_ = 0;
     uint32_t snapH_ = 0;
+
+    // ---- 没画面时喂给录制器的 NO SIGNAL 画布 -------------------------------
+    //
+    // 用户的要求：「窗口捕获和显示器捕获，无论是不是 NO SIGNAL，都要允许导出，
+    // 没有画面的部分用 NO SIGNAL 代替」。
+    //
+    // 原来的做法是"没画面就停录制器"，于是时间轴停在最后一帧：关掉窗口过几秒
+    // 再导出，回放窗口取的是「最后内容往前 N 秒」—— 整段都是关窗前的画面，
+    // 一个 NO SIGNAL 都没有，和预览对不上；而且 recorder_ 没了，ExportNow 直接
+    // 拒绝导出。
+    //
+    // 现在没画面时照常按帧率喂这张画布：时间轴一直走到"现在"，分片里就是
+    // NO SIGNAL 的真实像素，预览/导出/分片三口一致。
+    //
+    // 只生成一次就复用（每次 draw 是 w*h 次写，1080p 约 8MB，不能每拍都重画）。
+    std::vector<uint8_t> noSignalBuf_;
+    uint32_t noSignalW_ = 0;
+    uint32_t noSignalH_ = 0;
+
+    /** 确保 noSignalBuf_ 是 w×h 的 NO SIGNAL 图（尺寸变了才重画）。 */
+    void EnsureNoSignalCanvas(uint32_t w, uint32_t h);
+    /** 按帧率把 NO SIGNAL 喂给录制器（以及共享环），返回是否真的喂了一帧。 */
+    bool FeedNoSignal();
     // 帧环当前**生效**的尺寸（= 最近一次 SetMode 给它的那对值）。
     //
     // 和 snapW_/snapH_ 分开记：snap 是"这一拍采到多大"，环是"对外宣称多大"。

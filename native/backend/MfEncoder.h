@@ -32,7 +32,10 @@
 // 的喂帧线程）串行调用 Write() / Finish()。所有 MF 调用都在同一线程上。
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -278,8 +281,41 @@ public:
      */
     bool SetBitrate(uint32_t bitrateMbps);
 
+    /**
+     * 就地改回放窗口（保留多少秒），不中断录制、不重建会话。
+     *
+     * 【为什么需要】用户把回放时长从 120 秒改成 10 秒时，以前只有 "重建整路
+     * Session" 这一条路：新的录制器 = 新轮次目录 + 分片序号归零 + 帧环清空，
+     * 界面上就是"预览突然 NO SIGNAL、像是重启了一次"；如果当时正在导出，
+     * reload 线程还会等导出（或把会话放回去），导出跟着变慢。
+     *
+     * 回放窗口只决定"保留多久的内容"，和编码器参数无关 —— 改它只需要换一个
+     * 保留预算，下一次分片轮转（几十毫秒到 2 秒内）就会把跌出窗口的旧片清掉。
+     * 录制时间轴、轮次目录、分片序号全部原地不动。
+     *
+     * @param keepSegments 保留的分片数（= ceil(回放秒数 / 分片秒数)），至少 2
+     */
+    void SetKeepSegments(uint32_t keepSegments);
+
     /** 当前实际生效的码率（Mbps，四舍五入）。界面用它核对「配置的值真的落地了」。 */
     uint32_t EffectiveBitrateMbps() const { return (bitrateBps_ + 500000u) / 1000000u; }
+
+    /**
+     * 喂一块 PCM 给常驻 AAC 编码器（音频采集线程调用）。
+     *
+     * 【为什么这里不直接编码】AAC 编码器（IMFTransform）不是线程安全的，而且它
+     * 需要 COM 套间 + 进程级 MF 引用。音频采集线程是另一条独立线程，让它在这里
+     * 碰 MF 会引入跨线程 COM 的麻烦。所以这个函数只把 PCM **投进一个线程安全
+     * 的队列**就返回（微秒级），真正的编码在喂帧线程里做（见 PumpAudio）。
+     *
+     * @param pcm         交错的 S16LE 采样（立体声，48kHz），与 AudioCapture 同格式
+     * @param frames      采样帧数（每帧 2 个 int16）
+     * @param startWallMs 这一块第一帧对应的墙钟毫秒（用于把 AAC 样本归属到分片）
+     */
+    void FeedPcm(const int16_t* pcm, size_t frames, int64_t startWallMs);
+
+    /** 常驻 AAC 编码器是否可用（创建成功且类型协商通过）。 */
+    bool AudioEncoderReady() const;
 
     /** 用户/配置要的码率（Mbps，0 = 没配、走估算）。 */
     uint32_t RequestedBitrateMbps() const { return requestedBitrateMbps_; }
@@ -296,6 +332,88 @@ public:
     std::string ListFilePath() const;
 
 private:
+    /**
+     * 把音频队列里的 PCM 编码成 AAC，并按墙钟缓存带时间戳的 AAC 样本。
+     *
+     * 只在喂帧线程里调用（见 Write 的线程模型）。AAC 编码器、输出样本缓存都
+     * 只被这一条线程碰，无需加锁；只有从队列取 PCM 那一下需要锁。
+     */
+    void PumpAudio();
+    /**
+     * 建常驻 AAC 编码器并协商类型。返回 false = 建不起来（没有声音，录制照常）。
+     * 在 Start() 里、第一个分片开出来之前调一次；OpenSegment() 里逐片重试。
+     */
+    bool InitAudioEncoder();
+    /** 销毁常驻 AAC 编码器 + 排空缓存。在 Finish() 里调。 */
+    void CloseAudioEncoder();
+
+    /**
+     * 音频时间轴：以「采样帧号」为唯一时钟，时间戳全部由它算出来。
+     *
+     * 【为什么不能用毫秒累加】原来是 `wallMs += consumed * 1000 / 48000`，
+     * 每个 1024 帧块 21.333ms 被截断成 21ms —— 每秒凭空少 333µs，采样的
+     * 时间戳步长（21ms）就小于它的时长（21.333ms），**相邻 AAC 样本在 MP4 里
+     * 互相重叠**。录制端还看不出来，但导出端一直拷这些样本时会得到自相矛盾的
+     * stts，解码出来就是满屏"滋滋"的噪声（用户实测）。
+     *
+     * 现在：时间轴 = 起点墙钟ticks + 采样帧号 × 1e7 / 48000，逐块首尾相接、
+     * 零重叠零空洞（跨块误差锁在 1 tick 内，40 分钟不漂）。
+     */
+    int64_t TsOfOffset(int64_t frames) const {
+        return audioStartTicks_ + frames * 10000000ll / 48000ll;
+    }
+    /** 时间轴已经写到哪一刻（ticks，绝对墙钟）。还没开始返回 0。 */
+    int64_t AudioEndTicks() const {
+        return audioStartTicks_ > 0 ? TsOfOffset(audioBufferStart_ + BufferedFrames()) : 0;
+    }
+    /** 待编码 PCM 缓冲里有多少采样帧。 */
+    int64_t BufferedFrames() const { return static_cast<int64_t>(aacPcmBuf_.size() / 2); }
+    /** 往待编码 PCM 缓冲追加静音，让时间轴前进 ticks。 */
+    void AppendSilenceTicks(int64_t ticks);
+    /** 把时间轴补静音一直推进到 endTicks（tick 精度，不再取整到毫秒）。 */
+    void FillSilenceToTicks(int64_t endTicks);
+    /** 缓存里有没有落在 [startTicks, endTicks) 的 AAC 样本。 */
+    bool HasAudioInRange(int64_t startTicks, int64_t endTicks) const;
+
+    /** 把缓存里属于 [startTicks, endTicks) 墙钟范围的 AAC 样本直拷进当前分片的音频流。 */
+    void FlushAudioToSegment(int64_t startTicks, int64_t endTicks);
+
+    /** 一个已编码的 AAC 样本（一份独立内存拷贝 + 墙钟 + 时长，单位 100ns）。 */
+    struct AudioSample {
+        std::vector<uint8_t> data;
+        int64_t wallTicks = 0;   // 样本起始墙钟（100ns）
+        int64_t durTicks = 0;    // 样本时长（100ns）
+    };
+
+    // ---- 常驻 AAC 编码器 ---------------------------------------------------
+    void* aacEncoder_ = nullptr;        // IMFTransform*（CLSID_AACMFTEncoder）
+    uint32_t aacOutBufSize_ = 0;        // GetOutputStreamInfo 拿到的 cbSize
+    std::vector<uint8_t> asc_;          // AudioSpecificConfig（MF_MT_USER_DATA）
+    // 已编码、还没写进分片的 AAC 样本（按墙钟递增）。只在喂帧线程碰。
+    std::vector<AudioSample> aacPending_;
+    bool aacEncoderStarted_ = false;    // 是否已发 BEGIN_STREAMING 消息序列
+    // 已喂给编码器的每个 1024 帧块的时间戳（100ns）。输出样本按顺序和它们
+    // 一一对应 —— 不信任编码器回填的 sts（有的 MFT 会给 0 或按自己的时基）。
+    std::deque<int64_t> aacInTicks_;
+    int64_t aacLastOutTicks_ = 0;       // 兜底：队列空时用它顺延
+    // 音频采集线程投进来的原始 PCM（喂帧线程消费）。格式：S16 立体声交错。
+    struct PcmBlock {
+        std::vector<int16_t> data;
+        int64_t startWallMs = 0;
+    };
+    std::mutex pcmMu_;
+    std::deque<PcmBlock> pcmQueue_;
+    // 音频时间轴（单位 100ns / 采样帧）：见 TsOfOffset 的注释。
+    //
+    //   audioStartTicks_   时间轴 0 号采样对应的墙钟（0 = 还没开始采到声音）
+    //   audioBufferStart_  待编码缓冲头部在时间轴上的采样帧号
+    //   aacPcmBuf_         还没编码的 PCM（尾部 = 时间轴末端）
+    // 时间轴末端 = audioBufferStart_ + BufferedFrames()，所以"缓冲开头"永远是
+    // 精确的，编码消耗 / 溢出丢弃只要推进 audioBufferStart_ 就行。
+    int64_t audioStartTicks_ = 0;
+    int64_t audioBufferStart_ = 0;
+    std::vector<int16_t> aacPcmBuf_;
+
     /** 开一个新分片（轮转）。返回 false 表示开不出来。 */
     bool OpenSegment();
 
@@ -362,7 +480,14 @@ private:
      */
     uint32_t    requestedBitrateMbps_ = 0;
     uint32_t    segmentSeconds_ = 2;
-    uint32_t    keepSegments_ = 2;
+    /**
+     * 回放窗口的分片预算 —— **可以在录制中改**（SetKeepSegments）。
+     *
+     * 用 atomic 而不是普通成员：改它的线程是会话线程（reload），读它的是
+     * 喂帧线程（PurgeExpired/PickSlot）。两者同时发生完全可能，而这里保护
+     * 的只是一个"保留多少"的预算，不需要更强的同步。
+     */
+    std::atomic<uint32_t> keepSegments_{2};
     uint32_t    segmentFrames_ = 0;   // 每片多少帧（= fps * segmentSeconds）
 
     /**
@@ -428,7 +553,8 @@ private:
 
     /** 回放窗口的毫秒数（= keepSegments_ × 标称片长）。 */
     int64_t WindowMs() const {
-        return static_cast<int64_t>(keepSegments_) * static_cast<int64_t>(segmentSeconds_) * 1000;
+        return static_cast<int64_t>(keepSegments_.load(std::memory_order_relaxed)) *
+               static_cast<int64_t>(segmentSeconds_) * 1000;
     }
 
     /** 按时间清掉已经跌出回放窗口的分片（连文件一起），并重写 index.csv。 */
@@ -441,6 +567,9 @@ private:
     // 实际类型是 IMFSinkWriter*。
     void* writer_ = nullptr;
     uint32_t streamIndex_ = 0;
+    // 当前分片 SinkWriter 里的音频流下标（AAC passthrough）。0xFFFFFFFF = 没加
+    // （AAC 编码器没起来，这一片只有视频）。
+    uint32_t audioStreamIndex_ = 0xFFFFFFFFu;
 
     /**
      * 样本池（每片一组，开新片时重建）。

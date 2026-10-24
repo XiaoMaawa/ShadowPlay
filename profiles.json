@@ -17,7 +17,7 @@
       "video": {
         "fps": 60,
         "bitrateMbps": 20,
-        "replaySeconds": 120,
+        "replaySeconds": 10,
         "segmentSeconds": 2,
         "scaleWidth": 0,
         "scaleHeight": 0
@@ -52,10 +52,10 @@
         "pick": "largest",
         "pollMs": 1000,
         "requireVisible": true,
-        "title": "天崩，女儿基因病脑积水，父亲开深夜烧烤摊赚手术费，我去消费一下，",
+        "title": "你有个喜欢分享猎奇视频的魔丸兄弟",
         "className": "Chrome_WidgetWin_1",
         "process": "哔哩哔哩.exe",
-        "hwnd": 722664
+        "hwnd": 1116162
       }
     }
   ]

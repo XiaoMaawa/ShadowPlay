@@ -320,8 +320,16 @@ function saveSettings(patch) {
 // ---------------------------------------------------------------------------
 // 「从上次保存处继续」的切点记录（settings.json 同目录的 export-cuts.json）
 //
-// 每次导出**成功**后记下"点击保存那一刻"的毫秒墙钟，按 profile id 各记一份。
-// 下一次导出时把它作为窗口起点传给导出模块，之前的内容就都不要了。
+// 每次导出**成功**后记下"这次成片的内容铺到哪一刻"的毫秒墙钟，按 profile id
+// 各记一份。下一次导出时把它作为窗口起点传给导出模块，之前的内容就都不要了。
+//
+// 【切点必须来自导出端，不能是 Date.now()】
+//   分片的时间轴是**内容轴**：编码器跟不上时它会落后墙钟（1440p@144 实测落后
+//   十几秒），所以"点保存那一刻"往往早已越过成片的末帧。拿它当切点的话，
+//   第二次导出从"现在"开始，中间那几百毫秒到几秒的真实画面谁也没导出 ——
+//   用户报的「连续保存两个视频，两个视频不连续，出现了丢帧」就是这个。
+//   现在改用导出端回报的 contentEndUnixMs（成片真正铺到的那一帧的墙钟），
+//   第一支的末帧与第二支的首帧严格相邻。
 //
 // 为什么单独一个小文件而不是塞进 profiles.json：切点是**运行状态**（随每次
 // 导出变），配置是**用户数据**（用户编辑才变），混在一起会让用户每导出一次
@@ -1189,18 +1197,21 @@ async function runExportJob(job) {
     // 这个值能改 —— 改大了会把完整的 2 秒片误判成半片丢掉，成品就短一截。
     const segSecs = Math.round(Number(profile.video?.segmentSeconds) || 0) || 2
 
-    // 「从上次保存处继续」：设置打开且这一路记过切点时，把切点（上次成功保存
-    // 的点击时刻）作为窗口起点传下去。导出端据此锚定窗口、不补 NO SIGNAL，
-    // 之前录的内容一概不要。没记过切点（从来没有保存过）就照常按回放时长导。
+    // 「从上次保存处继续」：设置打开且这一路记过切点时，把切点（上一次成片
+    // 内容铺到的那一刻，见 saveExportCut）作为窗口起点传下去。导出端据此锚定
+    // 窗口、不补 NO SIGNAL，之前录的内容一概不要。没记过切点（从来没保存过）
+    // 就照常按回放时长导。
     //
-    // 切点在**每次导出成功后**都更新成这次的点击时刻 —— 不管开关现在开没开。
-    // 这是为了"开了开关后的第一次保存就生效"：用户先保存、再打开开关、再保存，
-    // 第二次保存的起点就应该是第一次保存那一刻，而不是要等到第三次。
+    // 切点在**每次导出成功后**都更新 —— 不管开关现在开没开。这是为了"开了
+    // 开关后的第一次保存就生效"：用户先保存、再打开开关、再保存，第二次保存
+    // 的起点就应该是第一次保存的结尾，而不是要等到第三次。
     // 导出失败不推进切点，失败那次的中间内容不会丢。
     const clickedAt = Date.now()
     let startUnixMs = 0
     if (loadSettings().continueAfterSave) {
       const cut = Number(loadExportCuts()[id]) || 0
+      // 切点是内容轴上的时刻，正常总在过去；夹一下是为了防止时钟跳变/文件被
+      // 手改后传一个未来时刻进去（那会算出一个空窗口直接报错）。
       if (cut > 0 && cut < clickedAt) startUnixMs = cut
     }
     const res = addon.exportStart(
@@ -1216,7 +1227,11 @@ async function runExportJob(job) {
       failJob(res?.error ?? '导出没能开始。')
       return
     }
-    log(`[export] ${id} 开跑：${segmentsDir} → ${exportDir}（${maxSeconds} 秒 / ${wantFps}fps）`)
+    log(
+      `[export] ${id} 开跑：${segmentsDir} → ${exportDir}（${maxSeconds} 秒 / ${wantFps}fps` +
+        (startUnixMs > 0 ? ` / 从上次结尾 ${startUnixMs} 起` : '') +
+        '）',
+    )
 
     // 【第二步：等它收尾】
     //
@@ -1249,9 +1264,21 @@ async function runExportJob(job) {
     if (st.ok) {
       const mb = ((st.bytes ?? 0) / 1024 / 1024).toFixed(1)
       log(`[export] ${id} 完成：${st.outPath}（${(st.durationSeconds ?? 0).toFixed(1)} 秒 / ${mb} MB）`)
-      // 成功了就把切点推到这次点击的时刻。**无条件记**：开关关着的时候也记，
-      // 这样之后哪天把开关打开，起点就是"最近一次保存"，第一次保存就生效。
-      saveExportCut(id, clickedAt)
+      // 把切点推到**成片内容真正铺到的那一刻**。**无条件记**：开关关着的时候
+      // 也记，这样之后哪天把开关打开，起点就是"最近一次保存到哪"，第一次保存
+      // 就生效。
+      //
+      // 优先用导出端回报的 contentEndUnixMs（内容轴，精确到一帧）；拿不到
+      // （老版本模块 / 这一趟一帧真实画面都没有）才退回点击时刻 —— 那会丢
+      // 几百毫秒，但总比不记强。
+      const endMs = Number(st.contentEndUnixMs) || 0
+      if (endMs > 0) {
+        saveExportCut(id, endMs)
+        log(`[export] 切点推进到 ${endMs}（内容轴；点击时刻 ${clickedAt}）`)
+      } else {
+        logErr(`[export] 导出没回报内容结尾时刻，切点退回点击时刻（下一支可能丢几帧）。`)
+        saveExportCut(id, clickedAt)
+      }
     } else {
       logErr(`[export] ${id} 失败：${st.detail ?? '原因不明'}`)
     }

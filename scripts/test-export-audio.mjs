@@ -1,11 +1,12 @@
 // scripts/test-export-audio.mjs —— 验证「导出成片里真的带音轨」
 //
-// 为什么单独一个脚本：音频采集依赖声卡有没有在出声。这台机器整机静音时
-// WASAPI loopback 一个包都不发，录制目录里不会有 .pcm —— 那样就没法验证
-// "导出把 PCM 编进成片"这条链路到底通不通。
-// 所以这里**自己合成一段 PCM** 丢进录像目录的 audio/ 下（格式与采集端一致：
-// 48000Hz / 16bit / 立体声 / 裸 PCM，文件名 a_<起始墙钟毫秒>.pcm），再让
-// 服务导出，然后检查产物里有没有 AAC 音轨（MP4 里的 mp4a / soun box）。
+// 音频现在**直接编进分片**（MfEncoder 的常驻 AAC 编码器），audio/ PCM 目录
+// 已删除。导出端的音源只有分片一个：直拷通道搬 AAC 样本、重编码通道解成
+// PCM 重压。这里录制 + 导出，然后检查产物里有没有 AAC 音轨（MP4 里的
+// mp4a / soun box）以及音轨里有没有实际样本。
+//
+// 注意：整机静音时 WASAPI loopback 一个包都不发，分片里的音轨就是空的 ——
+// 这种情况下"音轨存在但 0 样本"判为警告而不是失败（链路是通的，只是没声）。
 //
 // 用法：node scripts/test-export-audio.mjs
 // 退出码 0 = 通过。
@@ -31,6 +32,7 @@ const arg = (name, dflt) => {
 }
 const WINDOW_SEC = arg('window', 20)
 const RECORD_SEGMENTS = arg('segments', 4)
+const FPS = arg('fps', 30)
 const SKIP_PHASE2 = process.argv.includes('--skip-phase2')
 
 if (!existsSync(backend)) {
@@ -61,7 +63,7 @@ const writeProfile = (replaySeconds) =>
             enabled: true,
             source: { kind: 'monitor', monitorIndex: 0, clientAreaOnly: false, wgc: true },
             video: {
-              fps: 30,
+              fps: FPS,
               bitrateMbps: 6,
               replaySeconds,
               segmentSeconds: 1,
@@ -201,21 +203,7 @@ function audioPayload(file) {
   return { bytes: 0, samples: 0 }
 }
 
-/** 合成一段 440Hz 正弦（S16LE / 48k / 立体声），写到 audio 目录。 */
-function writeSine(dir, startMs, seconds) {
-  mkdirSync(dir, { recursive: true })
-  const rate = 48000
-  const frames = Math.round(seconds * rate)
-  const buf = Buffer.alloc(frames * 4)
-  for (let i = 0; i < frames; i += 1) {
-    const v = Math.round(Math.sin((2 * Math.PI * 440 * i) / rate) * 8000)
-    buf.writeInt16LE(v, i * 4)
-    buf.writeInt16LE(v, i * 4 + 2)
-  }
-  const file = path.join(dir, `a_${startMs}.pcm`)
-  writeFileSync(file, buf)
-  return file
-}
+/** 合成 PCM 的旧机制已删除：音频现在由采集端直接编进分片音轨。 */
 
 const child = spawn(backend, ['--profiles', PROFILES], {
   cwd: projectRoot,
@@ -254,14 +242,10 @@ if (!recordDir) {
   console.log('[test] 失败：状态里没有 recordDir')
   child.kill()
   process.exit(1)
-}console.log(`[test] 录像目录：${recordDir}`)
+}// 音频由采集端编进分片：整机静音时分片音轨为空，属正常（链路通、无声音）。
+console.log(`[test] 录像目录：${recordDir}`)
 console.log(`[test] 声音通道：${st?.audioDetail ?? '（服务没报）'}`)
-
-// 关键一步：手写一段 4 秒的 PCM 进 audio 目录（这台机器静音时采集端不会产出）
-const audioDir = path.join(recordDir, 'audio')
-const startMs = Date.now() - RECORD_SEGMENTS * 1000
-const pcm = writeSine(audioDir, startMs, RECORD_SEGMENTS)
-console.log(`[test] 已合成测试音频：${path.basename(pcm)}（${RECORD_SEGMENTS} 秒 440Hz）`)
+const machineSilent = !st?.audioActive
 
 const beforeFiles = countMp4()
 const beforeJob = desk()?.exportJobId ?? 0
@@ -302,9 +286,12 @@ function checkExport(label, r) {
       ` / 音频样本 ${payload.samples} 个 ${(payload.bytes / 1024).toFixed(1)} KB`,
   )
   if (!track.soun || !track.mp4a) problems.push(`${label}产物里没有 AAC 音轨（mp4a 缺失）`)
-  // 光有音轨盒子不够：一个样本都没写时也有 mp4a，但播出来是静音。
+  // 光有音轨盒子不够：一个样本都没写时也有 mp4a。整机静音时这是正常现象
+  // （WASAPI loopback 无包 → 分片音轨 0 样本），只警告不判失败。
   if (payload.samples <= 0 || payload.bytes < 8000) {
-    problems.push(`${label}音轨是空的（样本 ${payload.samples} 个 / ${payload.bytes} 字节）`)
+    const msg = `${label}音轨是空的（样本 ${payload.samples} 个 / ${payload.bytes} 字节）`
+    if (machineSilent) console.log(`[test] 警告（整机静音，属预期）：${msg}`)
+    else problems.push(msg)
   }
   if (dur < 3) problems.push(`${label}成片只有 ${dur.toFixed(2)}s，太短`)
 }
@@ -332,10 +319,7 @@ send({ cmd: 'flush', id: 'p-desk' })
 await sleep(600)
 
 const recDir2 = String(desk()?.recordDir ?? '')
-if (recDir2) {
-  writeSine(path.join(recDir2, 'audio'), Date.now() - 6000, 6)
-  console.log('[test] 已合成 6 秒测试音频（直拷用例）')
-}
+if (!recDir2) console.log('[test] 注意：第二轮没拿到 recordDir')
 
 const before2 = countMp4()
 const job2 = desk()?.exportJobId ?? 0

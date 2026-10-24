@@ -1085,10 +1085,62 @@ int RunProfilesMode(const Options& opt, HANDLE mutex) {
                                     ",\"detail\":\"只改了帧率/码率，已就地生效（不重建会话）\"}");
                             if (applied) continue;
                         }
+                        // ---- 只改了回放时长：同样就地改，绝不重建 --------------
+                        //
+                        // 用户的操作：点"保存视频"（导出开始）→ 立刻点"编辑配置"、
+                        // 把回放时间从 120 秒改成 10 秒 → 确定。以前这会被判成
+                        // "配置变了"，于是拆掉整路会话：预览立刻 NO SIGNAL、录制
+                        // 从零开始（用户："似乎什么东西重启了，我其实并不希望他
+                        // 重启"），正在跑的导出还会被 reload 线程等住而变得极慢
+                        // （用户："刚刚导出的视频会导出的非常的慢"）。
+                        //
+                        // 回放时长只决定环形缓冲保留多久，改它不需要动采集器/
+                        // 编码器：换一个保留预算，下一次分片轮转就把旧片清掉。
+                        if (it != sessions.end() && want &&
+                            (*it)->SameSettingsIgnoringFpsBitrateReplay(*np)) {
+                            const bool applied = (*it)->ApplyLiveSettings(*np);
+                            (*it)->SetPreviewFps(previewFps.load(std::memory_order_relaxed));
+                            LogLine("{\"type\":\"session_reloaded\",\"id\":\"" + JsonEscape(id) +
+                                    "\",\"active\":true,\"applied\":" +
+                                    (applied ? "true" : "false") +
+                                    ",\"detail\":\"只改了回放时长/帧率/码率，已就地生效"
+                                    "（不重建会话、不中断录制）\"}");
+                            if (applied) continue;
+                        }
                         // 配置确实变了（或者要停用）。旧的摘出来，锁外收尾。
                         if (it != sessions.end()) {
                             old = std::move(*it);
                             sessions.erase(it);
+                        }
+                    }
+                    // ---- 正在导出的这一路要等它导完再拆 --------------------
+                    //
+                    // 用户的操作顺序是「点保存（开始导出）→ 顺手把回放时长改一下
+                    // → 确定」。以前这里直接拆会话：Exporter 析构、导出被拦腰
+                    // 打断，成品停在 0KB；界面报"导出失败"，而用户觉得"我就改
+                    // 了个设置"。
+                    //
+                    // 导出通常一两秒，先等一等（最多 3 秒）再继续重建；等不到
+                    // 就跳过这一路 —— 宁可这次配置不生效，也不要把一个正在写的
+                    // 成品弄坏。下一次保存会重新应用。
+                    if (old) {
+                        const auto deadline =
+                            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                        while (old->ExportState().running &&
+                               std::chrono::steady_clock::now() < deadline) {
+                            Sleep(80);
+                        }
+                        if (old->ExportState().running) {
+                            // 还没导完：把会话放回去，这次改动不应用。
+                            {
+                                std::lock_guard<std::mutex> lk(sessionsMutex);
+                                sessions.push_back(std::move(old));
+                            }
+                            LogLine("{\"type\":\"session_reloaded\",\"id\":\"" +
+                                    JsonEscape(id) +
+                                    "\",\"active\":true,\"applied\":false,\"detail\":"
+                                    "\"这一路正在导出，配置改动等下次保存再应用\"}");
+                            continue;
                         }
                     }
                     if (old) old->Stop(); // 锁外收尾，主循环照常报状态

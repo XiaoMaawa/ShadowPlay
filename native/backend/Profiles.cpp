@@ -741,6 +741,24 @@ bool Profile::SameSettingsIgnoringFpsBitrate(const Profile& o) const {
     return a.SameSettings(b);
 }
 
+bool Profile::SameSettingsIgnoringFpsBitrateReplay(const Profile& o) const {
+    // 与 SameSettingsIgnoringFpsBitrate 同一套思路：把**能就地生效**的三个字段
+    // （帧率、码率、回放时长）抹平再交给 SameSettings。
+    //
+    // 【为什么回放时长也能就地改】它只决定环形缓冲保留多久（换算成保留片数），
+    // 和采集器 / 编码器的构造参数无关。以前改它会被判成"配置变了"→ 拆掉整路
+    // 会话重建：预览 NO SIGNAL、导出被打断/变慢（用户实测报的就是这个）。
+    Profile a = *this;
+    Profile b = o;
+    a.video.fps = 0.0;
+    b.video.fps = 0.0;
+    a.video.bitrateMbps = 0;
+    b.video.bitrateMbps = 0;
+    a.video.replaySeconds = 0;
+    b.video.replaySeconds = 0;
+    return a.SameSettings(b);
+}
+
 const Profile* ProfileDoc::Find(const std::string& id) const {
     for (const auto& p : profiles) {
         if (p.id == id) return &p;

@@ -20,3 +20,7 @@ test/
 
 # 应用保存配置时自己生成的上一版备份，每次设置变更都会变，不进仓库
 profiles.json.bak
+
+# 临时诊断产物（抓帧、导出的样本、探针日志）
+.tmp-inspect/
+/probe_*_out.mp4

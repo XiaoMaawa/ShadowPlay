@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "JsonUtil.h"
+#include "NoSignalMask.h"
 #include "RingNames.h"
 #include "Utf8Path.h"
 #include "WindowEnum.h"
@@ -154,9 +155,8 @@ Session::~Session() {
     // 帧环之前收尾。手工写死顺序比依赖成员声明位置可靠 —— 以后有人在
     // Session.h 里挪一行，析构顺序就不会跟着悄悄变。
     Stop();
-    // 声音采集要最先停：它的回调正在往 audioRing_ 里写，ring 不能先没。
+    // 声音采集要最先停：它的回调还在往编码器投 PCM，编码器不能先没。
     audio_.reset();
-    audioRing_.reset();
     windowCapture_.reset();
     recorder_.reset();
     exporter_.reset();
@@ -454,18 +454,49 @@ void Session::EnsureRecorder(uint32_t w, uint32_t h) {
     if (ok) StartAudio(dir);
 }
 
+// ---------------------------------------------------------------------------
+// 没画面时喂 NO SIGNAL
+// ---------------------------------------------------------------------------
+
+void Session::EnsureNoSignalCanvas(uint32_t w, uint32_t h) {
+    // 和 EnsureRecorder 同一套取偶规则：编码器按偶数宏块工作，喂进去的尺寸
+    // 必须和录制器建立时那对值一致，否则切片边界会错开。
+    w &= ~1u;
+    h &= ~1u;
+    if (w == 0 || h == 0) return;
+
+    const size_t need = static_cast<size_t>(w) * 4u * static_cast<size_t>(h);
+    if (noSignalW_ == w && noSignalH_ == h && noSignalBuf_.size() == need) return;
+
+    noSignalBuf_.assign(need, 0);
+    DrawNoSignalBgra(noSignalBuf_.data(), w, h, static_cast<size_t>(w) * 4u);
+    noSignalW_ = w;
+    noSignalH_ = h;
+}
+
+bool Session::FeedNoSignal() {
+    if (!recorder_ || !recorder_->Running()) return false;
+    // 用**录制器建立时**的尺寸：那才是编码器当前这条流的尺寸。
+    EnsureNoSignalCanvas(recorderW_, recorderH_);
+    if (noSignalBuf_.empty() || noSignalW_ == 0) return false;
+    recorder_->Feed(noSignalBuf_.data(), noSignalW_ * 4u, noSignalW_, noSignalH_);
+    return true;
+}
+
 // 把新配置里可以就地生效的部分应用到正在跑的会话上。
 bool Session::ApplyLiveSettings(const Profile& next) {
-    // 只有「除了帧率、码率以外全都一样」才允许就地改。别的字段都写死在采集器 /
-    // 录制器的构造里（分片时长、回放窗口、采集源、缩放），改不了。
-    if (!profile_.SameSettingsIgnoringFpsBitrate(next)) return false;
+    // 只有「除了帧率、码率、回放时长以外全都一样」才允许就地改。别的字段
+    // （分片时长、采集源、缩放）都写死在采集器 / 录制器的构造里，改不了。
+    if (!profile_.SameSettingsIgnoringFpsBitrateReplay(next)) return false;
 
     const double oldFps = profile_.video.fps;
     const double newFps = next.video.fps;
     const uint32_t oldBitrate = profile_.video.bitrateMbps;
     const uint32_t newBitrate = next.video.bitrateMbps;
+    const uint32_t oldReplay = profile_.video.replaySeconds;
+    const uint32_t newReplay = next.video.replaySeconds;
 
-    // 除了帧率/码率之外的元数据（名字用于导出文件名前缀，改了要跟着走）
+    // 除了帧率/码率/回放时长之外的元数据（名字用于导出文件名前缀，改了要跟着走）
     profile_.name = next.name;
 
     {
@@ -475,14 +506,20 @@ bool Session::ApplyLiveSettings(const Profile& next) {
 
     const bool fpsChanged = (oldFps != newFps);
     const bool bitrateChanged = (oldBitrate != newBitrate);
-    if (!fpsChanged && !bitrateChanged) return true;
+    const bool replayChanged = (oldReplay != newReplay);
+    if (!fpsChanged && !bitrateChanged && !replayChanged) return true;
 
     profile_.video.fps = newFps;
     profile_.video.bitrateMbps = newBitrate;
+    profile_.video.replaySeconds = newReplay;
 
     // 录制器那边也要跟着改。它内部会让编码器收掉当前片、按新参数开新片
     // （见 SegmentRecorder::SetFps / SetBitrate），**不换轮次目录、
     // 不归零分片序号、时间轴继续顺延**。
+    //
+    // 回放时长走 SetReplaySeconds：只换"保留多久"的预算，连片都不用切 ——
+    // 用户改回放时长时录制必须一直是连续的（不能出现 NO SIGNAL、不能碰
+    // 正在跑的导出）。
     //
     // 失败也不回滚：编码器可能被硬件吞吐上限卡住，但那时它会自己降档并
     // 把原因写进 recordDetail，比把会话拆了重建好得多。
@@ -494,6 +531,9 @@ bool Session::ApplyLiveSettings(const Profile& next) {
             // 码率改完要把结果如实报给界面（SegmentRecorder 的 stats 里没有
             // 码率字段，这里直接读编码器）。失败时 recordDetail 里会有原因。
             recorder_->SetBitrate(newBitrate);
+        }
+        if (replayChanged) {
+            recorder_->SetReplaySeconds(newReplay);
         }
     }
     return true;
@@ -517,8 +557,26 @@ bool Session::FlushRecording() {
 }
 
 bool Session::ExportNow(const std::string& exportDir, double maxSeconds) {
-    if (!recorder_) return false;
-    const std::string segDir = recorder_->SegmentsDir();
+    // 目录优先问录制器；录制器不在（采集链路断过、还没接回来）就退回状态里
+    // 记着的那个目录。
+    //
+    // 【为什么要留这条退路】用户的要求：「窗口捕获和显示器捕获，无论是不是
+    // NO SIGNAL，都要允许导出，没有画面的部分用 NO SIGNAL 代替」。以前这里是
+    // `if (!recorder_) return false;` —— 关掉窗口之后导出按钮直接失效，哪怕
+    // 磁盘上躺着几十个完好的分片。
+    std::string segDir;
+    if (recorder_) segDir = recorder_->SegmentsDir();
+    if (segDir.empty()) {
+        std::string dir;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            dir = status_.recordDir;
+        }
+        // 状态里报的是**配置目录**（<root>/<序号>），而分片在它下面的
+        // segments/ 里（见 SegmentRecorder::Start）。直接拿 recordDir 去扫
+        // 会连一片都找不到 —— 导出会报"分片目录里还没有可导出的完整分片"。
+        if (!dir.empty()) segDir = PathToUtf8(fs::u8path(dir) / fs::u8path("segments"));
+    }
     if (segDir.empty()) return false;
 
     // 导出前把**正在写的那一片**收尾落盘。
@@ -534,7 +592,8 @@ bool Session::ExportNow(const std::string& exportDir, double maxSeconds) {
     //
     // 失败不影响导出：FlushSegment 返回 false 只说明"没切"（没在录 / 当前片
     // 一帧都没有 / 等超时），导出端照旧拿已完成的分片，最多还是丢那一小段。
-    recorder_->FlushSegment();
+    // 录制器不在就没什么可 flush 的（分片已经是落盘状态）。
+    if (recorder_) recorder_->FlushSegment();
 
     // 文件名前缀用配置名，避免多路配置同一秒导出时互相覆盖。
     // 配置名里可能有目录分隔符/通配符，先洗一遍 —— 服务端不该把用户输入
@@ -613,7 +672,7 @@ void Session::RefreshRecordStatus() {    if (!recorder_) return;
 // ---------------------------------------------------------------------------
 
 namespace {
-/** 墙钟毫秒（Unix 纪元）。和 AudioRing / AudioCapture 用的是同一套时基。 */
+/** 墙钟毫秒（Unix 纪元）。和 AudioCapture 用的是同一套时基。 */
 int64_t NowMs() {
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
@@ -657,37 +716,29 @@ uint32_t Session::ResolveAudioPid() {
 }
 
 void Session::StartAudio(const std::string& recordDir) {
+    (void)recordDir; // 音频不再独立落盘（audio/ 目录已删除），目录仅用于诊断
     StopAudio();
-    if (recordDir.empty()) return;
-
-    // 音频目录与分片目录平级：<录像目录>/segments 与 <录像目录>/audio。
-    // 导出端只拿到分片目录，按这个约定自己找得到音频（见 AudioRing.h）。
-    const std::string audioDir = PathToUtf8(fs::u8path(recordDir) / fs::u8path("audio"));
-    audioRing_ = std::make_unique<AudioRing>();
-    if (!audioRing_->Open(audioDir, profile_.video.replaySeconds, 2)) {
-        std::lock_guard<std::mutex> lk(mu_);
-        status_.audioActive = false;
-        status_.audioDetail = "声音写不进去：" + audioDir;
-        return;
-    }
-
     RestartAudioCapture();
 }
 
 bool Session::RestartAudioCapture() {
-    // 顺序很关键：先把旧的采集线程停干净，它的回调手里攥着 ring 的裸指针。
+    // 顺序很关键：先把旧的采集线程停干净，再起新的。
     if (audio_) {
         audio_->Stop();
         audio_.reset();
     }
-    if (!audioRing_) return false;
 
-    AudioRing* ring = audioRing_.get();
+    // recorder_ 的裸指针：音频采集回调跑在独立线程，而 recorder_ 在 Stop 时
+    // 会被 reset。靠"声音采集最先停"（见 Stop 的注释）保证回调不会在 reset
+    // 之后还跑；即便偶发，FeedPcm 内部也只是投一个带锁队列，encoder_ 为空时
+    // 直接返回，不会崩。
+    SegmentRecorder* rec = recorder_.get();
     audio_ = std::make_unique<AudioCapture>();
-    // 回调跑在音频采集线程上：只往 ring 里追加 + 更新实时电平（都是几个原子
-    // 操作），不做别的（ring 自己带锁）。
-    audio_->SetSink([this, ring](const int16_t* pcm, size_t frames, int64_t startWallMs) {
-        ring->Append(pcm, frames, startWallMs);
+    // 回调跑在音频采集线程上：把 PCM 喂给常驻 AAC 编码器（音频**直接编进
+    // 切片**的音轨 —— 不再有独立的 audio/ PCM 目录），并更新实时电平。
+    audio_->SetSink([this, rec](const int16_t* pcm, size_t frames, int64_t startWallMs) {
+        // 音频编码进切片：投线程安全队列，微秒级，真正的编码在喂帧线程里做。
+        if (rec) rec->FeedPcm(pcm, frames, startWallMs);
         // 实时电平：界面那条音量条要 30Hz 地动，1 秒一次的状态撑不起来。
         // 就在这里顺手算一块的峰值（48k 立体声一秒也就 96k 个样本，可忽略）。
         int32_t mx = 0;
@@ -744,33 +795,23 @@ bool Session::RestartAudioCapture() {
         // 窗口源采不到声音 = 这条素材不会有声，必须让用户看见（界面盖红条）。
         if (profile_.source.kind == SourceKind::Window) status_.audioError = why;
     }
-    status_.audioChunks = audioRing_ ? audioRing_->Chunks() : 0;
-    status_.audioBytes = audioRing_ ? audioRing_->Bytes() : 0;
+    status_.audioChunks = 0; // audio/ PCM 目录已删除；音频在分片里
+    status_.audioBytes = 0;
     return ok;
 }
 
 void Session::StopAudio() {
-    // 顺序不能反：采集线程的回调里攥着 ring 的裸指针，必须先停线程再拆 ring。
     if (audio_) {
         audio_->Stop();
         audio_.reset();
-    }
-    uint32_t chunks = 0;
-    uint64_t bytes = 0;
-    if (audioRing_) {
-        audioRing_->Close();
-        audioRing_->Purge();
-        chunks = audioRing_->Chunks();
-        bytes = audioRing_->Bytes();
-        audioRing_.reset();
     }
     std::lock_guard<std::mutex> lk(mu_);
     status_.audioActive = false;
     status_.audioPeak = 0.0f;
     status_.audioRms = 0.0f;
     status_.audioError.clear();
-    status_.audioChunks = chunks;
-    status_.audioBytes = bytes;
+    status_.audioChunks = 0;
+    status_.audioBytes = 0;
     audioPid_ = 0;
 }
 
@@ -906,21 +947,14 @@ void Session::RefreshAudioStatus(int64_t nowMs) {
         pull(&active, &peak, &rms, &detail);
     }
 
-    uint32_t chunks = 0;
-    uint64_t bytes = 0;
-    if (audioRing_) {
-        audioRing_->Purge(nowMs);
-        chunks = audioRing_->Chunks();
-        bytes = audioRing_->Bytes();
-    }
-
     std::lock_guard<std::mutex> lk(mu_);
     status_.audioActive = active;
     status_.audioPeak = peak;
     status_.audioRms = rms;
     if (!detail.empty()) status_.audioDetail = detail;
-    status_.audioChunks = chunks;
-    status_.audioBytes = bytes;
+    // audio/ PCM 目录已删除：音频直接编进分片音轨，不再有独立的块统计。
+    status_.audioChunks = 0;
+    status_.audioBytes = 0;
     status_.audioRestarts = audioRestarts_;
     status_.audioTreeGrown = audioTreeGrown_;
 }
@@ -1222,11 +1256,46 @@ void Session::ThreadMain() {
             //
             // 重试间隔取 1 秒：窗口从创建到 WGC 能抓通常要几百毫秒，1 秒足够快，
             // 又不会让"永远不存在的窗口"把 CPU 烧掉。
+            //
+            // 【等待期间必须继续喂帧】见 Session.h 里 noSignalBuf_ 的说明。
+            // 以前这里就是干等：录制器已经在内层退出时被拆掉，时间轴停在最后
+            // 一帧。用户关掉窗口、过几秒点导出，回放窗口取的是"最后内容往前
+            // N 秒" —— 整段都是关窗前的画面，一个 NO SIGNAL 都没有，和预览
+            // 完全对不上；而且 recorder_ 没了，导出直接被拒。
+            //
+            // 现在按录制帧率一直喂 NO SIGNAL：时间轴走到"现在"，分片里就是
+            // 遮罩的真实像素，预览/分片/导出三处一致。
             const auto retryInterval = std::chrono::milliseconds(1000);
+            const double waitFps =
+                profile_.video.fps > 0.0 ? profile_.video.fps : kDefaultFps;
+            const auto waitTick =
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(1.0 / (waitFps > 0.0 ? waitFps : kDefaultFps)));
+            auto waitNext = std::chrono::steady_clock::now();
+            auto waitRetryAt = waitNext + retryInterval;
             while (!stopRequested_.load(std::memory_order_acquire)) {
-                Sleep(static_cast<DWORD>(retryInterval.count()));
-                if (stopRequested_.load(std::memory_order_acquire)) break;
-                if (ResolveSource()) break;
+                const auto nowTick = std::chrono::steady_clock::now();
+                if (nowTick >= waitNext) {
+                    FeedNoSignal();
+                    waitNext += waitTick;
+                    // 落后超过一拍就重锚，别追着补一堆（补帧只会把时间轴推快）。
+                    if (waitNext < nowTick) waitNext = nowTick + waitTick;
+                }
+                if (nowTick >= waitRetryAt) {
+                    waitRetryAt = nowTick + retryInterval;
+                    // 状态每秒刷一次：外面（界面、统计）要靠 recordFrames /
+                    // recording 判断"到底还在不在录"。不刷的话数字会冻在进
+                    // 这段之前的那个值上 —— 看起来像"关窗后就不录了"，但实际
+                    // 一直在写 NO SIGNAL。
+                    RefreshRecordStatus();
+                    RefreshAudioStatus(0);
+                    if (ResolveSource()) break;
+                }
+                const auto wakeAt = std::min(waitNext, waitRetryAt);
+                const auto sleepMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(wakeAt - nowTick)
+                        .count();
+                if (sleepMs > 0) Sleep(static_cast<DWORD>(sleepMs));
             }
             // 两条源至少得有一条活着：桌面源看 capture_，WGC 源看 windowCapture_。
             // 不能只判 capture_ —— WGC 模式下 capture_ 本来就是 nullptr（见
@@ -1267,6 +1336,13 @@ void Session::ThreadMain() {
 
         // 分辨率到这里才确定，录制器得现在才能起（见 EnsureRecorder 的说明）。
         EnsureRecorder(w, h);
+
+        // 重连成功后声音要跟着回来。
+        //
+        // EnsureRecorder 只在**新建**录制器时调 StartAudio，而重连时录制器是
+        // 复用的（见内层退出那段：故意不拆），于是音频会一直停着 —— 窗口关一下
+        // 再打开，画面恢复了但没有声音。这里补一刀。
+        if (recorder_ && recorder_->Running() && !audio_) StartAudio(recorder_->SegmentsDir());
 
         // 帧率是可热改的（见 ApplyLiveSettings）：用户把 144 改成 60 时不能
         // 拆掉这一路重建 —— 那会换轮次目录、recordSegments 归零、时间轴出现
@@ -2250,15 +2326,17 @@ void Session::ThreadMain() {
         // 内层循环退出的原因：如果**不是** Stop，说明这一轮采集没了（目标窗口
         // 关了、显示器没了），那就回到外层重新解析，等着它回来。
         if (!stopRequested_.load(std::memory_order_acquire)) {
-            // 这一轮的帧环/录制器要收干净再重来，否则新的解析会撞上自己。
-            // 声音也跟着收（录制停了就没有要往成片里塞的音频了）。
+            // 声音跟着收（采集断了，之后收不到新块；导出时音轨不足会补静音）。
+            //
+            // 【录制器**不能**收】见 Session.h 里 noSignalBuf_ 的说明。
+            // 以前这里 `recorder_->Stop(); recorder_ = nullptr;`：时间轴从此冻住，
+            // 用户看到的就是「关掉窗口后导出的还是一整段关窗前的画面」以及
+            // 「没画面就不让导出」。录制器保留下来，外层等待循环会一直往里喂
+            // NO SIGNAL，时间轴才能走到"现在"。
+            //
+            // 尺寸不同的窗口回来时也不用重建它：SegmentRecorder 跨尺寸存活，
+            // 编码器按新尺寸自己切一片（见 EnsureRecorder 的说明）。
             StopAudio();
-            if (recorder_) {
-                recorder_->Stop();
-                recorder_ = nullptr;
-                recorderW_ = 0;
-                recorderH_ = 0;
-            }
             // 帧环**不拆**：消费者可能正读着它，拆掉会让对端直接崩（见下面
             // "不主动销毁帧环"那段说明）。重连时直接复用同一个环，Open 会拿回
             // 已有的映射。

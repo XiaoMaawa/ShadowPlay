@@ -49,9 +49,8 @@ const SERVICE_SOURCES = [
   'native\\backend\\SegmentRecorder.cpp',
   'native\\backend\\Exporter.cpp',
   'native\\backend\\MfEncoder.cpp',
-  // 声音：WASAPI 采集（系统混音 / 进程环回）+ PCM 滚动落地。
+  // 声音：WASAPI 采集（系统混音 / 进程环回），PCM 直接编进分片音轨。
   'native\\backend\\AudioCapture.cpp',
-  'native\\backend\\AudioRing.cpp',
   'native\\backend\\Utf8Path.cpp',
   'native\\backend\\EnvPath.cpp',
   'native\\backend\\StatusFile.cpp',
@@ -185,8 +184,7 @@ runBatch(
 // 的编译，漏掉就是 LNK2019。
 // ---------------------------------------------------------------------------
 const addonExtraObjs = []
-// AudioRing 也在里面：Exporter 导出时要从 audio 目录读 PCM 塞进成片。
-for (const src of ['Exporter', 'MfEncoder', 'AudioRing', 'Utf8Path', 'EnvPath']) {
+for (const src of ['Exporter', 'MfEncoder', 'Utf8Path', 'EnvPath']) {
   const o = path.join(BUILD_DIR, `addon_${src}.obj`)
   runBatch(
     `编译 addon_${src}.obj`,
